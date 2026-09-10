@@ -18,7 +18,7 @@ import {
 } from "@controller-center/protocol";
 import { loadConfig } from "./config.js";
 import { AgentConnections } from "./connections.js";
-import { ControlDatabase, type CommandRecord, type ConversationListCursor } from "./database.js";
+import { ControlDatabase, type CommandRecord, type ConversationListCursor, type WorkspaceRecord } from "./database.js";
 import { UiEventBus } from "./event-bus.js";
 
 const config = loadConfig();
@@ -26,6 +26,7 @@ const database = new ControlDatabase(config.databasePath);
 const connections = new AgentConnections();
 const events = new UiEventBus();
 const app = Fastify({ logger: true });
+const uiStreams = new Set<FastifyReply["raw"]>();
 const taskCenterPolicy = { limit: 200, replyPreviewCharacters: 120, readRetentionDays: 30, unreadRetentionDays: 90 } as const;
 mkdirSync(config.attachmentDirectory, { recursive: true, mode: 0o700 });
 app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: 2 * 1024 * 1024 }, (_request, body, done) => {
@@ -131,6 +132,61 @@ function dispatch(command: CommandRecord): boolean {
 
 function dispatchPending(nodeId: string): void {
   for (const command of database.listPendingCommands(nodeId)) dispatch(command);
+}
+
+function syncNodeWorkspaces(nodeId: string): boolean {
+  return connections.syncWorkspaces(nodeId, database.listManagedWorkspacesForAgent(nodeId));
+}
+
+async function validatePathOnNode(nodeId: string, workspacePath: string): Promise<
+  { canonicalPath: string; suggestedName: string } | { statusCode: 400 | 404 | 409; error: string }
+> {
+  const node = database.listNodes().find((candidate) => candidate.id === nodeId);
+  if (!node) return { statusCode: 404, error: "节点不存在" };
+  if (node.status !== "online" || !connections.has(nodeId)) return { statusCode: 409, error: "节点当前离线，无法验证路径" };
+  try {
+    const result = await connections.validateWorkspace(nodeId, workspacePath);
+    if (!result.valid || !result.canonicalPath) {
+      return { statusCode: 400, error: result.error || "工作空间路径无效" };
+    }
+    return {
+      canonicalPath: result.canonicalPath,
+      suggestedName: (result.suggestedName?.trim() || result.canonicalPath).slice(0, 64),
+    };
+  } catch (error) {
+    return { statusCode: 409, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function validateWorkspaceForUse(nodeId: string, workspaceId: string): Promise<
+  { workspace: WorkspaceRecord } | { statusCode: 404 | 409; error: string }
+> {
+  const workspace = database.getWorkspace(nodeId, workspaceId);
+  if (!workspace) return { statusCode: 404, error: "工作空间不存在" };
+  if (workspace.archivedAt || workspace.status === "archived") return { statusCode: 409, error: "工作空间已停用" };
+  const node = database.listNodes().find((candidate) => candidate.id === nodeId);
+  if (!node || node.status !== "online" || !connections.has(nodeId)) {
+    return { statusCode: 409, error: "节点当前离线，无法验证工作空间" };
+  }
+  try {
+    const result = await connections.validateWorkspace(nodeId, workspace.path);
+    if (!result.valid || !result.canonicalPath) {
+      const error = result.error || "工作空间验证失败";
+      database.updateWorkspaceValidation(nodeId, workspaceId, false, error, now());
+      publish("workspace.updated", workspaceId);
+      return { statusCode: 409, error };
+    }
+    if (result.canonicalPath !== workspace.path) {
+      const error = "工作空间实际路径已经变化，请在工作空间管理中迁移路径";
+      database.updateWorkspaceValidation(nodeId, workspaceId, false, error, now());
+      publish("workspace.updated", workspaceId);
+      return { statusCode: 409, error };
+    }
+    const validated = database.updateWorkspaceValidation(nodeId, workspaceId, true, null, now()) ?? workspace;
+    return { workspace: validated };
+  } catch (error) {
+    return { statusCode: 409, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function publish(type: string, resourceId?: string): void {
@@ -305,9 +361,8 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
           socket.close(4400, "Protocol mismatch");
           return;
         }
-        nodeId = message.node.id;
-        initialized = true;
         const restarted = database.upsertNode(message.node, message.bootId, now());
+        nodeId = message.node.id;
         connections.set(nodeId, message.bootId, socket);
         connections.send(nodeId, {
           type: "control.welcome",
@@ -316,6 +371,8 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
           connectedAt: now(),
           heartbeatIntervalMs: config.heartbeatIntervalMs,
         });
+        syncNodeWorkspaces(nodeId);
+        initialized = true;
         publish("node.online", nodeId);
         if (restarted) publish("node.restarted", nodeId);
         dispatchPending(nodeId);
@@ -328,6 +385,10 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
       } else if (message.type === "agent.commandAck") {
         database.updateCommand(message.commandId, message.status, message.error ?? null, now());
         publish("command.updated", message.commandId);
+      } else if (message.type === "agent.workspaceValidation") {
+        if (!connections.resolveWorkspaceValidation(nodeId, message)) {
+          app.log.warn({ nodeId, requestId: message.requestId }, "Received an unknown workspace validation response");
+        }
       } else if (message.type === "agent.message") {
         processDurableMessage(nodeId, message);
       }
@@ -335,6 +396,7 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
       const message = error instanceof Error ? error.message : String(error);
       app.log.warn({ nodeId, error: message }, "Rejected agent message");
       socket.send(JSON.stringify({ type: "control.error", code: "invalid_message", message }));
+      if (!initialized) socket.close(4400, "Invalid handshake");
     }
   });
 
@@ -360,7 +422,124 @@ app.patch<{ Params: { id: string }; Body: { name?: string | null } }>("/api/node
   return { node };
 });
 
-app.get<{ Querystring: { nodeId?: string; q?: string; status?: string; limit?: string; cursor?: string } }>("/api/conversations", async (request, reply) => {
+app.get<{ Params: { id: string }; Querystring: { includeArchived?: string } }>("/api/nodes/:id/workspaces", async (request, reply) => {
+  if (!database.listNodes().some((node) => node.id === request.params.id)) {
+    return reply.code(404).send({ error: "节点不存在" });
+  }
+  return { data: database.listWorkspaces(request.params.id, request.query.includeArchived === "true") };
+});
+
+app.post<{ Params: { id: string }; Body: { name?: string; path?: string } }>("/api/nodes/:id/workspaces", async (request, reply) => {
+  const requestedPath = request.body?.path?.trim() ?? "";
+  const requestedName = request.body?.name?.trim() ?? "";
+  if (!requestedPath) return reply.code(400).send({ error: "工作空间路径不能为空" });
+  if (requestedPath.length > 4096) return reply.code(400).send({ error: "工作空间路径过长" });
+  if (requestedName.length > 64) return reply.code(400).send({ error: "工作空间名称不能超过 64 个字符" });
+  const validation = await validatePathOnNode(request.params.id, requestedPath);
+  if ("error" in validation) return reply.code(validation.statusCode).send({ error: validation.error });
+  const duplicate = database.findWorkspaceByPath(request.params.id, validation.canonicalPath);
+  if (duplicate) return reply.code(409).send({ error: `该路径已经登记为“${duplicate.name}”`, workspace: duplicate });
+  const createdAt = now();
+  const workspace = database.createWebWorkspace({
+    id: randomUUID(),
+    nodeId: request.params.id,
+    name: requestedName || validation.suggestedName,
+    path: validation.canonicalPath,
+    now: createdAt,
+  });
+  syncNodeWorkspaces(request.params.id);
+  publish("workspace.created", workspace.id);
+  return reply.code(201).send({ workspace });
+});
+
+app.patch<{
+  Params: { nodeId: string; workspaceId: string };
+  Body: { name?: string; path?: string; archived?: boolean; confirmMigration?: boolean };
+}>("/api/nodes/:nodeId/workspaces/:workspaceId", async (request, reply) => {
+  const current = database.getWorkspace(request.params.nodeId, request.params.workspaceId);
+  if (!current) return reply.code(404).send({ error: "工作空间不存在" });
+  if (current.isDefault) return reply.code(409).send({ error: "默认工作空间由 Agent 启动目录决定，不能修改" });
+  if (current.source === "config") return reply.code(409).send({ error: "启动配置工作空间只能通过 Agent 配置修改" });
+  const hasName = typeof request.body?.name === "string";
+  const hasPath = typeof request.body?.path === "string";
+  const hasArchived = typeof request.body?.archived === "boolean";
+  if (!hasName && !hasPath && !hasArchived) return reply.code(400).send({ error: "没有需要修改的内容" });
+  const name = hasName ? request.body.name!.trim() : undefined;
+  if (hasName && (!name || name.length > 64)) return reply.code(400).send({ error: "工作空间名称必须为 1 到 64 个字符" });
+
+  let canonicalPath: string | undefined;
+  if (hasPath && request.body.path!.trim() !== current.path) {
+    if (request.body.confirmMigration !== true) {
+      return reply.code(409).send({
+        error: current.conversationCount > 0
+          ? `该工作空间已绑定 ${current.conversationCount} 个会话，迁移路径需要明确确认`
+          : "迁移工作空间路径需要明确确认",
+        requiresConfirmation: true,
+        conversationCount: current.conversationCount,
+      });
+    }
+    const validation = await validatePathOnNode(request.params.nodeId, request.body.path!.trim());
+    if ("error" in validation) return reply.code(validation.statusCode).send({ error: validation.error });
+    const duplicate = database.findWorkspaceByPath(request.params.nodeId, validation.canonicalPath, current.id);
+    if (duplicate) return reply.code(409).send({ error: `该路径已经登记为“${duplicate.name}”` });
+    canonicalPath = validation.canonicalPath;
+  }
+  if (request.body.archived === false && current.archivedAt) {
+    const validation = await validatePathOnNode(request.params.nodeId, canonicalPath ?? current.path);
+    if ("error" in validation) return reply.code(validation.statusCode).send({ error: validation.error });
+    canonicalPath = validation.canonicalPath;
+  }
+  const workspace = database.updateWorkspace({
+    nodeId: request.params.nodeId,
+    id: request.params.workspaceId,
+    ...(name ? { name } : {}),
+    ...(canonicalPath ? { path: canonicalPath } : {}),
+    ...(hasArchived ? { archived: request.body.archived } : {}),
+    now: now(),
+  });
+  syncNodeWorkspaces(request.params.nodeId);
+  publish("workspace.updated", request.params.workspaceId);
+  return { workspace };
+});
+
+app.post<{ Params: { nodeId: string; workspaceId: string } }>("/api/nodes/:nodeId/workspaces/:workspaceId/validate", async (request, reply) => {
+  const current = database.getWorkspace(request.params.nodeId, request.params.workspaceId);
+  if (!current) return reply.code(404).send({ error: "工作空间不存在" });
+  if (current.archivedAt) return reply.code(409).send({ error: "工作空间已停用" });
+  const validation = await validatePathOnNode(request.params.nodeId, current.path);
+  if ("error" in validation) {
+    const workspace = database.updateWorkspaceValidation(request.params.nodeId, request.params.workspaceId, false, validation.error, now());
+    publish("workspace.updated", request.params.workspaceId);
+    return reply.code(validation.statusCode).send({ error: validation.error, workspace });
+  }
+  if (validation.canonicalPath !== current.path) {
+    const error = "工作空间实际路径已经变化，请使用迁移路径功能";
+    const workspace = database.updateWorkspaceValidation(request.params.nodeId, request.params.workspaceId, false, error, now());
+    publish("workspace.updated", request.params.workspaceId);
+    return reply.code(409).send({ error, workspace });
+  }
+  const workspace = database.updateWorkspaceValidation(request.params.nodeId, request.params.workspaceId, true, null, now());
+  publish("workspace.updated", request.params.workspaceId);
+  return { workspace };
+});
+
+app.delete<{ Params: { nodeId: string; workspaceId: string } }>("/api/nodes/:nodeId/workspaces/:workspaceId", async (request, reply) => {
+  const current = database.getWorkspace(request.params.nodeId, request.params.workspaceId);
+  if (!current) return reply.code(404).send({ error: "工作空间不存在" });
+  if (current.isDefault) return reply.code(409).send({ error: "默认工作空间不能删除" });
+  if (current.source === "config") return reply.code(409).send({ error: "启动配置工作空间只能通过 Agent 配置删除" });
+  if (current.conversationCount > 0) {
+    return reply.code(409).send({ error: "该工作空间已绑定会话，只能停用，不能删除" });
+  }
+  if (!database.deleteUnusedWorkspace(request.params.nodeId, request.params.workspaceId)) {
+    return reply.code(409).send({ error: "工作空间当前不能删除" });
+  }
+  syncNodeWorkspaces(request.params.nodeId);
+  publish("workspace.deleted", request.params.workspaceId);
+  return reply.code(204).send();
+});
+
+app.get<{ Querystring: { nodeId?: string; q?: string; status?: string; limit?: string; cursor?: string; includeTotal?: string } }>("/api/conversations", async (request, reply) => {
   const query = request.query.q?.trim() ?? "";
   if (query.length > 100) return reply.code(400).send({ error: "q must not exceed 100 characters" });
   const requestedLimit = Number.parseInt(request.query.limit ?? "50", 10);
@@ -372,11 +551,15 @@ app.get<{ Querystring: { nodeId?: string; q?: string; status?: string; limit?: s
   if (request.query.status && !["active", "failed"].includes(request.query.status)) {
     return reply.code(400).send({ error: "status must be active or failed" });
   }
+  if (request.query.includeTotal && !["true", "false"].includes(request.query.includeTotal)) {
+    return reply.code(400).send({ error: "includeTotal must be true or false" });
+  }
   const page = database.listConversationPage({
     ...(request.query.nodeId?.trim() ? { nodeId: request.query.nodeId.trim() } : {}),
     ...(query ? { query } : {}),
     ...(request.query.status ? { runStatus: request.query.status as "active" | "failed" } : {}),
     limit: requestedLimit,
+    includeTotal: request.query.includeTotal !== "false",
     ...(cursor ? { cursor } : {}),
   });
   return { data: page.data, total: page.total, nextCursor: encodeConversationCursor(page.nextCursor) };
@@ -440,9 +623,8 @@ app.post<{
   if (!nodeId || !workspaceId || !title) {
     return reply.code(400).send({ error: "nodeId, workspaceId and title are required" });
   }
-  if (!database.getWorkspace(nodeId, workspaceId)) {
-    return reply.code(404).send({ error: "Workspace not found on node" });
-  }
+  const workspaceValidation = await validateWorkspaceForUse(nodeId, workspaceId);
+  if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
 
   const createdAt = now();
   const conversationId = randomUUID();
@@ -517,9 +699,8 @@ app.post<{
   }
   const preparedAttachments = prepareAttachments(body.attachmentIds, clientRequestId);
   if (preparedAttachments.error) return reply.code(400).send({ error: preparedAttachments.error });
-  if (!database.getWorkspace(nodeId, workspaceId)) {
-    return reply.code(404).send({ error: "Workspace not found on node" });
-  }
+  const workspaceValidation = await validateWorkspaceForUse(nodeId, workspaceId);
+  if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
   const createdAt = now();
   const conversationId = randomUUID();
   const runId = randomUUID();
@@ -622,6 +803,8 @@ app.post<{
   if (conversation.status !== "ready" || !conversation.remoteThreadId) {
     return reply.code(409).send({ error: "Conversation is not ready on the node" });
   }
+  const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
+  if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
   const createdAt = now();
   const runId = randomUUID();
   const model = body.model?.trim() || conversation.model;
@@ -685,6 +868,8 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
   if (!conversation?.remoteThreadId || conversation.status !== "ready") {
     return reply.code(409).send({ error: "Conversation is not ready on the node" });
   }
+  const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
+  if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
   const clientRequestId = `retry:${sourceRun.id}`;
   const existingRetry = database.getRunByClientRequestId(clientRequestId);
   if (existingRetry) {
@@ -1026,6 +1211,7 @@ app.get<{ Querystring: { after?: string } }>("/api/stream", async (request, repl
     if (batch.length < 1000) break;
   }
   reply.raw.write(`event: ready\ndata: ${JSON.stringify({ connectedAt: now(), revision: database.currentUiRevision() })}\n\n`);
+  uiStreams.add(reply.raw);
   const unsubscribe = events.subscribe((event) => {
     reply.raw.write(`id: ${event.revision}\nevent: update\ndata: ${JSON.stringify(event)}\n\n`);
   });
@@ -1033,6 +1219,7 @@ app.get<{ Querystring: { after?: string } }>("/api/stream", async (request, repl
   request.raw.on("close", () => {
     clearInterval(keepAlive);
     unsubscribe();
+    uiStreams.delete(reply.raw);
   });
 });
 
@@ -1068,10 +1255,17 @@ const commandRetryTimer = setInterval(() => {
   }
 }, 15_000);
 
+let shuttingDown = false;
+
 async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   app.log.info({ signal }, "Shutting down control plane");
   clearInterval(staleTimer);
   clearInterval(commandRetryTimer);
+  connections.closeAll();
+  for (const stream of uiStreams) stream.end();
+  uiStreams.clear();
   await app.close();
   database.close();
   process.exit(0);

@@ -41,9 +41,9 @@ Browser ⇄ Control Plane ⇄ Node Agent ⇄ Codex App Server
 - Agent 收到 Ack 后删除 Outbox 记录。
 - Control Plane 对重复序列去重。
 
-当前实现已具备该基础，本期需要在协议 v3 中将原始 Codex 事件替换为产品级消息和进度事件。
+当前实现已具备该基础；协议 v4 使用产品级消息和进度事件，并增加工作空间同步与在线验证。
 
-## 3. 协议 v3
+## 3. 协议 v4
 
 ### 3.1 Agent 上报消息
 
@@ -98,6 +98,15 @@ interface MessageSnapshotPayload {
 - Control Plane 只接受更高 revision，重复和乱序快照不会覆盖新内容。
 - 完成、失败、停止和进程退出前必须发送最终快照。
 
+### 3.4 工作空间同步与验证
+
+- `agent.hello` 只发布 Agent 本地决定的默认工作空间和启动配置工作空间。
+- Control Plane 持久保存 Web 添加及历史保留工作空间，并在握手成功后通过 `control.workspaceSync` 下发到 Agent 内存注册表。
+- `control.workspaceValidate` / `agent.workspaceValidation` 使用独立 `requestId` 做一次性请求响应，默认 10 秒超时；节点断线或连接被替换时立即拒绝所有挂起验证。
+- Agent 返回 `realpath` 解析后的规范绝对路径，只认可存在、为目录且当前运行用户可读写的路径。
+- 工作空间验证消息不进入耐久任务 Outbox；只有验证成功后的配置和任务创建才持久化，断线时由调用方明确失败并保留用户输入。
+- 每次创建会话、开始新轮次或重试前由 Control Plane 在线复验；Agent 在 `thread/start` / `turn/start` 前再次本地复验，避免验证后目录被删除、换成链接或失去权限。
+
 ## 4. Run 状态机
 
 ```text
@@ -128,6 +137,7 @@ Agent Hello 后增加状态报告：
 - 已绑定 Conversation 与 Thread ID。
 - 已知活动 Run、Turn ID 和最后消息 revision。
 - Outbox 最小、最大待发送 sequence。
+- 当前启动目录决定的默认工作空间及启动配置工作空间。
 
 Control Plane 对比数据库后返回协调指令：
 
@@ -135,6 +145,7 @@ Control Plane 对比数据库后返回协调指令：
 - 接受 Agent 已完成但中心尚未确认的结果。
 - 要求 Agent 查询 Thread/Turn 当前状态。
 - 对无法确认的任务进入 `recovering`，而不是静默重跑。
+- 将 Control Plane 中有效的 Web/历史工作空间重新同步给 Agent；离线期间的配置不依赖 Agent 本地持久化。
 
 ### 5.2 App Server 重启
 
@@ -184,6 +195,7 @@ UI 事件日志只记录资源 ID 和变更类型，不保存对话正文或命�
 
 - `runs` 增加 `client_request_id` 唯一键、`progress_phase`、`progress_label`、`progress_updated_at` 和 `recovery_deadline_at`。
 - `conversations` 增加 `pinned_at`，标题索引及必要搜索索引。
+- `workspaces` 增加来源、默认标记、验证状态、验证错误、最后验证时间、停用时间和审计时间；会话继续使用稳定 `workspace_id` 绑定。
 - `events` 不再承担产品消息恢复；迁移完成后可按版本清理旧详细数据。
 
 ### 7.3 事务边界
@@ -195,6 +207,7 @@ UI 事件日志只记录资源 ID 和变更类型，不保存对话正文或命�
 - Run 最终状态 + notification + 清理等待操作 + UI revision。
 - 删除 conversation + message/notification/attachment 元数据清理标记。
 - 接收 Agent durable message + 业务写入 + delivery 去重记录。
+- Agent 注册时更新节点、本地工作空间、旧默认目录历史保留必须原子提交；握手失败不能留下半在线节点。
 
 ## 8. 附件可靠性
 
@@ -210,7 +223,7 @@ UI 事件日志只记录资源 ID 和变更类型，不保存对话正文或命�
 ## 9. 并发与排队
 
 - 每个 Agent 遵守 `maxConcurrentRuns`。
-- 同一工作区默认只允许一个可能修改文件的活动 Run，避免并发互相覆盖。
+- 同一规范路径默认只允许一个可能修改文件的活动 Run，避免不同工作空间 ID 或历史别名并发修改同一批文件。
 - 不同工作区或明确只读任务可以并发。
 - 同一工作区已有活动 Run 或节点达到并发上限时，新 Run 仍可靠落库并保持 queued，不向用户返回冲突失败。
 - 活动 Run 结束、失败或重连协调完成后，Control Plane 自动投递下一条可执行命令。
@@ -257,6 +270,10 @@ SQLite 使用 WAL、`busy_timeout` 和周期 checkpoint。正式长期运行需�
 | 附件上传中断 | 从已确认 offset 续传 |
 | 附件传到 Agent 时损坏 | SHA-256 失败，任务不启动并允许重试 |
 | 节点离线时发送 | 草稿保留，不创建不可投递的隐形任务 |
+| Web 添加不存在或无权限目录 | Agent 验证失败，不保存工作空间，表单内容保留 |
+| 路径在创建任务前失效 | 不创建 Run；工作空间标记失效并提示重新验证或迁移 |
+| Agent 从不同目录重启 | 新目录成为默认；有会话引用的旧默认转为历史工作空间并继续按原路径工作 |
+| 默认目录与既有 Web 路径重合 | 新会话只展示默认项；有会话引用的旧 ID 作为历史别名保留，调度仍按路径串行 |
 
 ## 13. 验收测试
 
@@ -273,5 +290,6 @@ SQLite 使用 WAL、`busy_timeout` 和周期 checkpoint。正式长期运行需�
 9. 320px、390px、820px 和桌面视口的完整流程测试。
 10. 数据库从当前 schema 到新 schema 的迁移及回滚备份测试。
 11. 至少 160 条混合高度消息的虚拟渲染、首次定位、回到底部及流式跟随测试。
+12. 工作空间添加/复验/迁移/停用/删除、默认目录不可变、Agent 更换启动目录及同路径别名串行测试。
 
 在这些故障注入测试通过前，不把“自动恢复”标记为已完成。

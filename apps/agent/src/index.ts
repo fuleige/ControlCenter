@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import WebSocket from "ws";
@@ -15,20 +15,23 @@ import {
   type ControlCommand,
   type DurableAgentPayload,
   type JsonValue,
+  type ManagedWorkspaceDescriptor,
   type ModelDescriptor,
   type ReasoningEffort,
   type RunProgressPhase,
+  type WorkspaceDescriptor,
 } from "@controller-center/protocol";
 import { AppServerClient, type AppServerNotification, type AppServerRequest, type RpcRequestId } from "./app-server-client.js";
 import { loadConfig } from "./config.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.1.0";
+const AGENT_VERSION = "0.2.0";
 
 interface ActiveRun {
   conversationId: string;
   runId: string;
   workspaceId: string;
+  workspacePath: string;
   threadId: string;
   turnId: string;
   lastProgressPhase?: string;
@@ -75,6 +78,7 @@ const workspaceLocks = new Map<string, string>();
 const startingRunIds = new Set<string>();
 const pendingApprovals = new Map<string, PendingApproval>();
 const assistantMessages = new Map<string, BufferedAssistantMessage>();
+const workspaceRegistry = new Map<string, WorkspaceDescriptor>(config.workspaces.map((workspace) => [workspace.id, workspace]));
 let socket: WebSocket | null = null;
 let heartbeatTimer: NodeJS.Timeout | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
@@ -111,6 +115,33 @@ function send(message: AgentToControlMessage): boolean {
 
 function sendAck(commandId: string, status: AgentCommandAckMessage["status"], error?: string): void {
   send({ type: "agent.commandAck", commandId, status, ...(error ? { error } : {}) });
+}
+
+function validateWorkspacePath(input: string): { canonicalPath: string } | { error: string } {
+  const candidate = input.trim();
+  if (!candidate) return { error: "工作空间路径不能为空" };
+  if (candidate.length > 4096) return { error: "工作空间路径过长" };
+  try {
+    const canonicalPath = realpathSync(path.resolve(candidate));
+    if (!statSync(canonicalPath).isDirectory()) return { error: "目标路径不是目录" };
+    accessSync(canonicalPath, constants.R_OK | constants.W_OK);
+    return { canonicalPath };
+  } catch (error) {
+    const code = isRecord(error) && typeof error.code === "string" ? error.code : "";
+    if (code === "ENOENT") return { error: "目录不存在" };
+    if (code === "EACCES" || code === "EPERM") return { error: "Agent 运行用户没有目录读写权限" };
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function applyManagedWorkspaces(workspaces: ManagedWorkspaceDescriptor[]): void {
+  for (const [id, workspace] of workspaceRegistry) {
+    if (workspace.source === "web" || workspace.source === "history") workspaceRegistry.delete(id);
+  }
+  for (const workspace of workspaces) {
+    if (workspaceRegistry.has(workspace.id)) continue;
+    workspaceRegistry.set(workspace.id, { ...workspace, isDefault: false });
+  }
 }
 
 function flushOutbox(): void {
@@ -309,8 +340,8 @@ function handleNotification(notification: AppServerNotification): void {
       finishedAt: timestamp(),
     });
     activeRunsByTurn.delete(context.run.turnId);
-    if (workspaceLocks.get(context.run.workspaceId) === context.run.runId) {
-      workspaceLocks.delete(context.run.workspaceId);
+    if (workspaceLocks.get(context.run.workspacePath) === context.run.runId) {
+      workspaceLocks.delete(context.run.workspacePath);
     }
   }
 
@@ -462,9 +493,12 @@ appServer.on("exit", (error: Error) => {
 });
 
 function workspaceFor(id: string) {
-  const workspace = config.workspaces.find((candidate) => candidate.id === id);
+  const workspace = workspaceRegistry.get(id);
   if (!workspace) throw new Error(`Workspace is not allowed on this node: ${id}`);
-  return workspace;
+  const validation = validateWorkspacePath(workspace.path);
+  if ("error" in validation) throw new Error(`工作空间不可用：${validation.error}`);
+  if (validation.canonicalPath !== workspace.path) throw new Error("工作空间实际路径已经变化，请重新验证");
+  return { ...workspace, path: validation.canonicalPath };
 }
 
 async function ensureThreadLoaded(threadId: string): Promise<void> {
@@ -561,12 +595,19 @@ async function startTurnForConversation(input: {
   model?: string;
   effort?: ReasoningEffort;
   attachments?: AttachmentDescriptor[];
+  workspace?: WorkspaceDescriptor;
+  reservationHeld?: boolean;
 }): Promise<void> {
-  if (activeRunsByTurn.size + startingRunIds.size >= config.maxConcurrentRuns) throw new Error("Node concurrency limit reached");
-  const workspace = workspaceFor(input.workspaceId);
-  if (workspaceLocks.has(workspace.id)) throw new Error(`Workspace is busy: ${workspace.name}`);
-  workspaceLocks.set(input.workspaceId, input.runId);
-  startingRunIds.add(input.runId);
+  const workspace = input.workspace ?? workspaceFor(input.workspaceId);
+  const reservationHeld = input.reservationHeld === true;
+  if (!reservationHeld) {
+    if (activeRunsByTurn.size + startingRunIds.size >= config.maxConcurrentRuns) throw new Error("Node concurrency limit reached");
+    if (workspaceLocks.has(workspace.path)) throw new Error(`Workspace is busy: ${workspace.name}`);
+    workspaceLocks.set(workspace.path, input.runId);
+    startingRunIds.add(input.runId);
+  } else if (workspaceLocks.get(workspace.path) !== input.runId || !startingRunIds.has(input.runId)) {
+    throw new Error("Workspace reservation was lost before the task started");
+  }
   try {
     conversationByThread.set(input.threadId, input.conversationId);
     await ensureThreadLoaded(input.threadId);
@@ -592,6 +633,7 @@ async function startTurnForConversation(input: {
       conversationId: input.conversationId,
       runId: input.runId,
       workspaceId: input.workspaceId,
+      workspacePath: workspace.path,
       threadId: input.threadId,
       turnId,
     };
@@ -607,10 +649,10 @@ async function startTurnForConversation(input: {
     });
     reportProgress(active, "analyzing", "正在分析任务");
   } catch (error) {
-    if (workspaceLocks.get(input.workspaceId) === input.runId) workspaceLocks.delete(input.workspaceId);
+    if (workspaceLocks.get(workspace.path) === input.runId) workspaceLocks.delete(workspace.path);
     throw error;
   } finally {
-    startingRunIds.delete(input.runId);
+    if (!reservationHeld) startingRunIds.delete(input.runId);
   }
 }
 
@@ -638,36 +680,47 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
       break;
     }
     case "conversation.start": {
-      if (activeRunsByTurn.size >= config.maxConcurrentRuns) throw new Error("Node concurrency limit reached");
+      if (activeRunsByTurn.size + startingRunIds.size >= config.maxConcurrentRuns) throw new Error("Node concurrency limit reached");
       const workspace = workspaceFor(command.workspaceId);
-      if (workspaceLocks.has(workspace.id)) throw new Error(`Workspace is busy: ${workspace.name}`);
-      const result = await startThread(workspace.path, command.model);
-      const threadId = result.thread?.id;
-      if (!threadId) throw new Error("thread/start did not return a thread id");
-      conversationByThread.set(threadId, command.conversationId);
-      loadedThreads.add(threadId);
+      if (workspaceLocks.has(workspace.path)) throw new Error(`Workspace is busy: ${workspace.name}`);
+      workspaceLocks.set(workspace.path, command.runId);
+      startingRunIds.add(command.runId);
       try {
-        await appServer.request("thread/name/set", { threadId, name: command.title });
+        const result = await startThread(workspace.path, command.model);
+        const threadId = result.thread?.id;
+        if (!threadId) throw new Error("thread/start did not return a thread id");
+        conversationByThread.set(threadId, command.conversationId);
+        loadedThreads.add(threadId);
+        try {
+          await appServer.request("thread/name/set", { threadId, name: command.title });
+        } catch (error) {
+          console.warn("[agent] unable to set thread name", error instanceof Error ? error.message : error);
+        }
+        emitDurable({
+          type: "conversation.bound",
+          commandId,
+          conversationId: command.conversationId,
+          threadId,
+        });
+        await startTurnForConversation({
+          commandId,
+          conversationId: command.conversationId,
+          runId: command.runId,
+          workspaceId: command.workspaceId,
+          threadId,
+          prompt: command.prompt,
+          workspace,
+          reservationHeld: true,
+          ...(command.model ? { model: command.model } : {}),
+          ...(command.effort ? { effort: command.effort } : {}),
+          ...(command.attachments ? { attachments: command.attachments } : {}),
+        });
       } catch (error) {
-        console.warn("[agent] unable to set thread name", error instanceof Error ? error.message : error);
+        if (workspaceLocks.get(workspace.path) === command.runId) workspaceLocks.delete(workspace.path);
+        throw error;
+      } finally {
+        startingRunIds.delete(command.runId);
       }
-      emitDurable({
-        type: "conversation.bound",
-        commandId,
-        conversationId: command.conversationId,
-        threadId,
-      });
-      await startTurnForConversation({
-        commandId,
-        conversationId: command.conversationId,
-        runId: command.runId,
-        workspaceId: command.workspaceId,
-        threadId,
-        prompt: command.prompt,
-        ...(command.model ? { model: command.model } : {}),
-        ...(command.effort ? { effort: command.effort } : {}),
-        ...(command.attachments ? { attachments: command.attachments } : {}),
-      });
       break;
     }
     case "conversation.delete":
@@ -826,6 +879,19 @@ function connect(): void {
         state.acknowledge(message.bootId, message.sequence);
       } else if (message.type === "control.command") {
         void handleCommand(message.commandId, message.command);
+      } else if (message.type === "control.workspaceValidate") {
+        const result = validateWorkspacePath(message.path);
+        send({
+          type: "agent.workspaceValidation",
+          requestId: message.requestId,
+          valid: !("error" in result),
+          ...("error" in result ? { error: result.error } : {
+            canonicalPath: result.canonicalPath,
+            suggestedName: path.basename(result.canonicalPath) || result.canonicalPath,
+          }),
+        });
+      } else if (message.type === "control.workspaceSync") {
+        applyManagedWorkspaces(message.workspaces);
       } else if (message.type === "control.error") {
         console.error(`[control] ${message.code}: ${message.message}`);
       }

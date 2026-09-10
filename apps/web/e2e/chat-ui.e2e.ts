@@ -13,7 +13,21 @@ const node = {
   activeRuns: 1,
   status: "online",
   lastSeenAt: now,
-  workspaces: [{ id: "qa-workspace", nodeId: "qa-node", name: "Controller Center", path: "/workspace/controller-center" }],
+  workspaces: [{
+    id: "qa-workspace",
+    nodeId: "qa-node",
+    name: "Controller Center",
+    path: "/workspace/controller-center",
+    source: "default",
+    isDefault: true,
+    status: "valid",
+    validationError: null,
+    lastValidatedAt: now,
+    archivedAt: null,
+    conversationCount: 1,
+    createdAt: now,
+    updatedAt: now,
+  }],
   models: [{
     id: "gpt-6-astra",
     displayName: "GPT-6-Astra",
@@ -118,6 +132,7 @@ const longConversationHistory = Array.from({ length: 160 }, (_, index) => {
 
 async function mockControlCenter(page: Page) {
   const presenceReports: Array<{ conversationId?: string | null; visible?: boolean }> = [];
+  const quickSearchRequests: string[] = [];
   await page.addInitScript(() => {
     localStorage.setItem("controller-center:selected-node", "qa-node");
     localStorage.setItem("controller-center:selected-conversation", "qa-conversation");
@@ -128,7 +143,10 @@ async function mockControlCenter(page: Page) {
       await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
     } else if (url.pathname === "/api/nodes") {
       await route.fulfill({ json: { data: [node] } });
+    } else if (url.pathname === `/api/nodes/${node.id}/workspaces`) {
+      await route.fulfill({ json: { data: node.workspaces } });
     } else if (url.pathname === "/api/conversations") {
+      if (!url.searchParams.has("nodeId")) quickSearchRequests.push(url.search);
       await route.fulfill({ json: { data: [conversation] } });
     } else if (url.pathname === `/api/conversations/${conversation.id}`) {
       await route.fulfill({
@@ -191,12 +209,12 @@ async function mockControlCenter(page: Page) {
       await route.fulfill({ status: 204 });
     }
   });
-  return presenceReports;
+  return { presenceReports, quickSearchRequests };
 }
 
 test("长对话可以滚动并正确渲染代码、公式和移动布局", async ({ page, context }, testInfo) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "http://127.0.0.1:5173" });
-  const presenceReports = await mockControlCenter(page);
+  const { presenceReports, quickSearchRequests } = await mockControlCenter(page);
   await page.goto("/");
 
   const timeline = page.locator(".timeline");
@@ -214,6 +232,25 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".composer-toolbar .model-setting > span, .composer-toolbar .effort-setting > span")).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "选择模型" })).toBeVisible();
   await expect(page.getByRole("combobox", { name: "选择思考强度" })).toBeVisible();
+  const composerTypography = await page.locator(".composer textarea").evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { family: style.fontFamily, size: style.fontSize, lineHeight: style.lineHeight };
+  });
+  const messageTypography = await page.locator(".markdown-content").first().evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { family: style.fontFamily, size: style.fontSize, lineHeight: style.lineHeight };
+  });
+  const typography = {
+    composerFamily: composerTypography.family,
+    messageFamily: messageTypography.family,
+    composerSize: composerTypography.size,
+    messageSize: messageTypography.size,
+    composerLineHeight: composerTypography.lineHeight,
+    messageLineHeight: messageTypography.lineHeight,
+  };
+  expect(typography.composerFamily).toBe(typography.messageFamily);
+  expect(typography.composerSize).toBe(typography.messageSize);
+  expect(typography.composerLineHeight).toBe(typography.messageLineHeight);
 
   const dimensions = await timeline.evaluate((element) => ({
     clientHeight: element.clientHeight,
@@ -254,15 +291,32 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await globalNavigation.getByRole("button", { name: /快速切换/ }).click();
   const switcher = page.getByRole("dialog", { name: "快速切换" });
   await expect(switcher).toBeVisible();
+  await expect(switcher.getByText("输入节点名称或会话名称开始搜索")).toBeVisible();
+  await page.waitForTimeout(250);
+  expect(quickSearchRequests).toEqual([]);
   await page.screenshot({ path: `/tmp/controller-center-switcher-${testInfo.project.name}.png`, fullPage: true });
   await switcher.getByRole("textbox", { name: "搜索节点或历史会话" }).fill("检查长内容");
+  await expect.poll(() => quickSearchRequests.length).toBe(1);
+  expect(new URLSearchParams(quickSearchRequests[0]).get("includeTotal")).toBe("false");
   await switcher.getByRole("button", { name: new RegExp(conversation.title) }).click();
   await expect(switcher).toBeHidden();
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.1.0");
+  await expect(page.locator(".settings-version")).toContainText("v0.2.0");
+  await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
+  await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
+  await expect(page.locator(".workspace-card")).toContainText("Controller Center");
+  await expect(page.locator(".workspace-card")).toContainText("/workspace/controller-center");
+  await expect(page.locator(".workspace-card").getByRole("button", { name: "编辑" })).toHaveCount(0);
+  await page.getByRole("button", { name: "添加工作空间" }).click();
+  await expect(page.getByPlaceholder("例如 /root/codes/project-a")).toBeVisible();
+  await page.locator(".workspace-add-form").getByRole("button", { name: "取消" }).click();
   await page.getByRole("button", { name: "关闭设置" }).click();
+  if (testInfo.project.name === "desktop") {
+    await page.locator(".node-card").filter({ hasText: node.name }).click();
+    await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
+  }
   await globalNavigation.getByRole("button", { name: /任务中心|全局任务中心/ }).click();
   await expect(page.getByRole("main", { name: "全局任务中心" })).toBeVisible();
   await expect(page.getByText("这是最新回复的摘要，点击后可以直接返回对应会话。")).toBeVisible();
@@ -284,7 +338,13 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   }
   await expect.poll(() => presenceReports.some((report) => report.conversationId === null && report.visible === true)).toBe(true);
   await page.screenshot({ path: `/tmp/controller-center-tasks-${testInfo.project.name}.png`, fullPage: true });
-  await page.getByRole("button", { name: "返回工作台" }).click();
+  if (testInfo.project.name === "desktop") {
+    await page.locator(".node-card").filter({ hasText: node.name }).click();
+    await expect(page.getByRole("main", { name: "全局任务中心" })).toBeHidden();
+    await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
+  } else {
+    await page.getByRole("button", { name: "返回工作台" }).click();
+  }
   await globalNavigation.getByRole("button", { name: /任务中心|全局任务中心/ }).click();
   await page.locator(".task-center-item").filter({ hasText: conversation.title }).click();
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
@@ -456,6 +516,7 @@ test("新会话创建结果不会抢占用户后来选择的会话", async ({ pa
   if (testInfo.project.name !== "desktop") {
     await page.locator(".node-card").filter({ hasText: node.name }).click();
   }
+  await expect(page.getByRole("combobox", { name: "选择工作空间" })).toHaveValue("qa-workspace");
   await page.locator(".composer textarea").fill("创建一个后台会话");
   await page.getByRole("button", { name: "发送" }).click();
 

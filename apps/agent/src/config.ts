@@ -37,27 +37,69 @@ function slug(value: string): string {
   return normalized || "workspace";
 }
 
-function parseWorkspaces(): WorkspaceDescriptor[] {
+function parseWorkspaces(dataDirectory: string): WorkspaceDescriptor[] {
   const configured = process.env.AGENT_WORKSPACES;
-  let candidates: Array<{ id?: string; name?: string; path?: string }>;
+  let candidates: Array<{ id?: string; name?: string; path?: string }> = [];
   if (configured) {
     const parsed: unknown = JSON.parse(configured);
     if (!Array.isArray(parsed)) throw new Error("AGENT_WORKSPACES must be a JSON array");
     candidates = parsed as Array<{ id?: string; name?: string; path?: string }>;
-  } else {
-    const current = process.cwd();
-    candidates = [{ id: slug(path.basename(current)), name: path.basename(current), path: current }];
   }
 
-  const seen = new Set<string>();
-  return candidates.map((candidate, index) => {
+  const seenIds = new Set<string>();
+  const seenPaths = new Set<string>();
+  const configuredWorkspaces = candidates.map((candidate, index) => {
     if (!candidate.path) throw new Error(`Workspace at index ${index} is missing path`);
     const absolutePath = realpathSync(path.resolve(candidate.path));
     const id = candidate.id?.trim() || slug(candidate.name || path.basename(absolutePath));
-    if (seen.has(id)) throw new Error(`Duplicate workspace id: ${id}`);
-    seen.add(id);
+    if (seenIds.has(id)) throw new Error(`Duplicate workspace id: ${id}`);
+    if (seenPaths.has(absolutePath)) throw new Error(`Duplicate workspace path: ${absolutePath}`);
+    seenIds.add(id);
+    seenPaths.add(absolutePath);
     return { id, name: candidate.name?.trim() || path.basename(absolutePath), path: absolutePath };
   });
+
+  // npm workspace scripts change process.cwd() to the package directory. INIT_CWD
+  // preserves the directory from which the operator actually started the Agent.
+  const startupDirectory = process.env.INIT_CWD?.trim() || process.cwd();
+  const currentPath = realpathSync(path.resolve(startupDirectory));
+  const identityPath = path.join(dataDirectory, "workspace-identities.json");
+  let identities: Record<string, string> = {};
+  if (existsSync(identityPath)) {
+    const parsed = JSON.parse(readFileSync(identityPath, "utf8")) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) identities = parsed as Record<string, string>;
+  }
+  const configuredDefault = configuredWorkspaces.find((workspace) => workspace.path === currentPath);
+  if (configuredDefault) {
+    const conflictingIdentity = Object.entries(identities)
+      .find(([workspacePath, id]) => workspacePath !== currentPath && id === configuredDefault.id);
+    if (conflictingIdentity) {
+      throw new Error(`Workspace id ${configuredDefault.id} is already assigned to ${conflictingIdentity[0]}`);
+    }
+    if (identities[currentPath] !== configuredDefault.id) {
+      identities[currentPath] = configuredDefault.id;
+      writeFileSync(identityPath, `${JSON.stringify(identities, null, 2)}\n`, { mode: 0o600 });
+    }
+    return [
+      { ...configuredDefault, source: "default", isDefault: true },
+      ...configuredWorkspaces.filter((workspace) => workspace.id !== configuredDefault.id)
+        .map((workspace) => ({ ...workspace, source: "config" as const, isDefault: false })),
+    ];
+  }
+
+  let defaultId = typeof identities[currentPath] === "string" ? identities[currentPath] : "";
+  const reservedIds = new Set([...seenIds, ...Object.values(identities)]);
+  if (!defaultId) {
+    const baseId = slug(path.basename(currentPath));
+    defaultId = reservedIds.has(baseId) ? `${baseId}-${randomUUID().slice(0, 8)}` : baseId;
+    identities[currentPath] = defaultId;
+    writeFileSync(identityPath, `${JSON.stringify(identities, null, 2)}\n`, { mode: 0o600 });
+  }
+  if (seenIds.has(defaultId)) throw new Error(`Default workspace id conflicts with AGENT_WORKSPACES: ${defaultId}`);
+  return [
+    { id: defaultId, name: path.basename(currentPath) || currentPath, path: currentPath, source: "default", isDefault: true },
+    ...configuredWorkspaces.map((workspace) => ({ ...workspace, source: "config" as const, isDefault: false })),
+  ];
 }
 
 function loadOrCreateNodeId(dataDirectory: string): string {
@@ -87,6 +129,6 @@ export function loadConfig(): AgentConfig {
     codexBinary: process.env.CODEX_BIN ?? "codex",
     maxConcurrentRuns: integerEnv("MAX_CONCURRENT_RUNS", 2),
     networkAccess: process.env.AGENT_NETWORK_ACCESS === "true",
-    workspaces: parseWorkspaces(),
+    workspaces: parseWorkspaces(dataDirectory),
   };
 }

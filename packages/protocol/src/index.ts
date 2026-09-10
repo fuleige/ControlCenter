@@ -1,12 +1,24 @@
-export const CONTROL_PROTOCOL_VERSION = 3 as const;
+export const CONTROL_PROTOCOL_VERSION = 4 as const;
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export type WorkspaceSource = "default" | "config" | "web" | "history";
+export type WorkspaceStatus = "valid" | "invalid" | "offline" | "archived";
 
 export interface WorkspaceDescriptor {
   id: string;
   name: string;
   path: string;
+  source: WorkspaceSource;
+  isDefault: boolean;
+}
+
+export interface ManagedWorkspaceDescriptor {
+  id: string;
+  name: string;
+  path: string;
+  source: "web" | "history";
 }
 
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -54,6 +66,15 @@ export interface AgentCommandAckMessage {
   type: "agent.commandAck";
   commandId: string;
   status: "accepted" | "completed" | "failed";
+  error?: string;
+}
+
+export interface AgentWorkspaceValidationMessage {
+  type: "agent.workspaceValidation";
+  requestId: string;
+  valid: boolean;
+  canonicalPath?: string;
+  suggestedName?: string;
   error?: string;
 }
 
@@ -182,6 +203,7 @@ export type AgentToControlMessage =
   | AgentHelloMessage
   | AgentHeartbeatMessage
   | AgentCommandAckMessage
+  | AgentWorkspaceValidationMessage
   | AgentDurableMessage;
 
 export interface CreateConversationCommand {
@@ -282,10 +304,23 @@ export interface ControlErrorMessage {
   message: string;
 }
 
+export interface ControlWorkspaceValidateMessage {
+  type: "control.workspaceValidate";
+  requestId: string;
+  path: string;
+}
+
+export interface ControlWorkspaceSyncMessage {
+  type: "control.workspaceSync";
+  workspaces: ManagedWorkspaceDescriptor[];
+}
+
 export type ControlToAgentMessage =
   | ControlCommandMessage
   | ControlWelcomeMessage
   | ControlDeliveryAckMessage
+  | ControlWorkspaceValidateMessage
+  | ControlWorkspaceSyncMessage
   | ControlErrorMessage;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -301,6 +336,7 @@ export function parseAgentMessage(input: string): AgentToControlMessage {
     value.type !== "agent.hello" &&
     value.type !== "agent.heartbeat" &&
     value.type !== "agent.commandAck" &&
+    value.type !== "agent.workspaceValidation" &&
     value.type !== "agent.message"
   ) {
     throw new Error(`Unsupported agent message type: ${value.type}`);
@@ -317,6 +353,8 @@ export function parseControlMessage(input: string): ControlToAgentMessage {
     value.type !== "control.command" &&
     value.type !== "control.welcome" &&
     value.type !== "control.deliveryAck" &&
+    value.type !== "control.workspaceValidate" &&
+    value.type !== "control.workspaceSync" &&
     value.type !== "control.error"
   ) {
     throw new Error(`Unsupported control message type: ${value.type}`);

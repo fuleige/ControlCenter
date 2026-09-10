@@ -26,4 +26,19 @@ describe("wire protocol", () => {
       "Unsupported control message type",
     );
   });
+
+  it("parses workspace validation messages", () => {
+    expect(parseControlMessage(JSON.stringify({
+      type: "control.workspaceValidate",
+      requestId: "workspace-request-1",
+      path: "/projects/example",
+    })).type).toBe("control.workspaceValidate");
+    expect(parseAgentMessage(JSON.stringify({
+      type: "agent.workspaceValidation",
+      requestId: "workspace-request-1",
+      valid: true,
+      canonicalPath: "/projects/example",
+      suggestedName: "example",
+    })).type).toBe("agent.workspaceValidation");
+  });
 });

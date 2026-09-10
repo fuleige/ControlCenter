@@ -17,12 +17,14 @@
 Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agent -- stdio --> Codex App Server
 ```
 
-控制中心与 Agent 使用自有 `control-protocol/v3`。Codex JSON-RPC 的版本差异只在 Agent 内处理。
+控制中心与 Agent 使用自有 `control-protocol/v4`。Codex JSON-RPC 的版本差异只在 Agent 内处理。
 
 ## 已实现能力
 
 - Agent 注册、心跳、断线检测和自动重连。
-- Agent 预配置项目目录（内部协议名 Workspace），服务端不能下发任意本地路径。
+- Agent 启动目录自动成为不可修改的默认工作空间；还可通过启动配置或 Web 设置为节点登记多个本地路径。
+- Web 添加工作空间时由对应 Agent 验证目录存在、可读写并返回规范路径；每次创建会话或新任务前再次验证。
+- 每个会话固定绑定一个工作空间；Agent 更换启动目录后，新目录成为默认，仍被会话使用的旧默认目录作为历史工作空间保留。
 - 节点默认使用主机名，也可以在 Web 中设置持久化显示名称。
 - 节点、工作区、Conversation/Thread 和 Run/Turn 管理；历史会话支持搜索、重命名、置顶、筛选和删除。
 - 多节点、多对话；不同工作区在节点并发额度内并行，同一工作区的多个任务接受后按顺序排队。
@@ -33,7 +35,7 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - 任务追加指令、中止当前轮次和失败状态；中止后可在同一历史会话继续发起新轮次。
 - 主内容区任务中心只保留全局节点菜单，隐藏依赖当前节点的历史会话栏；仅在用户未查看对应会话时生成未读完成、失败或等待操作通知，并展示会话名与对应任务最新回复摘要。
 - 任务中心支持会话名称/节点名称搜索、节点与状态筛选、全部标为已读，以及失败任务幂等重新执行。
-- 全局快速切换支持按节点名称或会话名称搜索所有节点和跨节点历史会话；桌面端可使用 `Ctrl/Cmd + K`，移动端使用顶部搜索入口。
+- 全局快速切换支持按节点名称或会话名称搜索所有节点和跨节点历史会话；空关键词不加载历史会话，有关键词时最多返回 10 条会话结果。桌面端可使用 `Ctrl/Cmd + K`，移动端使用顶部搜索入口。
 - 会话列表使用服务端名称搜索与游标分页，每页 50 条；不会下载或检索消息正文、代码和附件内容。
 - 任务中心最多展示 200 条，摘要最多 120 个字符；已读通知保留 30 天、未读通知保留 90 天，通知清理不影响会话历史。
 - 全局默认模型和思考强度设置，节点不支持偏好模型时回退本机默认；设置页展示构建版本号。
@@ -74,9 +76,10 @@ AGENT_SHARED_TOKEN=local-agent-token npm run dev:server
 CONTROL_CENTER_URL=ws://127.0.0.1:8787/agent/connect \
 AGENT_TOKEN=local-agent-token \
 AGENT_NAME=local-dev \
-AGENT_WORKSPACES='[{"id":"controller-center","name":"Controller Center","path":"/absolute/path/to/ControlerCenter"}]' \
 npm run dev:agent
 ```
+
+Agent 启动命令所在目录就是默认工作空间（通过 npm 启动时使用 npm 保留的原始调用目录，而不是 workspace 包目录）。`AGENT_WORKSPACES` 仅用于追加由部署配置维护的工作空间；若其中包含启动目录，该项会被识别为默认项。
 
 终端三，启动 Web：
 
@@ -113,6 +116,7 @@ Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿�
 - `deploy/agent.env.example`
 
 Agent 的运行用户必须对配置的工作区具有适当权限，并且该用户需要完成本地 Codex 登录。
+systemd 的 `WorkingDirectory` 决定该节点的默认工作空间；示例中为 `/opt/controller-center`。
 
 ## 常用配置
 
@@ -121,7 +125,7 @@ Agent 的运行用户必须对配置的工作区具有适当权限，并且该�
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `CONTROL_PORT` | `8787` | API 与 Agent WSS 端口 |
-| `CONTROL_DATA_DIR` | `./data` | SQLite 数据目录 |
+| `CONTROL_DATA_DIR` | `<启动命令所在目录>/data` | SQLite 数据与附件目录；建议生产环境显式配置绝对路径 |
 | `AGENT_SHARED_TOKEN` | `dev-agent-token` | Agent 共享注册令牌，生产必须修改 |
 | `ADMIN_TOKEN` | 空 | 可选的单管理员 API Bearer Token |
 | `CORS_ORIGIN` | `http://localhost:5173` | 允许的 Web Origin，逗号分隔 |
@@ -134,7 +138,7 @@ Agent：
 | `AGENT_TOKEN` | `dev-agent-token` | 与中心一致的令牌 |
 | `AGENT_NAME` | 当前主机名 | 首次注册时报告的节点名称；可在 Web 中设置显示名称 |
 | `AGENT_DATA_DIR` | `~/.controller-center-agent` | 本地身份与可靠队列 |
-| `AGENT_WORKSPACES` | 当前目录 | 允许使用的工作区 JSON 数组 |
+| `AGENT_WORKSPACES` | 空数组 | 可选的附加工作空间 JSON 数组；不能覆盖由进程当前目录决定的默认工作空间 |
 | `MAX_CONCURRENT_RUNS` | `2` | 节点最大活动任务数 |
 | `AGENT_NETWORK_ACCESS` | `false` | Codex workspace sandbox 默认网络权限 |
 | `CODEX_BIN` | `codex` | Codex CLI 路径 |
@@ -143,6 +147,9 @@ Agent：
 
 - `GET /api/nodes`
 - `PATCH /api/nodes/:id`
+- `GET/POST /api/nodes/:id/workspaces`
+- `PATCH/DELETE /api/nodes/:nodeId/workspaces/:workspaceId`
+- `POST /api/nodes/:nodeId/workspaces/:workspaceId/validate`
 - `GET/POST /api/conversations`
 - `PATCH /api/conversations/:id`（重命名、置顶）
 - `POST /api/conversations/start`（首次发送时幂等创建会话和首轮任务）
@@ -164,7 +171,9 @@ Agent：
 
 ## 安全边界
 
-- 控制中心不能指定任意 `cwd`，只能使用 Agent 显式发布的工作区 ID。
+- Web 管理员可以登记 Agent 运行用户有权访问的任意本地目录；这等同于授予后续 Codex 会话在该目录中工作的能力。
+- Agent 在保存和实际执行前都验证路径，并始终使用规范绝对路径；目录权限边界由 Agent 的操作系统用户决定。
+- 默认工作空间只能由 Agent 的进程启动目录决定，不能通过 Web 改名、迁移、停用或删除。
 - Agent 使用 `workspaceWrite` sandbox，默认关闭网络访问。
 - 不提供绕过 Codex 的远程 Shell API。
 - OpenAI/ChatGPT 凭据始终由节点本地的 Codex 管理。

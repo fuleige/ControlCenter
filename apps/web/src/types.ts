@@ -3,6 +3,15 @@ export interface Workspace {
   nodeId: string;
   name: string;
   path: string;
+  source: "default" | "config" | "web" | "history";
+  isDefault: boolean;
+  status: "valid" | "invalid" | "offline" | "archived";
+  validationError: string | null;
+  lastValidatedAt: string | null;
+  archivedAt: string | null;
+  conversationCount: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

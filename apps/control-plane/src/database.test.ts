@@ -40,8 +40,8 @@ describe("ControlDatabase", () => {
       codexVersion: "codex-cli 0.153.0",
       maxConcurrentRuns: 2,
       workspaces: [
-        { id: "repo", name: "Repository", path: "/repo" },
-        { id: "repo-2", name: "Other Repository", path: "/repo-2" },
+        { id: "repo", name: "Repository", path: "/repo", source: "default", isDefault: true },
+        { id: "repo-2", name: "Other Repository", path: "/repo-2", source: "config", isDefault: false },
       ],
       models: [{
         id: "gpt-test",
@@ -130,6 +130,7 @@ describe("ControlDatabase", () => {
     expect(database.listConversationPage({ query: "searchable", limit: 10 }).data.map((conversation) => conversation.id)).toEqual(["conversation-2"]);
     expect(database.listConversationPage({ query: "我的构建机", limit: 10 }).total).toBe(2);
     expect(database.listConversationPage({ nodeId: "node-1", query: "我的构建机", limit: 10 }).total).toBe(0);
+    expect(database.listConversationPage({ query: "searchable", limit: 10, includeTotal: false }).total).toBeUndefined();
     expect(database.listConversationPage({ nodeId: "node-1", runStatus: "active", limit: 10 }).data.map((conversation) => conversation.id)).toEqual(["conversation-1"]);
 
     database.insertUserMessage({
@@ -235,6 +236,99 @@ describe("ControlDatabase", () => {
     expect(database.canDispatchQueuedRun("node-1", "repo")).toBe(true);
     expect(database.deleteConversation("conversation-1")).toBe(true);
     expect(database.getConversation("conversation-1")).toBeNull();
+    database.close();
+  });
+
+  it("persists Web workspaces and retains a previous default for bound conversations", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "control-plane-workspace-test-"));
+    directories.push(directory);
+    const database = new ControlDatabase(path.join(directory, "test.db"));
+    const firstAt = "2026-09-09T10:00:00.000Z";
+    const secondAt = "2026-09-09T11:00:00.000Z";
+    const descriptor = {
+      id: "node-workspaces",
+      name: "Workspace host",
+      platform: "linux",
+      arch: "x64",
+      agentVersion: "0.2.0",
+      codexVersion: "codex-cli 0.154.0",
+      maxConcurrentRuns: 2,
+      models: [],
+    };
+    database.upsertNode({
+      ...descriptor,
+      workspaces: [{ id: "default-a", name: "Project A", path: "/projects/a", source: "default", isDefault: true }],
+    }, "boot-a", firstAt);
+    expect(database.getWorkspace(descriptor.id, "default-a")?.isDefault).toBe(true);
+
+    const managed = database.createWebWorkspace({
+      id: "managed-b",
+      nodeId: descriptor.id,
+      name: "Project B",
+      path: "/projects/b",
+      now: firstAt,
+    });
+    expect(managed.source).toBe("web");
+    expect(database.listManagedWorkspacesForAgent(descriptor.id)).toEqual([{
+      id: "managed-b",
+      name: "Project B",
+      path: "/projects/b",
+      source: "web",
+    }]);
+    expect(database.findWorkspaceByPath(descriptor.id, "/projects/b")?.id).toBe("managed-b");
+    expect(database.updateWorkspaceValidation(descriptor.id, "managed-b", false, "missing", secondAt)?.status).toBe("invalid");
+    expect(database.updateWorkspace({ nodeId: descriptor.id, id: "managed-b", path: "/projects/b-new", now: secondAt })?.status).toBe("valid");
+    database.createWebWorkspace({
+      id: "managed-current",
+      nodeId: descriptor.id,
+      name: "Future default alias",
+      path: "/projects/c",
+      now: firstAt,
+    });
+
+    database.createConversation({
+      id: "old-default-conversation",
+      nodeId: descriptor.id,
+      workspaceId: "default-a",
+      title: "Old default",
+      model: null,
+      effort: null,
+      clientRequestId: "old-default-request",
+      remoteThreadId: "old-default-thread",
+      status: "ready",
+      error: null,
+      pinnedAt: null,
+      latestRunStatus: null,
+      createdAt: firstAt,
+      updatedAt: firstAt,
+    });
+    database.createConversation({
+      id: "managed-current-conversation",
+      nodeId: descriptor.id,
+      workspaceId: "managed-current",
+      title: "Future default via Web",
+      model: null,
+      effort: null,
+      clientRequestId: "managed-current-request",
+      remoteThreadId: "managed-current-thread",
+      status: "ready",
+      error: null,
+      pinnedAt: null,
+      latestRunStatus: null,
+      createdAt: firstAt,
+      updatedAt: firstAt,
+    });
+    database.upsertNode({
+      ...descriptor,
+      workspaces: [{ id: "default-c", name: "Project C", path: "/projects/c", source: "default", isDefault: true }],
+    }, "boot-b", secondAt);
+    expect(database.getWorkspace(descriptor.id, "default-c")?.isDefault).toBe(true);
+    expect(database.getWorkspace(descriptor.id, "default-a")?.source).toBe("history");
+    expect(database.getWorkspace(descriptor.id, "managed-current")?.source).toBe("history");
+    expect(database.listManagedWorkspacesForAgent(descriptor.id).map((workspace) => workspace.id).sort()).toEqual(["default-a", "managed-b", "managed-current"]);
+    expect(database.deleteUnusedWorkspace(descriptor.id, "managed-b")).toBe(true);
+    expect(database.getWorkspace(descriptor.id, "managed-b")).toBeNull();
+    expect(database.deleteUnusedWorkspace(descriptor.id, "default-a")).toBe(false);
     database.close();
   });
 });

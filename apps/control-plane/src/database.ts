@@ -11,6 +11,8 @@ import type {
   RunProgressPayload,
   RunFinishedPayload,
   RunStartedPayload,
+  WorkspaceSource,
+  WorkspaceStatus,
 } from "@controller-center/protocol";
 
 type Row = Record<string, unknown>;
@@ -38,6 +40,15 @@ export interface WorkspaceRecord {
   nodeId: string;
   name: string;
   path: string;
+  source: WorkspaceSource;
+  isDefault: boolean;
+  status: WorkspaceStatus;
+  validationError: string | null;
+  lastValidatedAt: string | null;
+  archivedAt: string | null;
+  conversationCount: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ConversationRecord {
@@ -65,7 +76,7 @@ export interface ConversationListCursor {
 
 export interface ConversationPage {
   data: ConversationRecord[];
-  total: number;
+  total?: number;
   nextCursor: ConversationListCursor | null;
 }
 
@@ -264,6 +275,14 @@ export class ControlDatabase {
         id TEXT NOT NULL,
         name TEXT NOT NULL,
         path TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'config',
+        is_default INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'valid',
+        validation_error TEXT,
+        last_validated_at TEXT,
+        archived_at TEXT,
+        created_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (node_id, id)
       );
       CREATE TABLE IF NOT EXISTS conversations (
@@ -395,6 +414,14 @@ export class ControlDatabase {
     `);
     this.ensureColumn("nodes", "display_name", "TEXT");
     this.ensureColumn("nodes", "model_catalog_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("workspaces", "source", "TEXT NOT NULL DEFAULT 'config'");
+    this.ensureColumn("workspaces", "is_default", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("workspaces", "status", "TEXT NOT NULL DEFAULT 'valid'");
+    this.ensureColumn("workspaces", "validation_error", "TEXT");
+    this.ensureColumn("workspaces", "last_validated_at", "TEXT");
+    this.ensureColumn("workspaces", "archived_at", "TEXT");
+    this.ensureColumn("workspaces", "created_at", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("workspaces", "updated_at", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("conversations", "effort", "TEXT");
     this.ensureColumn("conversations", "client_request_id", "TEXT");
     this.ensureColumn("conversations", "pinned_at", "TEXT");
@@ -409,6 +436,8 @@ export class ControlDatabase {
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS conversations_node_order_idx ON conversations(node_id, pinned_at DESC, updated_at DESC, id DESC);");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS conversations_order_idx ON conversations(pinned_at DESC, updated_at DESC, id DESC);");
     this.sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS runs_client_request_idx ON runs(client_request_id) WHERE client_request_id IS NOT NULL;");
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS workspaces_node_status_idx ON workspaces(node_id, archived_at, is_default DESC, name);");
+    this.sqlite.prepare("UPDATE workspaces SET created_at = CASE WHEN created_at = '' THEN ? ELSE created_at END, updated_at = CASE WHEN updated_at = '' THEN ? ELSE updated_at END").run(new Date().toISOString(), new Date().toISOString());
     this.migrateLegacyMessages();
   }
 
@@ -464,48 +493,141 @@ export class ControlDatabase {
     }
   }
 
+  private workspaceFromRow(row: Row, nodeOffline = false): WorkspaceRecord {
+    const archivedAt = nullableText(row, "archived_at");
+    const storedStatus = text(row, "status") as WorkspaceStatus;
+    return {
+      id: text(row, "id"),
+      nodeId: text(row, "node_id"),
+      name: text(row, "name"),
+      path: text(row, "path"),
+      source: text(row, "source") as WorkspaceSource,
+      isDefault: Number(row.is_default) === 1,
+      status: archivedAt ? "archived" : nodeOffline ? "offline" : storedStatus,
+      validationError: nullableText(row, "validation_error"),
+      lastValidatedAt: nullableText(row, "last_validated_at"),
+      archivedAt,
+      conversationCount: Number(row.conversation_count ?? 0),
+      createdAt: text(row, "created_at"),
+      updatedAt: text(row, "updated_at"),
+    };
+  }
+
   upsertNode(node: NodeDescriptor, bootId: string, now: string): boolean {
     const previous = this.sqlite.prepare("SELECT boot_id FROM nodes WHERE id = ?").get(node.id) as Row | undefined;
     const restarted = Boolean(previous?.boot_id && String(previous.boot_id) !== bootId);
-    this.sqlite.prepare(`
-      INSERT INTO nodes (
-        id, name, platform, arch, agent_version, codex_version,
-        max_concurrent_runs, active_runs, status, boot_id, last_seen_at, connected_at, model_catalog_json, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        platform = excluded.platform,
-        arch = excluded.arch,
-        agent_version = excluded.agent_version,
-        codex_version = excluded.codex_version,
-        max_concurrent_runs = excluded.max_concurrent_runs,
-        status = 'online',
-        boot_id = excluded.boot_id,
-        last_seen_at = excluded.last_seen_at,
-        connected_at = excluded.connected_at,
-        model_catalog_json = excluded.model_catalog_json,
-        updated_at = excluded.updated_at
-    `).run(
-      node.id,
-      node.name,
-      node.platform,
-      node.arch,
-      node.agentVersion,
-      node.codexVersion,
-      node.maxConcurrentRuns,
-      bootId,
-      now,
-      now,
-      JSON.stringify(node.models ?? []),
-      now,
-    );
-
     this.sqlite.exec("BEGIN");
     try {
-      this.sqlite.prepare("DELETE FROM workspaces WHERE node_id = ?").run(node.id);
-      const insert = this.sqlite.prepare("INSERT INTO workspaces (node_id, id, name, path) VALUES (?, ?, ?, ?)");
+      this.sqlite.prepare(`
+        INSERT INTO nodes (
+          id, name, platform, arch, agent_version, codex_version,
+          max_concurrent_runs, active_runs, status, boot_id, last_seen_at, connected_at, model_catalog_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          platform = excluded.platform,
+          arch = excluded.arch,
+          agent_version = excluded.agent_version,
+          codex_version = excluded.codex_version,
+          max_concurrent_runs = excluded.max_concurrent_runs,
+          status = 'online',
+          boot_id = excluded.boot_id,
+          last_seen_at = excluded.last_seen_at,
+          connected_at = excluded.connected_at,
+          model_catalog_json = excluded.model_catalog_json,
+          updated_at = excluded.updated_at
+      `).run(
+        node.id,
+        node.name,
+        node.platform,
+        node.arch,
+        node.agentVersion,
+        node.codexVersion,
+        node.maxConcurrentRuns,
+        bootId,
+        now,
+        now,
+        JSON.stringify(node.models ?? []),
+        now,
+      );
+      this.sqlite.prepare("UPDATE workspaces SET is_default = 0 WHERE node_id = ?").run(node.id);
+      const previousLocal = this.sqlite.prepare(
+        "SELECT id FROM workspaces WHERE node_id = ? AND source IN ('default', 'config')",
+      ).all(node.id) as Row[];
+      const incomingIds = new Set(node.workspaces.map((workspace) => workspace.id));
+      const upsert = this.sqlite.prepare(`
+        INSERT INTO workspaces (
+          node_id, id, name, path, source, is_default, status,
+          validation_error, last_validated_at, archived_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'valid', NULL, ?, NULL, ?, ?)
+        ON CONFLICT(node_id, id) DO UPDATE SET
+          name = excluded.name,
+          path = excluded.path,
+          source = excluded.source,
+          is_default = excluded.is_default,
+          status = 'valid',
+          validation_error = NULL,
+          last_validated_at = excluded.last_validated_at,
+          archived_at = NULL,
+          updated_at = excluded.updated_at
+      `);
       for (const workspace of node.workspaces) {
-        insert.run(node.id, workspace.id, workspace.name, workspace.path);
+        const conflict = this.sqlite.prepare(
+          `SELECT source, path,
+            (SELECT COUNT(*) FROM conversations c WHERE c.node_id = workspaces.node_id AND c.workspace_id = workspaces.id) AS conversation_count
+           FROM workspaces WHERE node_id = ? AND id = ?`,
+        ).get(node.id, workspace.id) as Row | undefined;
+        if (conflict && !["default", "config", "history"].includes(text(conflict, "source"))) {
+          throw new Error(`Agent workspace id conflicts with a Web workspace: ${workspace.id}`);
+        }
+        if (conflict && text(conflict, "path") !== workspace.path && Number(conflict.conversation_count ?? 0) > 0) {
+          throw new Error(`Agent workspace id ${workspace.id} cannot move because existing conversations use its previous path`);
+        }
+        upsert.run(
+          node.id,
+          workspace.id,
+          workspace.name,
+          workspace.path,
+          workspace.source,
+          workspace.isDefault ? 1 : 0,
+          now,
+          now,
+          now,
+        );
+      }
+      for (const previous of previousLocal) {
+        const workspaceId = text(previous, "id");
+        if (incomingIds.has(workspaceId)) continue;
+        const usage = this.sqlite.prepare(
+          "SELECT COUNT(*) AS count FROM conversations WHERE node_id = ? AND workspace_id = ?",
+        ).get(node.id, workspaceId) as Row;
+        if (Number(usage.count) > 0) {
+          this.sqlite.prepare(`
+            UPDATE workspaces
+            SET source = 'history', is_default = 0, archived_at = NULL, updated_at = ?
+            WHERE node_id = ? AND id = ?
+          `).run(now, node.id, workspaceId);
+        } else {
+          this.sqlite.prepare("DELETE FROM workspaces WHERE node_id = ? AND id = ?").run(node.id, workspaceId);
+        }
+      }
+      for (const workspace of node.workspaces) {
+        const aliases = this.sqlite.prepare(`
+          SELECT id FROM workspaces
+          WHERE node_id = ? AND path = ? AND id <> ? AND source IN ('web', 'history') AND archived_at IS NULL
+        `).all(node.id, workspace.path, workspace.id) as Row[];
+        for (const alias of aliases) {
+          const aliasId = text(alias, "id");
+          const usage = this.sqlite.prepare(
+            "SELECT COUNT(*) AS count FROM conversations WHERE node_id = ? AND workspace_id = ?",
+          ).get(node.id, aliasId) as Row;
+          if (Number(usage.count) > 0) {
+            this.sqlite.prepare("UPDATE workspaces SET source = 'history', is_default = 0, updated_at = ? WHERE node_id = ? AND id = ?")
+              .run(now, node.id, aliasId);
+          } else {
+            this.sqlite.prepare("DELETE FROM workspaces WHERE node_id = ? AND id = ?").run(node.id, aliasId);
+          }
+        }
       }
       this.sqlite.exec("COMMIT");
     } catch (error) {
@@ -560,7 +682,12 @@ export class ControlDatabase {
 
   listNodes(): NodeRecord[] {
     const rows = this.sqlite.prepare("SELECT * FROM nodes ORDER BY status DESC, name").all() as Row[];
-    const workspaceStatement = this.sqlite.prepare("SELECT * FROM workspaces WHERE node_id = ? ORDER BY name");
+    const workspaceStatement = this.sqlite.prepare(`
+      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      FROM workspaces w
+      WHERE w.node_id = ?
+      ORDER BY w.is_default DESC, w.archived_at IS NOT NULL, w.name
+    `);
     return rows.map((row) => ({
       id: text(row, "id"),
       name: nullableText(row, "display_name") ?? text(row, "name"),
@@ -576,12 +703,8 @@ export class ControlDatabase {
       lastSeenAt: text(row, "last_seen_at"),
       connectedAt: nullableText(row, "connected_at"),
       models: parseJson(row.model_catalog_json ?? "[]") as ModelDescriptor[],
-      workspaces: (workspaceStatement.all(text(row, "id")) as Row[]).map((workspace) => ({
-        id: text(workspace, "id"),
-        nodeId: text(workspace, "node_id"),
-        name: text(workspace, "name"),
-        path: text(workspace, "path"),
-      })),
+      workspaces: (workspaceStatement.all(text(row, "id")) as Row[])
+        .map((workspace) => this.workspaceFromRow(workspace, text(row, "status") !== "online")),
     }));
   }
 
@@ -593,9 +716,103 @@ export class ControlDatabase {
   }
 
   getWorkspace(nodeId: string, workspaceId: string): WorkspaceRecord | null {
-    const row = this.sqlite.prepare("SELECT * FROM workspaces WHERE node_id = ? AND id = ?").get(nodeId, workspaceId) as Row | undefined;
+    const row = this.sqlite.prepare(`
+      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      FROM workspaces w WHERE w.node_id = ? AND w.id = ?
+    `).get(nodeId, workspaceId) as Row | undefined;
     if (!row) return null;
-    return { id: text(row, "id"), nodeId: text(row, "node_id"), name: text(row, "name"), path: text(row, "path") };
+    const node = this.sqlite.prepare("SELECT status FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
+    return this.workspaceFromRow(row, node ? text(node, "status") !== "online" : true);
+  }
+
+  listWorkspaces(nodeId: string, includeArchived = false): WorkspaceRecord[] {
+    const rows = this.sqlite.prepare(`
+      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      FROM workspaces w
+      WHERE w.node_id = ? ${includeArchived ? "" : "AND w.archived_at IS NULL"}
+      ORDER BY w.is_default DESC, w.archived_at IS NOT NULL, w.name
+    `).all(nodeId) as Row[];
+    const node = this.sqlite.prepare("SELECT status FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
+    const offline = !node || text(node, "status") !== "online";
+    return rows.map((row) => this.workspaceFromRow(row, offline));
+  }
+
+  listManagedWorkspacesForAgent(nodeId: string): Array<{ id: string; name: string; path: string; source: "web" | "history" }> {
+    return (this.sqlite.prepare(`
+      SELECT id, name, path, source FROM workspaces
+      WHERE node_id = ? AND source IN ('web', 'history') AND archived_at IS NULL
+      ORDER BY name
+    `).all(nodeId) as Row[]).map((row) => ({
+      id: text(row, "id"),
+      name: text(row, "name"),
+      path: text(row, "path"),
+      source: text(row, "source") as "web" | "history",
+    }));
+  }
+
+  findWorkspaceByPath(nodeId: string, workspacePath: string, exceptId?: string): WorkspaceRecord | null {
+    const row = this.sqlite.prepare(`
+      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      FROM workspaces w
+      WHERE w.node_id = ? AND w.path = ? ${exceptId ? "AND w.id <> ?" : ""}
+      LIMIT 1
+    `).get(...(exceptId ? [nodeId, workspacePath, exceptId] : [nodeId, workspacePath])) as Row | undefined;
+    return row ? this.workspaceFromRow(row) : null;
+  }
+
+  createWebWorkspace(input: { id: string; nodeId: string; name: string; path: string; now: string }): WorkspaceRecord {
+    this.sqlite.prepare(`
+      INSERT INTO workspaces (
+        node_id, id, name, path, source, is_default, status,
+        validation_error, last_validated_at, archived_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'web', 0, 'valid', NULL, ?, NULL, ?, ?)
+    `).run(input.nodeId, input.id, input.name, input.path, input.now, input.now, input.now);
+    return this.getWorkspace(input.nodeId, input.id)!;
+  }
+
+  updateWorkspace(input: { nodeId: string; id: string; name?: string; path?: string; archived?: boolean; now: string }): WorkspaceRecord | null {
+    const current = this.getWorkspace(input.nodeId, input.id);
+    if (!current) return null;
+    const name = input.name ?? current.name;
+    const workspacePath = input.path ?? current.path;
+    const archivedAt = input.archived === undefined ? current.archivedAt : input.archived ? input.now : null;
+    const status = archivedAt
+      ? "archived"
+      : input.archived === false || input.path
+        ? "valid"
+        : current.status === "offline" ? "valid" : current.status;
+    this.sqlite.prepare(`
+      UPDATE workspaces SET name = ?, path = ?, status = ?, validation_error = ?,
+        last_validated_at = ?, archived_at = ?, updated_at = ?
+      WHERE node_id = ? AND id = ?
+    `).run(
+      name,
+      workspacePath,
+      status,
+      input.path ? null : current.validationError,
+      input.path ? input.now : current.lastValidatedAt,
+      archivedAt,
+      input.now,
+      input.nodeId,
+      input.id,
+    );
+    return this.getWorkspace(input.nodeId, input.id);
+  }
+
+  updateWorkspaceValidation(nodeId: string, id: string, valid: boolean, error: string | null, now: string): WorkspaceRecord | null {
+    this.sqlite.prepare(`
+      UPDATE workspaces SET status = ?, validation_error = ?, last_validated_at = ?, updated_at = ?
+      WHERE node_id = ? AND id = ? AND archived_at IS NULL
+    `).run(valid ? "valid" : "invalid", valid ? null : error, now, now, nodeId, id);
+    return this.getWorkspace(nodeId, id);
+  }
+
+  deleteUnusedWorkspace(nodeId: string, id: string): boolean {
+    return this.sqlite.prepare(`
+      DELETE FROM workspaces
+      WHERE node_id = ? AND id = ? AND is_default = 0
+        AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.node_id = workspaces.node_id AND c.workspace_id = workspaces.id)
+    `).run(nodeId, id).changes > 0;
   }
 
   createConversation(record: ConversationRecord): void {
@@ -670,6 +887,7 @@ export class ControlDatabase {
     runStatus?: "active" | "failed";
     limit: number;
     cursor?: ConversationListCursor;
+    includeTotal?: boolean;
   }): ConversationPage {
     const predicates: string[] = [];
     const baseParameters: Array<string | number> = [];
@@ -699,12 +917,12 @@ export class ControlDatabase {
       }
     }
     const baseWhere = predicates.length ? `WHERE ${predicates.join(" AND ")}` : "";
-    const totalRow = this.sqlite.prepare(`
-      SELECT COUNT(*) AS count
-      FROM conversations c
-      JOIN nodes n ON n.id = c.node_id
-      ${baseWhere}
-    `).get(...baseParameters) as Row;
+    const total = options.includeTotal === false ? undefined : Number((this.sqlite.prepare(`
+        SELECT COUNT(*) AS count
+        FROM conversations c
+        JOIN nodes n ON n.id = c.node_id
+        ${baseWhere}
+      `).get(...baseParameters) as Row).count);
 
     const pagePredicates = [...predicates];
     const pageParameters = [...baseParameters];
@@ -738,7 +956,7 @@ export class ControlDatabase {
     const last = pageRows.at(-1);
     return {
       data: pageRows.map((row) => this.conversationFromRow(row)),
-      total: Number(totalRow.count),
+      ...(total === undefined ? {} : { total }),
       nextCursor: hasMore && last ? {
         pinned: nullableText(last, "pinned_at") ? 1 : 0,
         updatedAt: text(last, "updated_at"),
@@ -862,16 +1080,18 @@ export class ControlDatabase {
 
   canDispatchQueuedRun(nodeId: string, workspaceId: string): boolean {
     const node = this.sqlite.prepare("SELECT max_concurrent_runs FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
-    if (!node) return false;
+    const workspace = this.sqlite.prepare("SELECT path FROM workspaces WHERE node_id = ? AND id = ?").get(nodeId, workspaceId) as Row | undefined;
+    if (!node || !workspace) return false;
     const active = this.sqlite.prepare(`
       SELECT
         COUNT(*) AS node_count,
-        SUM(CASE WHEN c.workspace_id = ? THEN 1 ELSE 0 END) AS workspace_count
+        SUM(CASE WHEN w.path = ? THEN 1 ELSE 0 END) AS workspace_count
       FROM runs r
       JOIN conversations c ON c.id = r.conversation_id
+      JOIN workspaces w ON w.node_id = c.node_id AND w.id = c.workspace_id
       WHERE c.node_id = ?
         AND r.status IN ('dispatching', 'running', 'waiting_approval', 'recovering')
-    `).get(workspaceId, nodeId) as Row;
+    `).get(text(workspace, "path"), nodeId) as Row;
     return Number(active.node_count) < Number(node.max_concurrent_runs)
       && Number(active.workspace_count ?? 0) === 0;
   }

@@ -9,6 +9,7 @@ import type {
   Run,
   TaskCenterEntry,
   TaskCenterPolicy,
+  Workspace,
 } from "./types";
 
 const configuredApiUrl = (import.meta.env.VITE_API_URL as string | undefined)?.trim();
@@ -46,12 +47,45 @@ export async function updateNodeName(nodeId: string, name: string): Promise<Node
   })).node;
 }
 
+export async function listNodeWorkspaces(nodeId: string, includeArchived = true): Promise<Workspace[]> {
+  return (await api<{ data: Workspace[] }>(`/api/nodes/${encodeURIComponent(nodeId)}/workspaces?includeArchived=${includeArchived}`)).data;
+}
+
+export async function createNodeWorkspace(nodeId: string, input: { name?: string; path: string }): Promise<Workspace> {
+  return (await api<{ workspace: Workspace }>(`/api/nodes/${encodeURIComponent(nodeId)}/workspaces`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  })).workspace;
+}
+
+export async function updateNodeWorkspace(
+  nodeId: string,
+  workspaceId: string,
+  input: { name?: string; path?: string; archived?: boolean; confirmMigration?: boolean },
+): Promise<Workspace> {
+  return (await api<{ workspace: Workspace }>(`/api/nodes/${encodeURIComponent(nodeId)}/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  })).workspace;
+}
+
+export async function validateNodeWorkspace(nodeId: string, workspaceId: string): Promise<Workspace> {
+  return (await api<{ workspace: Workspace }>(`/api/nodes/${encodeURIComponent(nodeId)}/workspaces/${encodeURIComponent(workspaceId)}/validate`, {
+    method: "POST",
+  })).workspace;
+}
+
+export async function deleteNodeWorkspace(nodeId: string, workspaceId: string): Promise<void> {
+  await api<void>(`/api/nodes/${encodeURIComponent(nodeId)}/workspaces/${encodeURIComponent(workspaceId)}`, { method: "DELETE" });
+}
+
 export async function listConversations(options: {
   nodeId?: string;
   query?: string;
   status?: "active" | "failed";
   limit?: number;
   cursor?: string;
+  includeTotal?: boolean;
 } = {}): Promise<{ data: Conversation[]; total: number; nextCursor: string | null }> {
   const parameters = new URLSearchParams();
   if (options.nodeId) parameters.set("nodeId", options.nodeId);
@@ -59,6 +93,7 @@ export async function listConversations(options: {
   if (options.status) parameters.set("status", options.status);
   if (options.limit) parameters.set("limit", String(options.limit));
   if (options.cursor) parameters.set("cursor", options.cursor);
+  if (options.includeTotal === false) parameters.set("includeTotal", "false");
   const suffix = parameters.size ? `?${parameters}` : "";
   const result = await api<{ data: Conversation[]; total?: number; nextCursor?: string | null }>(`/api/conversations${suffix}`);
   return {

@@ -18,7 +18,11 @@ export interface ControlPlaneConfig {
 }
 
 export function loadConfig(): ControlPlaneConfig {
-  const dataDirectory = process.env.CONTROL_DATA_DIR ?? path.resolve("data");
+  // npm workspace scripts execute inside the package directory. INIT_CWD keeps
+  // the operator's invocation directory so the default database does not move
+  // when switching between root-level and workspace-level start commands.
+  const startupDirectory = process.env.INIT_CWD?.trim() || process.cwd();
+  const dataDirectory = path.resolve(process.env.CONTROL_DATA_DIR ?? path.join(startupDirectory, "data"));
   return {
     host: process.env.CONTROL_HOST ?? "0.0.0.0",
     port: integerEnv("CONTROL_PORT", 8787),

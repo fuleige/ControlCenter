@@ -18,6 +18,8 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
   deleteConversation,
+  createNodeWorkspace,
+  deleteNodeWorkspace,
   createAttachmentUpload,
   deleteAttachmentUpload,
   getConversation,
@@ -26,6 +28,7 @@ import {
   interruptRun,
   listConversations,
   listNodes,
+  listNodeWorkspaces,
   listPendingApprovals,
   markAllNotificationsRead,
   markConversationRead,
@@ -37,9 +40,11 @@ import {
   streamUrl,
   updateConversation,
   updateNodeName,
+  updateNodeWorkspace,
   updatePresence,
   updateSettings,
   uploadAttachmentContent,
+  validateNodeWorkspace,
 } from "./api";
 import type {
   Approval,
@@ -52,6 +57,7 @@ import type {
   Run,
   TaskCenterEntry,
   TaskCenterPolicy,
+  Workspace,
 } from "./types";
 
 type MobilePane = "nodes" | "conversations" | "chat";
@@ -682,11 +688,7 @@ function ApprovalCard({ approval, onDone }: { approval: Approval; onDone: () => 
 function TimelineCard({ entry, attachments }: { entry: TimelineEntry; attachments: AttachmentRecord[] }) {
   const linkedAttachments = attachments.filter((attachment) => entry.attachmentIds.includes(attachment.id));
   return (
-    <article className={`timeline-card timeline-${entry.kind}`}>
-      <div className="timeline-head">
-        <span>{entry.kind === "user" ? "你" : entry.title ?? (entry.kind === "agent" ? "Codex" : "运行事件")}</span>
-        <time>{formatDate(entry.at)}</time>
-      </div>
+    <article className={`timeline-card timeline-${entry.kind}`} title={formatDate(entry.at)}>
       {linkedAttachments.length > 0 && <div className="message-attachments">{linkedAttachments.map((attachment) => <span key={attachment.id}>{attachment.mediaType.startsWith("image/") ? "图片" : "文件"} · {attachment.name}</span>)}</div>}
       <MarkdownContent>{entry.content}</MarkdownContent>
     </article>
@@ -719,16 +721,223 @@ const effortLabels: Record<ReasoningEffort, string> = {
   max: "max · 最大",
 };
 
+const workspaceSourceLabels: Record<Workspace["source"], string> = {
+  default: "默认目录",
+  config: "启动配置",
+  web: "Web 添加",
+  history: "历史保留",
+};
+
+const workspaceStatusLabels: Record<Workspace["status"], string> = {
+  valid: "有效",
+  invalid: "失效",
+  offline: "节点离线",
+  archived: "已停用",
+};
+
+function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRecord[]; initialNodeId: string | null; onChanged: () => Promise<void> | void }) {
+  const [nodeId, setNodeId] = useState(nodes.find((node) => node.id === initialNodeId)?.id ?? nodes[0]?.id ?? "");
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newPath, setNewPath] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editPath, setEditPath] = useState("");
+  const [confirmation, setConfirmation] = useState<{
+    kind: "migration" | "archive" | "delete";
+    workspace: Workspace;
+    name?: string;
+    path?: string;
+  } | null>(null);
+  const requestRevision = useRef(0);
+  const selectedNode = nodes.find((node) => node.id === nodeId) ?? null;
+
+  useEffect(() => {
+    if (nodes.length === 0) setNodeId("");
+    else if (!nodes.some((node) => node.id === nodeId)) setNodeId(nodes[0]!.id);
+  }, [nodeId, nodes]);
+
+  const refresh = useCallback(async () => {
+    if (!nodeId) {
+      setWorkspaces([]);
+      return;
+    }
+    const revision = ++requestRevision.current;
+    setLoading(true);
+    try {
+      const result = await listNodeWorkspaces(nodeId, true);
+      if (revision === requestRevision.current) {
+        setWorkspaces(result);
+        setError(null);
+      }
+    } catch (reason) {
+      if (revision === requestRevision.current) setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (revision === requestRevision.current) setLoading(false);
+    }
+  }, [nodeId]);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  async function finishMutation(operation: () => Promise<unknown>, busyKey: string): Promise<boolean> {
+    setBusyId(busyKey);
+    setError(null);
+    try {
+      await operation();
+      await refresh();
+      await onChanged();
+      setEditingId(null);
+      setConfirmation(null);
+      return true;
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      await refresh();
+      setError(message);
+      return false;
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function addWorkspace(event: FormEvent) {
+    event.preventDefault();
+    if (!nodeId || !newPath.trim()) return;
+    const added = await finishMutation(
+      () => createNodeWorkspace(nodeId, { path: newPath.trim(), ...(newName.trim() ? { name: newName.trim() } : {}) }),
+      "add",
+    );
+    if (!added) return;
+    setNewName("");
+    setNewPath("");
+    setAdding(false);
+  }
+
+  function startEditing(workspace: Workspace) {
+    setEditingId(workspace.id);
+    setEditName(workspace.name);
+    setEditPath(workspace.path);
+    setError(null);
+  }
+
+  async function saveEditing(workspace: Workspace) {
+    const name = editName.trim();
+    const workspacePath = editPath.trim();
+    if (!name || !workspacePath) return setError("名称和路径不能为空");
+    if (workspacePath !== workspace.path) {
+      setConfirmation({ kind: "migration", workspace, name, path: workspacePath });
+      return;
+    }
+    if (name === workspace.name) {
+      setEditingId(null);
+      return;
+    }
+    await finishMutation(
+      () => updateNodeWorkspace(nodeId, workspace.id, {
+        ...(name !== workspace.name ? { name } : {}),
+        ...(workspacePath !== workspace.path ? { path: workspacePath } : {}),
+      }),
+      workspace.id,
+    );
+  }
+
+  async function confirmAction() {
+    if (!confirmation) return;
+    const { workspace } = confirmation;
+    if (confirmation.kind === "migration") {
+      await finishMutation(
+        () => updateNodeWorkspace(nodeId, workspace.id, {
+          name: confirmation.name,
+          path: confirmation.path,
+          confirmMigration: true,
+        }),
+        workspace.id,
+      );
+    } else if (confirmation.kind === "archive") {
+      await finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: true }), workspace.id);
+    } else {
+      await finishMutation(() => deleteNodeWorkspace(nodeId, workspace.id), workspace.id);
+    }
+  }
+
+  return <section className="workspace-settings" aria-label="工作空间管理">
+    <div className="settings-copy"><h3>工作空间</h3><p>为节点登记可以执行任务的本地目录。路径会交给对应 Agent 验证；默认工作空间固定为 Agent 的启动目录。</p></div>
+    <label className="workspace-node-select"><span>管理节点</span><select value={nodeId} disabled={Boolean(busyId)} onChange={(event) => { setNodeId(event.target.value); setAdding(false); setEditingId(null); setConfirmation(null); setError(null); }}>
+      {nodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.status === "online" ? "在线" : "离线"}</option>)}
+    </select></label>
+    <div className="workspace-settings-toolbar">
+      <div><strong>{selectedNode?.name ?? "没有节点"}</strong><span>{workspaces.filter((workspace) => !workspace.archivedAt && workspace.source !== "history").length} 个新会话可选</span></div>
+      <button type="button" className="primary-button" disabled={!selectedNode || selectedNode.status !== "online" || adding} onClick={() => setAdding(true)}>添加工作空间</button>
+    </div>
+    {adding && <form className="workspace-add-form" onSubmit={(event) => void addWorkspace(event)}>
+      <label><span>名称（可选）</span><input value={newName} maxLength={64} onChange={(event) => setNewName(event.target.value)} placeholder="默认使用目录名称" /></label>
+      <label><span>该节点上的路径</span><input value={newPath} onChange={(event) => setNewPath(event.target.value)} placeholder="例如 /root/codes/project-a" autoFocus /></label>
+      <p>该路径可以位于 Agent 用户有权访问的任意位置。系统不会自动创建目录。</p>
+      <div><button type="button" onClick={() => { setAdding(false); setNewName(""); setNewPath(""); }}>取消</button><button className="primary-button" disabled={!newPath.trim() || busyId === "add"}>{busyId === "add" ? "验证中…" : "验证并添加"}</button></div>
+    </form>}
+    {error && <p className="form-error workspace-settings-error">{error}</p>}
+    <div className="workspace-list">
+      {loading && workspaces.length === 0 ? <div className="empty compact">正在读取工作空间…</div> : workspaces.map((workspace) => {
+        const editable = !workspace.isDefault && workspace.source !== "config" && workspace.status !== "archived";
+        const isEditing = editingId === workspace.id;
+        return <article className={`workspace-card workspace-${workspace.status}`} key={workspace.id}>
+          <div className="workspace-card-main">
+            {isEditing ? <div className="workspace-edit-fields">
+              <input aria-label="工作空间名称" value={editName} maxLength={64} onChange={(event) => setEditName(event.target.value)} />
+              <input aria-label="工作空间路径" value={editPath} onChange={(event) => setEditPath(event.target.value)} />
+            </div> : <div className="workspace-card-copy">
+              <div><strong>{workspace.name}</strong>{workspace.isDefault ? <b>默认</b> : <span>{workspaceSourceLabels[workspace.source]}</span>}</div>
+              <code title={workspace.path}>{workspace.path}</code>
+              {workspace.validationError && <small>{workspace.validationError}</small>}
+            </div>}
+            <div className="workspace-card-meta"><span className={`workspace-status status-${workspace.status}`}>{workspaceStatusLabels[workspace.status]}</span><small>{workspace.conversationCount} 个会话</small></div>
+          </div>
+          <div className="workspace-card-actions">
+            {isEditing ? <>
+              <button type="button" onClick={() => setEditingId(null)}>取消</button>
+              <button type="button" className="primary-button" disabled={busyId === workspace.id} onClick={() => void saveEditing(workspace)}>保存</button>
+            </> : <>
+              {!workspace.archivedAt && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => validateNodeWorkspace(nodeId, workspace.id), workspace.id)}>验证</button>}
+              {editable && <button type="button" onClick={() => startEditing(workspace)}>编辑</button>}
+              {editable && <button type="button" className="danger-text" onClick={() => setConfirmation({ kind: workspace.conversationCount > 0 ? "archive" : "delete", workspace })}>{workspace.conversationCount > 0 ? "停用" : "删除"}</button>}
+              {workspace.archivedAt && workspace.source !== "config" && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: false }), workspace.id)}>恢复</button>}
+            </>}
+          </div>
+        </article>;
+      })}
+      {!loading && workspaces.length === 0 && <div className="empty compact">该节点还没有工作空间</div>}
+    </div>
+    {confirmation && <div className="workspace-confirm" role="alertdialog" aria-label="确认工作空间操作">
+      <strong>{confirmation.kind === "migration" ? "确认迁移路径" : confirmation.kind === "archive" ? "确认停用工作空间" : "确认删除工作空间"}</strong>
+      <p>{confirmation.kind === "migration"
+        ? confirmation.workspace.conversationCount > 0
+          ? `这会影响 ${confirmation.workspace.conversationCount} 个历史会话，之后它们将在新路径中继续执行。`
+          : `路径将从“${confirmation.workspace.path}”迁移到“${confirmation.path}”。`
+        : confirmation.kind === "archive"
+          ? `“${confirmation.workspace.name}”已有 ${confirmation.workspace.conversationCount} 个会话。停用后历史仍可查看，但不能继续执行。`
+          : `“${confirmation.workspace.name}”尚未绑定会话，删除后不会保留。`}</p>
+      <div><button type="button" disabled={Boolean(busyId)} onClick={() => setConfirmation(null)}>取消</button><button type="button" className="danger-button" disabled={Boolean(busyId)} onClick={() => void confirmAction()}>{busyId ? "处理中…" : "确认"}</button></div>
+    </div>}
+  </section>;
+}
+
 function SettingsPanel({
   settings,
   nodes,
   onClose,
   onSaved,
+  onNodesChanged,
+  selectedNodeId,
 }: {
   settings: GlobalSettings;
   nodes: NodeRecord[];
   onClose: () => void;
   onSaved: (settings: GlobalSettings) => void;
+  onNodesChanged: () => Promise<void> | void;
+  selectedNodeId: string | null;
 }) {
   const models = useMemo(() => {
     const catalog = new Map<string, string>();
@@ -739,6 +948,7 @@ function SettingsPanel({
   const [effort, setEffort] = useState<ReasoningEffort | "">(settings.defaultEffort ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [section, setSection] = useState<"defaults" | "workspaces">("defaults");
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -759,17 +969,18 @@ function SettingsPanel({
       <header><div><span>Controller Center</span><h2>设置</h2></div><button type="button" onClick={onClose} aria-label="关闭设置">×</button></header>
       <div className="settings-layout">
         <nav>
-          <button className="active">对话默认值</button>
+          <button type="button" className={section === "defaults" ? "active" : ""} onClick={() => setSection("defaults")}>对话默认值</button>
+          <button type="button" className={section === "workspaces" ? "active" : ""} onClick={() => setSection("workspaces")}>工作空间</button>
           <small>更多设置将在后续版本加入</small>
           <div className="settings-version"><span>Controller Center</span><strong>v{__APP_VERSION__}</strong></div>
         </nav>
-        <form onSubmit={(event) => void save(event)}>
+        {section === "defaults" ? <form className="settings-form" onSubmit={(event) => void save(event)}>
           <div className="settings-copy"><h3>对话默认值</h3><p>创建新会话时优先使用这些选项。节点不支持所选模型时，将自动使用该节点的本机默认模型。</p></div>
           <label><span>默认模型</span><select value={model} onChange={(event) => setModel(event.target.value)}><option value="">各节点本机默认</option>{models.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
           <label><span>默认思考强度</span><select value={effort} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}><option value="">模型默认</option>{Object.entries(effortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
           {error && <p className="form-error">{error}</p>}
           <div className="settings-actions"><button type="button" onClick={onClose}>取消</button><button className="primary-button" disabled={busy}>{busy ? "保存中…" : "保存设置"}</button></div>
-        </form>
+        </form> : <WorkspaceSettings nodes={nodes} initialNodeId={selectedNodeId} onChanged={onNodesChanged} />}
       </div>
     </section>
   </div>;
@@ -791,16 +1002,18 @@ function QuickSwitcher({ nodes, conversations, loading, error, onClose, onSearch
 }) {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
+  const hasQuery = query.trim().length > 0;
   const results = useMemo<QuickSwitchResult[]>(() => {
     const keyword = query.trim().toLocaleLowerCase();
+    if (!keyword) return [];
     const matchingNodes = nodes
-      .filter((node) => !keyword || `${node.name} ${node.reportedName} ${node.platform}`.toLocaleLowerCase().includes(keyword))
-      .slice(0, keyword ? 6 : 4)
+      .filter((node) => `${node.name} ${node.reportedName}`.toLocaleLowerCase().includes(keyword))
+      .slice(0, 6)
       .map((node): QuickSwitchResult => ({ key: `node:${node.id}`, kind: "node", node }));
     const matchingConversations = conversations
       .map((conversation) => ({ conversation, node: nodes.find((node) => node.id === conversation.nodeId) ?? null }))
-      .filter(({ conversation, node }) => !keyword || `${conversation.title} ${node?.name ?? ""}`.toLocaleLowerCase().includes(keyword))
-      .slice(0, keyword ? 10 : 6)
+      .filter(({ conversation, node }) => `${conversation.title} ${node?.name ?? ""}`.toLocaleLowerCase().includes(keyword))
+      .slice(0, 10)
       .map(({ conversation, node }): QuickSwitchResult => ({ key: `conversation:${conversation.id}`, kind: "conversation", conversation, node }));
     return [...matchingNodes, ...matchingConversations];
   }, [conversations, nodes, query]);
@@ -843,9 +1056,10 @@ function QuickSwitcher({ nodes, conversations, loading, error, onClose, onSearch
         <kbd>ESC</kbd>
       </div>
       <div className="switcher-results">
+        {!hasQuery && !loading && !error && <div className="switcher-state">输入节点名称或会话名称开始搜索</div>}
         {loading && results.length === 0 && <div className="switcher-state"><span className="loading-spinner" />正在搜索…</div>}
         {error && <div className="switcher-error">{error}</div>}
-        {!loading && !error && results.length === 0 && <div className="switcher-state">没有找到匹配的节点或会话</div>}
+        {hasQuery && !loading && !error && results.length === 0 && <div className="switcher-state">没有找到匹配的节点或会话</div>}
         {results.map((result, index) => {
           if (result.kind === "node") return <button
             type="button"
@@ -855,7 +1069,7 @@ function QuickSwitcher({ nodes, conversations, loading, error, onClose, onSearch
             onClick={() => activate(result)}
           >
             <span className="switcher-avatar">{nodeShortLabel(result.node.name)}</span>
-            <span className="switcher-main"><strong>{result.node.name}</strong><small>节点 · {result.node.workspaces.length} 个项目目录</small></span>
+            <span className="switcher-main"><strong>{result.node.name}</strong><small>节点 · {result.node.workspaces.filter((workspace) => workspace.source !== "history" && !workspace.archivedAt).length} 个工作空间</small></span>
             <span className={`switcher-status ${result.node.status}`}>{result.node.status === "online" ? "在线" : "离线"}</span>
           </button>;
           const workspace = result.node?.workspaces.find((candidate) => candidate.id === result.conversation.workspaceId);
@@ -867,7 +1081,7 @@ function QuickSwitcher({ nodes, conversations, loading, error, onClose, onSearch
             onClick={() => activate(result)}
           >
             <span className="switcher-avatar conversation">聊</span>
-            <span className="switcher-main"><strong>{result.conversation.title}</strong><small>{result.node?.name ?? "未知节点"} · {workspace?.name ?? "项目目录"}</small></span>
+            <span className="switcher-main"><strong>{result.conversation.title}</strong><small>{result.node?.name ?? "未知节点"} · {workspace?.name ?? "工作空间"}</small></span>
             <time>{relativeTime(result.conversation.updatedAt)}</time>
           </button>;
         })}
@@ -1018,10 +1232,11 @@ function ChatPanel({
     ?? modelCatalog.find((candidate) => candidate.isDefault);
   const effortOptions = selectedModel?.supportedReasoningEfforts ?? [];
   const composerStorageKey = `controller-center:composer:${node?.id ?? "none"}:${detail?.conversation.id ?? "new"}`;
+  const draftWorkspaceStorageKey = `controller-center:draft-workspace:${node?.id ?? "none"}`;
   const timelineVirtualizer = useVirtualizer({
     count: timeline.length,
     getScrollElement: () => timelineElement.current,
-    estimateSize: (index) => timeline[index]?.kind === "user" ? 82 : 100,
+    estimateSize: (index) => timeline[index]?.kind === "user" ? 66 : 84,
     getItemKey: (index) => timeline[index]?.id ?? index,
     overscan: 6,
     useFlushSync: false,
@@ -1040,7 +1255,14 @@ function ChatPanel({
     const resolvedEffort = preferredEffort && (!descriptor || descriptor.supportedReasoningEfforts.length === 0 || descriptor.supportedReasoningEfforts.some((option) => option.reasoningEffort === preferredEffort))
       ? preferredEffort
       : descriptor?.defaultReasoningEffort ?? "";
-    setWorkspaceId(detail?.conversation.workspaceId ?? node?.workspaces[0]?.id ?? "");
+    const activeWorkspaces = node?.workspaces.filter((workspace) => !workspace.archivedAt && workspace.source !== "history") ?? [];
+    const storedWorkspaceId = isDraft ? storedValue(draftWorkspaceStorageKey) : null;
+    const initialWorkspace = detail?.conversation.workspaceId
+      ?? activeWorkspaces.find((workspace) => workspace.id === storedWorkspaceId)?.id
+      ?? activeWorkspaces.find((workspace) => workspace.isDefault)?.id
+      ?? activeWorkspaces[0]?.id
+      ?? "";
+    setWorkspaceId(initialWorkspace);
     setModel(initialModel);
     setEffort(resolvedEffort);
     setPrompt(storedValue(composerStorageKey) ?? "");
@@ -1055,6 +1277,18 @@ function ChatPanel({
   useEffect(() => {
     storeValue(composerStorageKey, prompt || null);
   }, [composerStorageKey, prompt]);
+
+  useEffect(() => {
+    if (isDraft) storeValue(draftWorkspaceStorageKey, workspaceId || null);
+  }, [draftWorkspaceStorageKey, isDraft, workspaceId]);
+
+  useEffect(() => {
+    if (!isDraft) return;
+    const candidates = node?.workspaces.filter((workspace) => !workspace.archivedAt && workspace.source !== "history") ?? [];
+    setWorkspaceId((current) => candidates.some((workspace) => workspace.id === current)
+      ? current
+      : candidates.find((workspace) => workspace.isDefault)?.id ?? candidates[0]?.id ?? "");
+  }, [isDraft, node?.id, node?.workspaces]);
 
   useEffect(() => {
     uploadsRef.current = uploads;
@@ -1267,6 +1501,9 @@ function ChatPanel({
   const workspace = node.workspaces.find((item) => item.id === workspaceId);
   const canCompose = node.status === "online"
     && Boolean(workspaceId)
+    && workspace?.status === "valid"
+    && !workspace.archivedAt
+    && (!isDraft || workspace.source !== "history")
     && (isDraft || conversation?.status === "ready")
     && (!activeRun || Boolean(activeRun.remoteTurnId) && ["running", "waiting_approval"].includes(activeRun.status));
   const activeStateText = activeRun?.status === "waiting_approval"
@@ -1392,11 +1629,15 @@ function ChatPanel({
           <div className="composer-toolbar">
             <input ref={fileInputElement} className="file-input" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
             <button className="attach-button" type="button" onClick={() => fileInputElement.current?.click()} disabled={busy || uploads.length >= 10} title="上传文件或图片">＋ 附件</button>
-            {isDraft && node.workspaces.length > 1 && (
+            {isDraft && (
               <label className="setting-field workspace-setting">
-                <span>项目目录</span>
-                <select value={workspaceId} onChange={(event) => setWorkspaceId(event.target.value)} disabled={busy}>
-                  {node.workspaces.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
+                <select aria-label="选择工作空间" title="选择工作空间" value={workspaceId} onChange={(event) => setWorkspaceId(event.target.value)} disabled={busy || node.status !== "online"}>
+                  {node.workspaces.filter((candidate) => !candidate.archivedAt && candidate.source !== "history").map((candidate) => (
+                    <option key={candidate.id} value={candidate.id} disabled={candidate.status !== "valid"}>
+                      {candidate.name}{candidate.isDefault ? "（默认）" : ""} · {candidate.path}
+                    </option>
+                  ))}
+                  {node.workspaces.every((candidate) => Boolean(candidate.archivedAt) || candidate.source === "history") && <option value="">没有有效工作空间</option>}
                 </select>
               </label>
             )}
@@ -1636,10 +1877,16 @@ export function App() {
 
   const searchQuickConversations = useCallback(async (query: string) => {
     const requestRevision = ++quickSearchRequestRef.current;
-    setQuickLoading(true);
     setQuickError(null);
+    const keyword = query.trim();
+    if (!keyword) {
+      setQuickConversations([]);
+      setQuickLoading(false);
+      return;
+    }
+    setQuickLoading(true);
     try {
-      const result = await listConversations({ query, limit: 10 });
+      const result = await listConversations({ query: keyword, limit: 10, includeTotal: false });
       if (requestRevision === quickSearchRequestRef.current) setQuickConversations(result.data);
     } catch (reason) {
       if (requestRevision === quickSearchRequestRef.current) setQuickError(reason instanceof Error ? reason.message : String(reason));
@@ -1649,8 +1896,9 @@ export function App() {
   }, []);
 
   const openQuickSwitcher = useCallback(() => {
+    quickSearchRequestRef.current += 1;
     setOverlay("switcher");
-    setQuickLoading(true);
+    setQuickLoading(false);
     setQuickError(null);
     setQuickConversations([]);
   }, []);
@@ -1781,14 +2029,18 @@ export function App() {
 
   function selectNode(node: NodeRecord) {
     const nodeChanged = selectedNodeIdRef.current !== node.id;
-    if (nodeChanged) {
-      conversationSearchRef.current = "";
-      conversationFilterRef.current = "all";
-      setConversationSearch("");
-      setConversationFilter("all");
-      commitSelectedNode(node.id);
-      setConversations([]);
+    if (!nodeChanged) {
+      setPrimaryView("workspace");
+      setMobilePane("chat");
+      setOverlay(null);
+      return;
     }
+    conversationSearchRef.current = "";
+    conversationFilterRef.current = "all";
+    setConversationSearch("");
+    setConversationFilter("all");
+    commitSelectedNode(node.id);
+    setConversations([]);
     beginNewConversation();
   }
 
@@ -1927,7 +2179,7 @@ export function App() {
           settings={settings}
         />}
       </div>
-      {overlay === "settings" && <SettingsPanel settings={settings} nodes={nodes} onClose={() => setOverlay(null)} onSaved={setSettings} />}
+      {overlay === "settings" && <SettingsPanel settings={settings} nodes={nodes} selectedNodeId={selectedNodeId} onClose={() => setOverlay(null)} onSaved={setSettings} onNodesChanged={refreshNodes} />}
       {overlay === "switcher" && <QuickSwitcher
         nodes={nodes}
         conversations={quickConversations}
@@ -1935,7 +2187,11 @@ export function App() {
         error={quickError}
         onClose={() => setOverlay(null)}
         onSearch={searchQuickConversations}
-        onNode={(node) => { selectNode(node); setOverlay(null); }}
+        onNode={(node) => {
+          if (selectedNodeIdRef.current === node.id) beginNewConversation();
+          else selectNode(node);
+          setOverlay(null);
+        }}
         onConversation={selectConversation}
       />}
     </div>
