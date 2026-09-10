@@ -1,0 +1,27 @@
+{
+  "name": "controller-center",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/control-plane && npm run build -w @controller-center/agent && npm run build -w @controller-center/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "dev:server": "npm run dev -w @controller-center/control-plane",
+    "dev:agent": "npm run dev -w @controller-center/agent",
+    "dev:web": "npm run dev -w @controller-center/web"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^5.0.0"
+  }
+}

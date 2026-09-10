@@ -1,0 +1,15 @@
+node_modules/
+dist/
+/data/
+.vite/
+coverage/
+test-results/
+playwright-report/
+*.log
+*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+.controller-agent/

@@ -1,0 +1,18 @@
+[Unit]
+Description=Controller Center node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=controller-agent
+Group=controller-agent
+WorkingDirectory=/opt/controller-center
+EnvironmentFile=/etc/controller-center/agent.env
+ExecStart=/usr/bin/node /opt/controller-center/apps/agent/dist/index.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
