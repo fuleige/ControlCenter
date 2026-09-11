@@ -1,0 +1,17 @@
+{
+  "name": "Controller Center",
+  "short_name": "Control Center",
+  "description": "Codex 节点调度控制中心",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f7fb",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

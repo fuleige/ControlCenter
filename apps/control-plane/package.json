@@ -1,14 +1,18 @@
 {
   "name": "@controller-center/control-plane",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
+  "bin": {
+    "controller-center-admin": "./dist/admin-cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "admin": "node dist/admin-cli.js",
     "test": "vitest run"
   },
   "dependencies": {

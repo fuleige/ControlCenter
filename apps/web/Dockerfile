@@ -1,8 +1,7 @@
 FROM node:24-bookworm-slim AS build
 WORKDIR /workspace
 ARG VITE_API_URL=
-ARG VITE_ADMIN_TOKEN=
-ENV VITE_API_URL=$VITE_API_URL VITE_ADMIN_TOKEN=$VITE_ADMIN_TOKEN
+ENV VITE_API_URL=$VITE_API_URL
 
 COPY package.json package-lock.json tsconfig.base.json ./
 COPY packages/protocol/package.json packages/protocol/package.json

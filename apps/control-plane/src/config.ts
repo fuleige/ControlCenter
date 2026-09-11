@@ -8,10 +8,15 @@ function integerEnv(name: string, fallback: number): number {
 export interface ControlPlaneConfig {
   host: string;
   port: number;
+  dataDirectory: string;
   databasePath: string;
   agentToken: string;
   adminToken: string | null;
+  adminTokenPath: string;
+  enrollmentDisplayKeyPath: string;
+  publicOrigin: string;
   corsOrigin: string;
+  trustProxy: boolean;
   heartbeatIntervalMs: number;
   offlineAfterMs: number;
   attachmentDirectory: string;
@@ -26,10 +31,15 @@ export function loadConfig(): ControlPlaneConfig {
   return {
     host: process.env.CONTROL_HOST ?? "0.0.0.0",
     port: integerEnv("CONTROL_PORT", 8787),
+    dataDirectory,
     databasePath: process.env.CONTROL_DATABASE_PATH ?? path.join(dataDirectory, "control-center.db"),
     agentToken: process.env.AGENT_SHARED_TOKEN ?? "dev-agent-token",
     adminToken: process.env.ADMIN_TOKEN || null,
+    adminTokenPath: process.env.ADMIN_TOKEN_FILE ?? path.join(dataDirectory, "secrets", "admin-token"),
+    enrollmentDisplayKeyPath: process.env.ENROLLMENT_DISPLAY_KEY_FILE ?? path.join(dataDirectory, "secrets", "enrollment-display-key"),
+    publicOrigin: (process.env.PUBLIC_ORIGIN ?? process.env.CORS_ORIGIN ?? "http://localhost:5173").replace(/\/$/, ""),
     corsOrigin: process.env.CORS_ORIGIN ?? "http://localhost:5173",
+    trustProxy: process.env.TRUST_PROXY === "true",
     heartbeatIntervalMs: integerEnv("HEARTBEAT_INTERVAL_MS", 15_000),
     offlineAfterMs: integerEnv("OFFLINE_AFTER_MS", 45_000),
     attachmentDirectory: path.join(dataDirectory, "attachments"),

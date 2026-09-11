@@ -139,7 +139,9 @@ async function mockControlCenter(page: Page) {
   });
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
-    if (url.pathname === "/api/stream") {
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
+    } else if (url.pathname === "/api/stream") {
       await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
     } else if (url.pathname === "/api/nodes") {
       await route.fulfill({ json: { data: [node] } });
@@ -303,7 +305,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.2.0");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.0");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -398,7 +400,9 @@ test("后台运行会话的延迟刷新不会抢回当前会话", async ({ page 
 
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
-    if (url.pathname === "/api/stream") {
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
+    } else if (url.pathname === "/api/stream") {
       await route.fulfill({
         status: 200,
         contentType: "text/event-stream",
@@ -489,7 +493,9 @@ test("新会话创建结果不会抢占用户后来选择的会话", async ({ pa
 
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
-    if (url.pathname === "/api/stream") {
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
+    } else if (url.pathname === "/api/stream") {
       await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
     } else if (url.pathname === "/api/nodes") {
       await route.fulfill({ json: { data: [node] } });
@@ -527,4 +533,95 @@ test("新会话创建结果不会抢占用户后来选择的会话", async ({ pa
   await page.waitForTimeout(800);
   await expect(page.locator(".chat-title strong")).toHaveText(existingConversation.title);
   await expect(page.locator(".conversation-card").filter({ hasText: createdConversation.title })).not.toHaveClass(/selected/);
+});
+
+test("未认证访问会进入 Token 登录且登录后不在浏览器保存原始 Token", async ({ page }) => {
+  let authenticated = false;
+  let submittedToken = "";
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated } });
+    } else if (url.pathname === "/api/auth/login") {
+      submittedToken = (route.request().postDataJSON() as { token: string }).token;
+      authenticated = submittedToken === "cca_test-admin-token";
+      await route.fulfill({ status: authenticated ? 200 : 401, json: authenticated ? { authenticated: true } : { error: "管理员 Token 无效" } });
+    } else if (url.pathname === "/api/stream") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
+    } else if (url.pathname === "/api/nodes" || url.pathname === "/api/approvals") {
+      await route.fulfill({ json: { data: [] } });
+    } else if (url.pathname === "/api/settings") {
+      await route.fulfill({ json: { settings: { defaultModel: null, defaultEffort: null } } });
+    } else if (url.pathname === "/api/task-center") {
+      await route.fulfill({ json: { data: [], unreadCount: 0 } });
+    } else {
+      await route.fulfill({ status: 204 });
+    }
+  });
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "登录控制中心" })).toBeVisible();
+  await page.getByLabel("管理员 Token").fill("cca_test-admin-token");
+  await page.getByRole("button", { name: "进入控制中心" }).click();
+  await expect(page.locator(".nodes-pane")).toBeVisible();
+  expect(submittedToken).toBe("cca_test-admin-token");
+  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain("cca_test-admin-token");
+});
+
+test("设置页在列表展示注册 Token、状态和到期倒计时", async ({ page }) => {
+  const registrationToken = "cce_00000000-0000-4000-8000-000000000001.test-registration-secret-value";
+  let created = false;
+  let registrationStatus: "pending" | "used" = "pending";
+  const expiresAt = new Date(Date.now() + 6_000).toISOString();
+  const enrollment = () => ({
+    id: "00000000-0000-4000-8000-000000000001",
+    token: registrationToken,
+    status: registrationStatus,
+    createdAt: now,
+    expiresAt,
+    usedAt: registrationStatus === "used" ? now : null,
+    nodeId: registrationStatus === "used" ? node.id : null,
+  });
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true } });
+    } else if (url.pathname === "/api/stream") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
+    } else if (url.pathname === "/api/nodes") {
+      await route.fulfill({ json: { data: [node] } });
+    } else if (url.pathname === "/api/conversations") {
+      await route.fulfill({ json: { data: [conversation] } });
+    } else if (url.pathname === `/api/conversations/${conversation.id}`) {
+      await route.fulfill({ json: { conversation, runs: [], messages: [], attachments: [], approvals: [] } });
+    } else if (url.pathname === "/api/approvals") {
+      await route.fulfill({ json: { data: [] } });
+    } else if (url.pathname === "/api/settings") {
+      await route.fulfill({ json: { settings: { defaultModel: null, defaultEffort: null } } });
+    } else if (url.pathname === "/api/task-center") {
+      await route.fulfill({ json: { data: [], unreadCount: 0 } });
+    } else if (url.pathname === "/api/enrollment-tokens" && route.request().method() === "POST") {
+      created = true;
+      await route.fulfill({ status: 201, json: { enrollment: enrollment(), token: registrationToken } });
+    } else if (url.pathname === "/api/enrollment-tokens") {
+      await route.fulfill({ json: { data: created ? [enrollment()] : [], lifetimeSeconds: 600 } });
+    } else {
+      await route.fulfill({ status: 204 });
+    }
+  });
+
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
+  await page.getByRole("button", { name: "节点接入" }).click();
+  await page.getByRole("button", { name: "生成注册 Token" }).click();
+  await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
+  await expect(page.getByText(registrationToken)).toBeVisible();
+  await expect(page.getByText("未注册", { exact: true })).toBeVisible();
+  await expect(page.getByText(/剩余 0:0[1-6]/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "复制" })).toBeVisible();
+
+  registrationStatus = "used";
+  await expect(page.getByText("已注册", { exact: true })).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText(registrationToken)).toHaveCount(0, { timeout: 8_000 });
+  await expect(page.getByText("当前没有有效的注册 Token")).toBeVisible();
 });

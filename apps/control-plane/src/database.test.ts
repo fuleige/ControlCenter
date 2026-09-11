@@ -331,4 +331,60 @@ describe("ControlDatabase", () => {
     expect(database.deleteUnusedWorkspace(descriptor.id, "default-a")).toBe(false);
     database.close();
   });
+
+  it("stores revocable admin sessions and consumes enrollment tokens exactly once", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "control-plane-auth-test-"));
+    directories.push(directory);
+    const database = new ControlDatabase(path.join(directory, "test.db"), { recoverRuntimeState: false });
+    const createdAt = "2026-09-10T08:00:00.000Z";
+    const expiresAt = "2026-09-10T08:10:00.000Z";
+
+    database.setAdminTokenHash("admin-hash", createdAt);
+    expect(database.getAdminTokenHash()).toBe("admin-hash");
+    database.createAdminSession({
+      id: "session-1",
+      tokenHash: "session-hash",
+      createdAt,
+      lastSeenAt: createdAt,
+      expiresAt,
+      revokedAt: null,
+    });
+    expect(database.getAdminSession("session-1")?.tokenHash).toBe("session-hash");
+    database.touchAdminSession("session-1", "2026-09-10T08:01:00.000Z");
+    expect(database.getAdminSession("session-1")?.lastSeenAt).toBe("2026-09-10T08:01:00.000Z");
+    expect(database.revokeAllAdminSessions("2026-09-10T08:02:00.000Z")).toBe(1);
+    expect(database.getAdminSession("session-1")?.revokedAt).toBe("2026-09-10T08:02:00.000Z");
+
+    database.createEnrollmentToken({
+      id: "enrollment-1",
+      tokenHash: "enrollment-hash",
+      tokenCiphertext: "encrypted-enrollment-token",
+      createdAt,
+      expiresAt,
+      usedAt: null,
+      revokedAt: null,
+      nodeId: null,
+      credentialId: null,
+    });
+    const enrollment = {
+      id: "enrollment-1",
+      nodeId: "node-1",
+      credentialId: "credential-1",
+      credentialHash: "credential-hash",
+      usedAt: "2026-09-10T08:03:00.000Z",
+    };
+    expect(database.consumeEnrollmentToken(enrollment)).toBe(true);
+    expect(database.consumeEnrollmentToken(enrollment)).toBe(true);
+    expect(database.consumeEnrollmentToken({ ...enrollment, nodeId: "node-2" })).toBe(false);
+    expect(database.getEnrollmentToken("enrollment-1")).toMatchObject({ nodeId: "node-1", credentialId: "credential-1" });
+    expect(database.getNodeCredential("credential-1")).toMatchObject({ nodeId: "node-1", tokenHash: "credential-hash" });
+    expect(database.nodeHasCredentials("node-1")).toBe(true);
+    expect(database.revokeNodeCredentials("node-1", "2026-09-10T08:04:00.000Z")).toBe(1);
+    expect(database.getNodeCredential("credential-1")?.revokedAt).toBe("2026-09-10T08:04:00.000Z");
+    expect(database.revokeEnrollmentToken("enrollment-1", "2026-09-10T08:04:00.000Z")).toBe(false);
+    expect(database.cleanupEnrollmentTokens("2026-09-10T08:09:59.999Z")).toBe(0);
+    expect(database.cleanupEnrollmentTokens(expiresAt)).toBe(1);
+    expect(database.getEnrollmentToken("enrollment-1")).toBeNull();
+    database.close();
+  });
 });

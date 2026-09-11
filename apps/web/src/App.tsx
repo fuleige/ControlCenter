@@ -18,22 +18,29 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
   deleteConversation,
+  createEnrollmentToken,
   createNodeWorkspace,
   deleteNodeWorkspace,
   createAttachmentUpload,
   deleteAttachmentUpload,
   getConversation,
+  getAuthSession,
   getSettings,
   getTaskCenter,
   interruptRun,
   listConversations,
+  listEnrollmentTokens,
   listNodes,
   listNodeWorkspaces,
   listPendingApprovals,
   markAllNotificationsRead,
   markConversationRead,
+  loginAdmin,
+  logoutAdmin,
   retryRun,
   resolveApproval,
+  revokeNodeAccess,
+  revokeEnrollmentToken,
   startConversation,
   startRun,
   steerRun,
@@ -51,6 +58,7 @@ import type {
   AttachmentRecord,
   Conversation,
   ConversationDetail,
+  EnrollmentToken,
   GlobalSettings,
   NodeRecord,
   ReasoningEffort,
@@ -924,12 +932,148 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
   </section>;
 }
 
+const enrollmentStatusLabels: Record<EnrollmentToken["status"], string> = {
+  pending: "未注册",
+  used: "已注册",
+  revoked: "已撤销",
+  expired: "已过期",
+};
+
+function enrollmentCountdown(expiresAt: string, clock: number): string {
+  const remainingSeconds = Math.max(0, Math.ceil((Date.parse(expiresAt) - clock) / 1_000));
+  return `${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, "0")}`;
+}
+
+function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; onNodesChanged: () => Promise<void> | void }) {
+  const [entries, setEntries] = useState<EnrollmentToken[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmNodeId, setConfirmNodeId] = useState<string | null>(null);
+  const [clock, setClock] = useState(Date.now());
+  const usedIds = useRef(new Set<string>());
+
+  const refresh = useCallback(async () => {
+    const result = await listEnrollmentTokens();
+    const currentTime = Date.now();
+    const visibleEntries = result.data.filter((entry) => Date.parse(entry.expiresAt) > currentTime);
+    const nextUsedIds = new Set(visibleEntries.filter((entry) => entry.status === "used").map((entry) => entry.id));
+    const hasNewRegistration = [...nextUsedIds].some((id) => !usedIds.current.has(id));
+    usedIds.current = nextUsedIds;
+    setEntries(visibleEntries);
+    if (hasNewRegistration) await onNodesChanged();
+  }, [onNodesChanged]);
+
+  useEffect(() => {
+    const update = () => void refresh().catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    update();
+    const timer = window.setInterval(update, 2_000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const currentTime = Date.now();
+      setClock(currentTime);
+      setEntries((current) => current.filter((entry) => Date.parse(entry.expiresAt) > currentTime));
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  async function create(): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await createEnrollmentToken();
+      setClock(Date.now());
+      const entry = { ...created.enrollment, token: created.enrollment.token ?? created.token };
+      setEntries((current) => [entry, ...current.filter((candidate) => candidate.id !== entry.id)]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke(entry: EnrollmentToken): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      await revokeEnrollmentToken(entry.id);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeAccess(node: NodeRecord): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      await revokeNodeAccess(node.id);
+      setConfirmNodeId(null);
+      await onNodesChanged();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <section className="enrollment-settings">
+    <div className="settings-copy"><h3>节点接入</h3><p>生成一次性注册 Token，让新 Agent 建立自己的长期身份。有效期 10 分钟，倒计时结束后自动删除清理。</p></div>
+    <div className="enrollment-create-card">
+      <div><strong>注册新节点</strong><span>在目标机器准备好控制中心 HTTPS 地址，然后粘贴这里生成的 Token。</span></div>
+      <button type="button" className="primary-button" disabled={busy} onClick={() => void create()}>{busy ? "生成中…" : "生成注册 Token"}</button>
+    </div>
+    {error && <p className="form-error workspace-settings-error">{error}</p>}
+    {nodes.length > 0 && <div className="enrollment-nodes">
+      <header><strong>已登记节点</strong><span>丢失或停用节点时应立即撤销其长期凭证</span></header>
+      {nodes.map((node) => <article key={node.id}>
+        <div><strong>{node.name}</strong><small>{node.accessMode === "enrolled" ? "独立凭证" : node.accessMode === "revoked" ? "接入已撤销" : "旧共享凭证"} · {node.status === "online" ? "在线" : "离线"}</small></div>
+        {confirmNodeId === node.id ? <div className="enrollment-node-confirm"><span>撤销后 Agent 会立即断开</span><button type="button" onClick={() => setConfirmNodeId(null)}>取消</button><button type="button" className="danger-text" disabled={busy} onClick={() => void revokeAccess(node)}>确认撤销</button></div>
+          : <button type="button" disabled={busy || node.accessMode !== "enrolled"} onClick={() => setConfirmNodeId(node.id)}>撤销接入</button>}
+      </article>)}
+    </div>}
+    <div className="enrollment-history">
+      <header><strong>注册 Token</strong><span>可在有效期内查看和复制，到期自动删除</span></header>
+      {entries.map((entry) => {
+        const node = entry.nodeId ? nodes.find((candidate) => candidate.id === entry.nodeId) : null;
+        return <article key={entry.id}>
+          <div className="enrollment-token-info">
+            <div className="enrollment-token-heading">
+              <span className={`enrollment-dot enrollment-${entry.status}`} />
+              <strong>{enrollmentStatusLabels[entry.status]}</strong>
+              <small>{node?.name ?? (entry.nodeId ? "节点已登记" : `生成于 ${formatDate(entry.createdAt)}`)}</small>
+              <time>剩余 {enrollmentCountdown(entry.expiresAt, clock)}</time>
+            </div>
+            {entry.token
+              ? <code title={entry.token}>{entry.token}</code>
+              : <span className="enrollment-token-unavailable">该 Token 创建于升级前，无法恢复原文，请重新生成</span>}
+          </div>
+          <div className="enrollment-token-actions">
+            {entry.token && <button type="button" className="copy-token" onClick={() => void copyToClipboard(entry.token!).then(() => {
+              setCopiedId(entry.id);
+              window.setTimeout(() => setCopiedId((current) => current === entry.id ? null : current), 1_500);
+            }).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))}>{copiedId === entry.id ? "已复制" : "复制"}</button>}
+            {entry.status === "pending" && <button type="button" disabled={busy} onClick={() => void revoke(entry)}>撤销</button>}
+          </div>
+        </article>;
+      })}
+      {entries.length === 0 && <div className="empty compact">当前没有有效的注册 Token</div>}
+    </div>
+  </section>;
+}
+
 function SettingsPanel({
   settings,
   nodes,
   onClose,
   onSaved,
   onNodesChanged,
+  onLogout,
   selectedNodeId,
 }: {
   settings: GlobalSettings;
@@ -937,6 +1081,7 @@ function SettingsPanel({
   onClose: () => void;
   onSaved: (settings: GlobalSettings) => void;
   onNodesChanged: () => Promise<void> | void;
+  onLogout: () => Promise<void> | void;
   selectedNodeId: string | null;
 }) {
   const models = useMemo(() => {
@@ -948,7 +1093,7 @@ function SettingsPanel({
   const [effort, setEffort] = useState<ReasoningEffort | "">(settings.defaultEffort ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [section, setSection] = useState<"defaults" | "workspaces">("defaults");
+  const [section, setSection] = useState<"defaults" | "workspaces" | "enrollment">("defaults");
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -971,7 +1116,8 @@ function SettingsPanel({
         <nav>
           <button type="button" className={section === "defaults" ? "active" : ""} onClick={() => setSection("defaults")}>对话默认值</button>
           <button type="button" className={section === "workspaces" ? "active" : ""} onClick={() => setSection("workspaces")}>工作空间</button>
-          <small>更多设置将在后续版本加入</small>
+          <button type="button" className={section === "enrollment" ? "active" : ""} onClick={() => setSection("enrollment")}>节点接入</button>
+          <button type="button" className="settings-logout" onClick={() => void onLogout()}>退出登录</button>
           <div className="settings-version"><span>Controller Center</span><strong>v{__APP_VERSION__}</strong></div>
         </nav>
         {section === "defaults" ? <form className="settings-form" onSubmit={(event) => void save(event)}>
@@ -980,7 +1126,9 @@ function SettingsPanel({
           <label><span>默认思考强度</span><select value={effort} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}><option value="">模型默认</option>{Object.entries(effortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
           {error && <p className="form-error">{error}</p>}
           <div className="settings-actions"><button type="button" onClick={onClose}>取消</button><button className="primary-button" disabled={busy}>{busy ? "保存中…" : "保存设置"}</button></div>
-        </form> : <WorkspaceSettings nodes={nodes} initialNodeId={selectedNodeId} onChanged={onNodesChanged} />}
+        </form> : section === "workspaces"
+          ? <WorkspaceSettings nodes={nodes} initialNodeId={selectedNodeId} onChanged={onNodesChanged} />
+          : <EnrollmentSettings nodes={nodes} onNodesChanged={onNodesChanged} />}
       </div>
     </section>
   </div>;
@@ -1682,7 +1830,7 @@ function ChatPanel({
   );
 }
 
-export function App() {
+function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }) {
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationTotal, setConversationTotal] = useState(0);
@@ -1761,11 +1909,18 @@ export function App() {
     try {
       const result = await listNodes();
       setNodes(result);
+      if (result.length === 0 && (selectedNodeIdRef.current || selectedConversationIdRef.current)) {
+        commitSelectedNode(null);
+        commitSelectedConversation(null);
+        setConversations([]);
+        setConversationTotal(0);
+        setDetail(null);
+      }
       setConnectionError(null);
     } catch (error) {
       setConnectionError(error instanceof Error ? error.message : String(error));
     }
-  }, []);
+  }, [commitSelectedConversation, commitSelectedNode]);
 
   const refreshConversations = useCallback(async (options: {
     mode?: "refresh" | "replace" | "append";
@@ -1994,7 +2149,7 @@ export function App() {
 
   useEffect(() => {
     const storedRevision = Number(storedValue(streamRevisionStorageKey) ?? 0);
-    const source = new EventSource(streamUrl(Number.isSafeInteger(storedRevision) ? storedRevision : 0));
+    const source = new EventSource(streamUrl(Number.isSafeInteger(storedRevision) ? storedRevision : 0), { withCredentials: true });
     let refreshTimer: number | null = null;
     const scheduleRefresh = () => {
       if (refreshTimer !== null) return;
@@ -2179,7 +2334,7 @@ export function App() {
           settings={settings}
         />}
       </div>
-      {overlay === "settings" && <SettingsPanel settings={settings} nodes={nodes} selectedNodeId={selectedNodeId} onClose={() => setOverlay(null)} onSaved={setSettings} onNodesChanged={refreshNodes} />}
+      {overlay === "settings" && <SettingsPanel settings={settings} nodes={nodes} selectedNodeId={selectedNodeId} onClose={() => setOverlay(null)} onSaved={setSettings} onNodesChanged={refreshNodes} onLogout={onLogout} />}
       {overlay === "switcher" && <QuickSwitcher
         nodes={nodes}
         conversations={quickConversations}
@@ -2196,4 +2351,79 @@ export function App() {
       />}
     </div>
   );
+}
+
+function LoginScreen({ initialError, onAuthenticated, onRetry }: {
+  initialError?: string | null;
+  onAuthenticated: () => void;
+  onRetry: () => void;
+}) {
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(initialError ?? null);
+
+  async function submit(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    if (!token.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await loginAdmin(token.trim());
+      setToken("");
+      onAuthenticated();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <main className="login-page">
+    <section className="login-card">
+      <div className="login-brand"><span>CC</span><div><strong>Controller Center</strong><small>集中调度你的 Codex 节点</small></div></div>
+      <div className="login-copy"><span>ADMIN ACCESS</span><h1>登录控制中心</h1><p>输入部署机器上保存的管理员 Token。验证通过后，浏览器只保存安全会话 Cookie，不保存原始 Token。</p></div>
+      <form onSubmit={(event) => void submit(event)}>
+        <label><span>管理员 Token</span><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="cca_…" autoComplete="current-password" autoFocus /></label>
+        {error && <div className="login-error"><span>{error}</span>{initialError && <button type="button" onClick={onRetry}>重试连接</button>}</div>}
+        <button className="primary-button" disabled={busy || !token.trim()}>{busy ? "正在验证…" : "进入控制中心"}</button>
+      </form>
+      <footer>管理员 Token 可在控制中心服务器本机通过管理命令查询。</footer>
+    </section>
+  </main>;
+}
+
+export function App() {
+  const [state, setState] = useState<"loading" | "authenticated" | "anonymous" | "error">("loading");
+  const [error, setError] = useState<string | null>(null);
+
+  const checkSession = useCallback(async () => {
+    setState("loading");
+    setError(null);
+    try {
+      const session = await getAuthSession();
+      setState(session.authenticated ? "authenticated" : "anonymous");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setState("error");
+    }
+  }, []);
+
+  useEffect(() => { void checkSession(); }, [checkSession]);
+  useEffect(() => {
+    const unauthorized = () => setState("anonymous");
+    window.addEventListener("controller-center:unauthorized", unauthorized);
+    return () => window.removeEventListener("controller-center:unauthorized", unauthorized);
+  }, []);
+
+  if (state === "loading") return <main className="auth-loading"><span /><strong>正在连接控制中心…</strong></main>;
+  if (state !== "authenticated") {
+    return <LoginScreen
+      initialError={state === "error" ? error : null}
+      onRetry={() => void checkSession()}
+      onAuthenticated={() => setState("authenticated")}
+    />;
+  }
+  return <AuthenticatedApp onLogout={async () => {
+    try { await logoutAdmin(); } finally { setState("anonymous"); }
+  }} />;
 }

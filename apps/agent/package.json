@@ -1,14 +1,18 @@
 {
   "name": "@controller-center/agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
+  "bin": {
+    "controller-center-agent-enroll": "./dist/enroll.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "enroll": "node dist/enroll.js",
     "test": "vitest run"
   },
   "dependencies": {

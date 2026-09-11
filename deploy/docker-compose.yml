@@ -11,6 +11,8 @@ services:
       AGENT_SHARED_TOKEN: ${AGENT_SHARED_TOKEN:?set AGENT_SHARED_TOKEN}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       CORS_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
+      PUBLIC_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
+      TRUST_PROXY: "true"
     volumes:
       - control-data:/data
     expose:
@@ -22,7 +24,6 @@ services:
       dockerfile: apps/web/Dockerfile
       args:
         VITE_API_URL: ${PUBLIC_CONTROL_API_URL:-}
-        VITE_ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     restart: unless-stopped
     depends_on:
       - control-plane

@@ -38,6 +38,7 @@ export interface NodeRecord {
   maxConcurrentRuns: number;
   activeRuns: number;
   status: "online" | "offline";
+  accessMode?: "enrolled" | "revoked" | "legacy";
   lastSeenAt: string;
   workspaces: Workspace[];
   models: ModelDescriptor[];
@@ -119,6 +120,16 @@ export interface ConversationDetail {
 export interface GlobalSettings {
   defaultModel: string | null;
   defaultEffort: ReasoningEffort | null;
+}
+
+export interface EnrollmentToken {
+  id: string;
+  token: string | null;
+  status: "pending" | "used" | "revoked" | "expired";
+  createdAt: string;
+  expiresAt: string;
+  usedAt: string | null;
+  nodeId: string | null;
 }
 
 export interface TaskCenterEntry {

@@ -2,7 +2,7 @@
 
 一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据和工作区文件都不会交给控制中心。
 
-产品与可靠性方案见 [产品设计](docs/product-design.md) 和 [可靠性设计](docs/reliability-design.md)。两份方案已经确认，代码按该边界实施。
+产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。代码按这些边界实施。
 
 ## 组成
 
@@ -21,7 +21,9 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 
 ## 已实现能力
 
-- Agent 注册、心跳、断线检测和自动重连。
+- Web 使用随机管理员 Token 登录，服务端建立 HttpOnly 会话；管理员原始 Token 不进入前端构建、Local Storage 或 URL。
+- Web 可生成 10 分钟有效的节点注册 Token；有效期内可在列表查看、复制和确认注册状态，到期自动删除；Agent 首次注册后使用与固定节点 ID 绑定的独立长期凭证。
+- Agent 注册、心跳、断线检测和自动重连；迁移期间仍兼容旧共享 Token。
 - Agent 启动目录自动成为不可修改的默认工作空间；还可通过启动配置或 Web 设置为节点登记多个本地路径。
 - Web 添加工作空间时由对应 Agent 验证目录存在、可读写并返回规范路径；每次创建会话或新任务前再次验证。
 - 每个会话固定绑定一个工作空间；Agent 更换启动目录后，新目录成为默认，仍被会话使用的旧默认目录作为历史工作空间保留。
@@ -70,6 +72,12 @@ npm run build
 AGENT_SHARED_TOKEN=local-agent-token npm run dev:server
 ```
 
+首次启动会在 `data/secrets/admin-token` 随机生成管理员 Token。另开终端查询：
+
+```bash
+npm run admin -- admin-token show
+```
+
 终端二，启动节点 Agent：
 
 ```bash
@@ -87,7 +95,9 @@ Agent 启动命令所在目录就是默认工作空间（通过 npm 启动时使
 npm run dev:web
 ```
 
-打开 `http://127.0.0.1:5173`。开发服务器会把同源 `/api`、`/agent/connect` 和附件下载代理到本机控制中心，因此从其他电脑、手机或 Agent 访问时可以只暴露 `5173`。
+打开 `http://127.0.0.1:5173` 并使用上面的管理员 Token 登录。开发服务器会把同源 `/api`、`/agent/connect`、`/agent/enroll` 和附件下载代理到本机控制中心，因此从其他电脑、手机或 Agent 访问时可以只暴露 `5173`。
+
+若临时通过域名反向代理 Vite 开发服务，可用逗号分隔的 `WEB_ALLOWED_HOSTS` 配置 Host 白名单；仓库默认允许 `c.llmdev.cn`。生产部署仍应使用构建后的 Nginx Web 容器，而不是长期运行 Vite。
 
 ## 独立部署
 
@@ -104,9 +114,22 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
 
 - `PUBLIC_CONTROL_API_URL`：默认留空并使用 Web 容器的同源反向代理；只有 API 单独使用其他域名时才填写。
 - `WEB_ORIGIN`：Web 的完整 Origin，用于 CORS。
-- `AGENT_SHARED_TOKEN`：Agent 注册使用的高强度随机令牌。
+- `AGENT_SHARED_TOKEN`：只用于尚未迁移的旧 Agent；新节点不共享长期令牌。
 
-默认部署只映射 Web 端口，Nginx 同时转发 API、SSE、Agent WebSocket 和附件下载，因此访问者不需要单独映射控制中心端口。生产环境必须启用 TLS。若需要用户登录，推荐在 Web/API 前使用统一认证反向代理；内置 `ADMIN_TOKEN` 只适合单管理员内网部署，设置到 Web 构建参数后会存在于浏览器环境中。
+默认部署只映射 Web 端口，Nginx 同时转发 API、SSE、节点注册、Agent WebSocket 和附件下载，因此访问者不需要单独映射控制中心端口。公网部署必须在外层 Nginx 启用 TLS，并把 `WEB_ORIGIN` 设为实际的 `https://` Origin。
+
+管理员 Token 在首次启动时随机生成到持久化数据卷，不会写入 Web 镜像。可在服务器本机查询、轮换或撤销全部登录会话：
+
+```bash
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-plane \
+  node apps/control-plane/dist/admin-cli.js admin-token show
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-plane \
+  node apps/control-plane/dist/admin-cli.js admin-token rotate
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-plane \
+  node apps/control-plane/dist/admin-cli.js sessions revoke-all
+```
+
+成功登录后使用 HttpOnly、SameSite=Strict 的服务端会话；空闲有效期 7 天，最长有效期 30 天。轮换管理员 Token 会立即撤销全部现有会话。
 
 ### Agent
 
@@ -118,6 +141,15 @@ Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿�
 Agent 的运行用户必须对配置的工作区具有适当权限，并且该用户需要完成本地 Codex 登录。
 systemd 的 `WorkingDirectory` 决定该节点的默认工作空间；示例中为 `/opt/controller-center`。
 
+新节点首次接入：先在 Web 的“设置 → 节点接入”生成注册 Token，再在节点执行以下命令。命令只要求控制中心域名，Token 会通过不回显的交互输入读取；公网地址必须为 HTTPS。
+
+```bash
+AGENT_DATA_DIR=/var/lib/controller-center-agent \
+npm run agent:enroll -- --server https://control.example.com
+```
+
+注册成功后，中心地址与该节点的独立凭证保存到 `AGENT_DATA_DIR/connection.json`（权限 `0600`），之后启动 Agent 不再需要配置域名或 Token。自动化环境可临时使用 `CONTROLLER_CENTER_ENROLLMENT_TOKEN` 环境变量，避免把 Token 写入命令行参数和 shell 历史。
+
 ## 常用配置
 
 控制中心：
@@ -126,16 +158,20 @@ systemd 的 `WorkingDirectory` 决定该节点的默认工作空间；示例中�
 | --- | --- | --- |
 | `CONTROL_PORT` | `8787` | API 与 Agent WSS 端口 |
 | `CONTROL_DATA_DIR` | `<启动命令所在目录>/data` | SQLite 数据与附件目录；建议生产环境显式配置绝对路径 |
-| `AGENT_SHARED_TOKEN` | `dev-agent-token` | Agent 共享注册令牌，生产必须修改 |
-| `ADMIN_TOKEN` | 空 | 可选的单管理员 API Bearer Token |
+| `AGENT_SHARED_TOKEN` | `dev-agent-token` | 旧 Agent 迁移用共享令牌；迁移期仍须设为高强度随机值 |
+| `ADMIN_TOKEN` | 空 | 仅在管理员 Token 文件尚不存在时作为首次引导值；通常留空自动生成 |
+| `ADMIN_TOKEN_FILE` | `<CONTROL_DATA_DIR>/secrets/admin-token` | 本机可查询的管理员原始 Token 文件，权限 `0600` |
+| `ENROLLMENT_DISPLAY_KEY_FILE` | `<CONTROL_DATA_DIR>/secrets/enrollment-display-key` | 注册 Token 临时展示内容的本机加密密钥，权限 `0600` |
+| `PUBLIC_ORIGIN` | 与 `CORS_ORIGIN` 相同 | 浏览器访问的公开 Origin；HTTPS 时启用 Secure 会话 Cookie |
+| `TRUST_PROXY` | `false` | 控制面仅位于可信反向代理之后时设为 `true`，用于正确识别登录限流来源 IP |
 | `CORS_ORIGIN` | `http://localhost:5173` | 允许的 Web Origin，逗号分隔 |
 
 Agent：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CONTROL_CENTER_URL` | `ws://127.0.0.1:8787/agent/connect` | 中心 Agent 通道 |
-| `AGENT_TOKEN` | `dev-agent-token` | 与中心一致的令牌 |
+| `CONTROL_CENTER_URL` | 注册记录或 `ws://127.0.0.1:8787/agent/connect` | 显式覆盖中心 Agent 通道；注册后通常无需设置 |
+| `AGENT_TOKEN` | 注册凭证或 `dev-agent-token` | 仅未注册节点使用的旧共享 Token；本机已有独立注册凭证时自动忽略 |
 | `AGENT_NAME` | 当前主机名 | 首次注册时报告的节点名称；可在 Web 中设置显示名称 |
 | `AGENT_DATA_DIR` | `~/.controller-center-agent` | 本地身份与可靠队列 |
 | `AGENT_WORKSPACES` | 空数组 | 可选的附加工作空间 JSON 数组；不能覆盖由进程当前目录决定的默认工作空间 |
@@ -147,6 +183,7 @@ Agent：
 
 - `GET /api/nodes`
 - `PATCH /api/nodes/:id`
+- `POST /api/nodes/:id/access/revoke`（撤销节点独立凭证并断开连接）
 - `GET/POST /api/nodes/:id/workspaces`
 - `PATCH/DELETE /api/nodes/:nodeId/workspaces/:workspaceId`
 - `POST /api/nodes/:nodeId/workspaces/:workspaceId/validate`
@@ -162,6 +199,8 @@ Agent：
 - `GET /api/approvals?status=pending`
 - `POST /api/approvals/:id/resolve`
 - `GET/PATCH /api/settings`
+- `GET/POST /api/enrollment-tokens`（管理员创建与查看注册状态）
+- `DELETE /api/enrollment-tokens/:id`（撤销尚未使用的注册 Token）
 - `GET /api/task-center`
 - `POST /api/notifications/read-all`
 - `POST /api/ui/presence`
@@ -172,6 +211,8 @@ Agent：
 ## 安全边界
 
 - Web 管理员可以登记 Agent 运行用户有权访问的任意本地目录；这等同于授予后续 Codex 会话在该目录中工作的能力。
+- 管理员 Token 原文仅保存在控制中心本机权限为 `0600` 的文件；数据库只保存哈希，浏览器登录后只持有 HttpOnly Cookie。
+- 节点注册 Token 在 10 分钟有效期内可由已登录管理员查看和复制，但仍只能成功使用一次；数据库保存校验哈希及由本机独立密钥加密的临时展示内容，到期自动删除整条记录。节点长期凭证与固定节点 ID 绑定。
 - Agent 在保存和实际执行前都验证路径，并始终使用规范绝对路径；目录权限边界由 Agent 的操作系统用户决定。
 - 默认工作空间只能由 Agent 的进程启动目录决定，不能通过 Web 改名、迁移、停用或删除。
 - Agent 使用 `workspaceWrite` sandbox，默认关闭网络访问。

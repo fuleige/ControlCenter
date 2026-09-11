@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -16,12 +16,17 @@ export interface AgentConfig {
   workspaces: WorkspaceDescriptor[];
 }
 
+export interface SavedAgentConnection {
+  controlUrl: string;
+  credential: string;
+}
+
 function integerEnv(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function normalizeControlUrl(value: string): string {
+export function normalizeControlUrl(value: string): string {
   const url = new URL(value);
   if (url.protocol === "http:") url.protocol = "ws:";
   if (url.protocol === "https:") url.protocol = "wss:";
@@ -102,7 +107,11 @@ function parseWorkspaces(dataDirectory: string): WorkspaceDescriptor[] {
   ];
 }
 
-function loadOrCreateNodeId(dataDirectory: string): string {
+export function agentDataDirectory(): string {
+  return path.resolve(process.env.AGENT_DATA_DIR ?? path.join(os.homedir(), ".controller-center-agent"));
+}
+
+export function loadOrCreateNodeId(dataDirectory: string): string {
   const identityPath = path.join(dataDirectory, "identity.json");
   if (process.env.AGENT_ID) return process.env.AGENT_ID;
   if (existsSync(identityPath)) {
@@ -114,14 +123,26 @@ function loadOrCreateNodeId(dataDirectory: string): string {
   return nodeId;
 }
 
+export function loadSavedConnection(dataDirectory: string): SavedAgentConnection | null {
+  const connectionPath = path.join(dataDirectory, "connection.json");
+  if (!existsSync(connectionPath)) return null;
+  const parsed = JSON.parse(readFileSync(connectionPath, "utf8")) as Partial<SavedAgentConnection>;
+  if (typeof parsed.controlUrl !== "string" || typeof parsed.credential !== "string") {
+    throw new Error(`Invalid Agent connection file: ${connectionPath}`);
+  }
+  return { controlUrl: parsed.controlUrl, credential: parsed.credential };
+}
+
 export function loadConfig(): AgentConfig {
-  const dataDirectory = path.resolve(
-    process.env.AGENT_DATA_DIR ?? path.join(os.homedir(), ".controller-center-agent"),
-  );
+  const dataDirectory = agentDataDirectory();
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
-  const token = process.env.AGENT_TOKEN ?? "dev-agent-token";
+  chmodSync(dataDirectory, 0o700);
+  const savedConnection = loadSavedConnection(dataDirectory);
+  // Once enrollment has produced a node-bound credential it must win over a
+  // legacy AGENT_TOKEN left in an existing systemd environment file.
+  const token = savedConnection?.credential ?? process.env.AGENT_TOKEN ?? "dev-agent-token";
   return {
-    controlUrl: normalizeControlUrl(process.env.CONTROL_CENTER_URL ?? "ws://127.0.0.1:8787/agent/connect"),
+    controlUrl: normalizeControlUrl(process.env.CONTROL_CENTER_URL ?? savedConnection?.controlUrl ?? "ws://127.0.0.1:8787/agent/connect"),
     token,
     nodeId: loadOrCreateNodeId(dataDirectory),
     nodeName: process.env.AGENT_NAME?.trim() || os.hostname(),

@@ -18,14 +18,29 @@ import {
 } from "@controller-center/protocol";
 import { loadConfig } from "./config.js";
 import { AgentConnections } from "./connections.js";
-import { ControlDatabase, type CommandRecord, type ConversationListCursor, type WorkspaceRecord } from "./database.js";
+import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type WorkspaceRecord } from "./database.js";
 import { UiEventBus } from "./event-bus.js";
+import {
+  ADMIN_SESSION_IDLE_MS,
+  ADMIN_SESSION_LIFETIME_MS,
+  ENROLLMENT_TOKEN_LIFETIME_MS,
+  createOpaqueToken,
+  decryptEnrollmentToken,
+  encryptEnrollmentToken,
+  ensureAdminToken,
+  ensureEnrollmentDisplayKey,
+  hashSecret,
+  parseOpaqueToken,
+  secretMatches,
+} from "./auth.js";
 
 const config = loadConfig();
 const database = new ControlDatabase(config.databasePath);
+ensureAdminToken(database, config.adminTokenPath, config.adminToken);
+const enrollmentDisplayKey = ensureEnrollmentDisplayKey(config.enrollmentDisplayKeyPath);
 const connections = new AgentConnections();
 const events = new UiEventBus();
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, trustProxy: config.trustProxy });
 const uiStreams = new Set<FastifyReply["raw"]>();
 const taskCenterPolicy = { limit: 200, replyPreviewCharacters: 120, readRetentionDays: 30, unreadRetentionDays: 90 } as const;
 mkdirSync(config.attachmentDirectory, { recursive: true, mode: 0o700 });
@@ -37,7 +52,7 @@ await app.register(cors, {
   origin: config.corsOrigin === "*"
     ? true
     : config.corsOrigin.split(",").map((value) => value.trim()),
-  credentials: false,
+  credentials: true,
 });
 await app.register(websocket, { options: { maxPayload: 16 * 1024 * 1024 } });
 
@@ -94,14 +109,96 @@ function bearerToken(request: FastifyRequest): string {
   return value.startsWith("Bearer ") ? value.slice(7) : "";
 }
 
-app.addHook("onRequest", async (request, reply) => {
-  if (!request.url.startsWith("/api/") || request.url.startsWith("/api/health") || !config.adminToken) return;
-  const query = request.query as { token?: string };
-  const token = bearerToken(request) || query.token || "";
-  if (!safeTokenEqual(token, config.adminToken)) {
-    return reply.code(401).send({ error: "Unauthorized" });
+const secureAdminCookie = config.publicOrigin.startsWith("https://");
+const adminCookieName = secureAdminCookie ? "__Host-cc_session" : "cc_session";
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function cookieValue(request: FastifyRequest, name: string): string {
+  const source = request.headers.cookie ?? "";
+  for (const part of source.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      return "";
+    }
   }
+  return "";
+}
+
+function sessionCookie(token: string, maximumAgeSeconds = Math.floor(ADMIN_SESSION_LIFETIME_MS / 1000)): string {
+  return `${adminCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maximumAgeSeconds}${secureAdminCookie ? "; Secure" : ""}`;
+}
+
+function authenticatedSession(request: FastifyRequest, touch = false): { id: string; expiresAt: string } | null {
+  const parsed = parseOpaqueToken(cookieValue(request, adminCookieName), "ccs");
+  if (!parsed) return null;
+  const session = database.getAdminSession(parsed.id);
+  const timestamp = Date.now();
+  if (!session
+    || session.revokedAt
+    || !secretMatches(parsed.token, session.tokenHash)
+    || Date.parse(session.expiresAt) <= timestamp
+    || Date.parse(session.lastSeenAt) + ADMIN_SESSION_IDLE_MS <= timestamp) return null;
+  if (touch && timestamp - Date.parse(session.lastSeenAt) > 5 * 60 * 1000) {
+    database.touchAdminSession(session.id, new Date(timestamp).toISOString());
+  }
+  return { id: session.id, expiresAt: session.expiresAt };
+}
+
+function requestHasValidAdminToken(request: FastifyRequest): boolean {
+  const token = bearerToken(request);
+  const tokenHash = database.getAdminTokenHash();
+  return Boolean(token && tokenHash && secretMatches(token, tokenHash));
+}
+
+function originAllowed(request: FastifyRequest): boolean {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  const configured = new Set([
+    config.publicOrigin,
+    ...config.corsOrigin.split(",").map((value) => value.trim()),
+  ]);
+  return config.corsOrigin === "*" || configured.has(origin);
+}
+
+app.addHook("onRequest", async (request, reply) => {
+  const pathname = request.url.split("?", 1)[0] ?? request.url;
+  if (!pathname.startsWith("/api/")
+    || pathname === "/api/health"
+    || pathname === "/api/auth/login"
+    || pathname === "/api/auth/session") return;
+  if (!originAllowed(request)) return reply.code(403).send({ error: "请求来源不受信任" });
+  if (requestHasValidAdminToken(request) || authenticatedSession(request, true)) return;
+  return reply.code(401).send({ error: "Unauthorized" });
 });
+
+function enrollmentStatus(record: { expiresAt: string; usedAt: string | null; revokedAt: string | null }): "pending" | "used" | "revoked" | "expired" {
+  if (record.usedAt) return "used";
+  if (record.revokedAt) return "revoked";
+  return Date.parse(record.expiresAt) <= Date.now() ? "expired" : "pending";
+}
+
+function publicEnrollment(record: EnrollmentTokenRecord) {
+  let token: string | null = null;
+  if (record.tokenCiphertext) {
+    try {
+      token = decryptEnrollmentToken(record.tokenCiphertext, enrollmentDisplayKey);
+    } catch {
+      app.log.warn({ enrollmentTokenId: record.id }, "Unable to decrypt enrollment token display value");
+    }
+  }
+  return {
+    id: record.id,
+    status: enrollmentStatus(record),
+    createdAt: record.createdAt,
+    expiresAt: record.expiresAt,
+    usedAt: record.usedAt,
+    nodeId: record.nodeId,
+    token,
+  };
+}
 
 function commandEnvelope(command: CommandRecord): ControlCommandMessage {
   return {
@@ -338,8 +435,127 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
 app.get("/readyz", async () => ({ ready: true }));
 app.get("/api/health", async () => ({ status: "ok", protocolVersion: CONTROL_PROTOCOL_VERSION }));
 
+app.get("/api/auth/session", async (request) => {
+  const session = authenticatedSession(request, true);
+  return session ? { authenticated: true, expiresAt: session.expiresAt } : { authenticated: false };
+});
+
+app.post<{ Body: { token?: string } }>("/api/auth/login", async (request, reply) => {
+  if (!originAllowed(request)) return reply.code(403).send({ error: "请求来源不受信任" });
+  const remote = request.ip;
+  const timestamp = Date.now();
+  const attempt = loginAttempts.get(remote);
+  if (attempt && attempt.resetAt > timestamp && attempt.count >= 8) {
+    return reply.header("Retry-After", String(Math.ceil((attempt.resetAt - timestamp) / 1000))).code(429).send({ error: "尝试次数过多，请稍后再试" });
+  }
+  const token = typeof request.body?.token === "string" ? request.body.token.trim() : "";
+  const expectedHash = database.getAdminTokenHash();
+  if (!token || token.length > 256 || !expectedHash || !secretMatches(token, expectedHash)) {
+    const current = attempt && attempt.resetAt > timestamp ? attempt : { count: 0, resetAt: timestamp + 10 * 60 * 1000 };
+    current.count += 1;
+    loginAttempts.set(remote, current);
+    return reply.code(401).send({ error: "管理员 Token 无效" });
+  }
+  loginAttempts.delete(remote);
+  const createdAt = new Date(timestamp).toISOString();
+  const expiresAt = new Date(timestamp + ADMIN_SESSION_LIFETIME_MS).toISOString();
+  const session = createOpaqueToken("ccs");
+  database.createAdminSession({
+    id: session.id,
+    tokenHash: session.tokenHash,
+    createdAt,
+    lastSeenAt: createdAt,
+    expiresAt,
+    revokedAt: null,
+  });
+  reply.header("Set-Cookie", sessionCookie(session.token));
+  return { authenticated: true, expiresAt };
+});
+
+app.post("/api/auth/logout", async (request, reply) => {
+  const session = authenticatedSession(request);
+  if (session) database.revokeAdminSession(session.id, now());
+  reply.header("Set-Cookie", sessionCookie("", 0));
+  return reply.code(204).send();
+});
+
+app.get("/api/enrollment-tokens", async (_request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  database.cleanupEnrollmentTokens(now());
+  return {
+    data: database.listEnrollmentTokens().map(publicEnrollment),
+    lifetimeSeconds: Math.floor(ENROLLMENT_TOKEN_LIFETIME_MS / 1000),
+  };
+});
+
+app.post("/api/enrollment-tokens", async (_request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  const created = createOpaqueToken("cce");
+  const createdAt = now();
+  const record = {
+    id: created.id,
+    tokenHash: created.tokenHash,
+    tokenCiphertext: encryptEnrollmentToken(created.token, enrollmentDisplayKey),
+    createdAt,
+    expiresAt: new Date(Date.parse(createdAt) + ENROLLMENT_TOKEN_LIFETIME_MS).toISOString(),
+    usedAt: null,
+    revokedAt: null,
+    nodeId: null,
+    credentialId: null,
+  };
+  database.createEnrollmentToken(record);
+  return reply.code(201).send({ enrollment: publicEnrollment(record), token: created.token });
+});
+
+app.get<{ Params: { id: string } }>("/api/enrollment-tokens/:id", async (request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  database.cleanupEnrollmentTokens(now());
+  const record = database.getEnrollmentToken(request.params.id);
+  return record ? { enrollment: publicEnrollment(record) } : reply.code(404).send({ error: "注册 Token 不存在" });
+});
+
+app.delete<{ Params: { id: string } }>("/api/enrollment-tokens/:id", async (request, reply) => {
+  if (!database.revokeEnrollmentToken(request.params.id, now())) {
+    const existing = database.getEnrollmentToken(request.params.id);
+    if (!existing) return reply.code(404).send({ error: "注册 Token 不存在" });
+    return reply.code(409).send({ error: "注册 Token 已使用、已撤销或已过期" });
+  }
+  return reply.code(204).send();
+});
+
+app.post<{ Body: { nodeId?: string; credential?: string } }>("/agent/enroll", async (request, reply) => {
+  const enrollment = parseOpaqueToken(bearerToken(request), "cce");
+  const credentialValue = typeof request.body?.credential === "string" ? request.body.credential.trim() : "";
+  const credential = parseOpaqueToken(credentialValue, "ccn");
+  const nodeId = typeof request.body?.nodeId === "string" ? request.body.nodeId.trim() : "";
+  if (!enrollment || !credential || !/^[0-9a-f-]{36}$/i.test(nodeId)) {
+    return reply.code(400).send({ error: "注册参数无效" });
+  }
+  const record = database.getEnrollmentToken(enrollment.id);
+  if (!record || !secretMatches(enrollment.token, record.tokenHash)) {
+    return reply.code(401).send({ error: "注册 Token 无效" });
+  }
+  const enrolled = database.consumeEnrollmentToken({
+    id: enrollment.id,
+    nodeId,
+    credentialId: credential.id,
+    credentialHash: hashSecret(credential.token),
+    usedAt: now(),
+  });
+  if (!enrolled) return reply.code(409).send({ error: "注册 Token 已使用、已撤销或已过期" });
+  publish("enrollment.used", enrollment.id);
+  return reply.code(201).send({ nodeId });
+});
+
 app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
-  if (!safeTokenEqual(bearerToken(request), config.agentToken)) {
+  const suppliedToken = bearerToken(request);
+  const parsedCredential = parseOpaqueToken(suppliedToken, "ccn");
+  const credential = parsedCredential ? database.getNodeCredential(parsedCredential.id) : null;
+  const credentialNodeId = credential && !credential.revokedAt && secretMatches(suppliedToken, credential.tokenHash)
+    ? credential.nodeId
+    : null;
+  const legacyAuthenticated = safeTokenEqual(suppliedToken, config.agentToken);
+  if (!legacyAuthenticated && !credentialNodeId) {
     socket.close(4401, "Invalid agent token");
     return;
   }
@@ -352,6 +568,14 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
       const message = parseAgentMessage(data.toString());
       if (!initialized) {
         if (message.type !== "agent.hello") throw new Error("agent.hello must be the first message");
+        if (legacyAuthenticated && database.nodeHasCredentials(message.node.id)) {
+          socket.close(4403, "This node must use its enrolled credential");
+          return;
+        }
+        if (credentialNodeId && message.node.id !== credentialNodeId) {
+          socket.close(4403, "Credential does not belong to this node");
+          return;
+        }
         if (message.protocolVersion !== CONTROL_PROTOCOL_VERSION) {
           socket.send(JSON.stringify({
             type: "control.error",
@@ -362,6 +586,7 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
           return;
         }
         const restarted = database.upsertNode(message.node, message.bootId, now());
+        if (parsedCredential) database.touchNodeCredential(parsedCredential.id, now());
         nodeId = message.node.id;
         connections.set(nodeId, message.bootId, socket);
         connections.send(nodeId, {
@@ -420,6 +645,18 @@ app.patch<{ Params: { id: string }; Body: { name?: string | null } }>("/api/node
   publish("node.updated", request.params.id);
   const node = database.listNodes().find((candidate) => candidate.id === request.params.id);
   return { node };
+});
+
+app.post<{ Params: { id: string } }>("/api/nodes/:id/access/revoke", async (request, reply) => {
+  if (!database.listNodes().some((node) => node.id === request.params.id)) {
+    return reply.code(404).send({ error: "节点不存在" });
+  }
+  const revoked = database.revokeNodeCredentials(request.params.id, now());
+  if (revoked === 0) return reply.code(409).send({ error: "该节点没有可撤销的独立凭证" });
+  connections.close(request.params.id);
+  database.markNodeOffline(request.params.id, now());
+  publish("node.access-revoked", request.params.id);
+  return { revoked };
 });
 
 app.get<{ Params: { id: string }; Querystring: { includeArchived?: string } }>("/api/nodes/:id/workspaces", async (request, reply) => {
@@ -1179,7 +1416,8 @@ app.delete<{ Params: { id: string } }>("/api/attachments/:id", async (request, r
 
 app.get<{ Params: { id: string }; Querystring: { token?: string } }>("/agent/attachments/:id", async (request, reply) => {
   const attachment = database.getAttachment(request.params.id);
-  if (!attachment || !request.query.token || !safeTokenEqual(request.query.token, attachment.downloadToken)) {
+  const downloadToken = bearerToken(request) || request.query.token || "";
+  if (!attachment || !downloadToken || !safeTokenEqual(downloadToken, attachment.downloadToken)) {
     return reply.code(404).send({ error: "Attachment not found" });
   }
   if (!["ready", "consumed"].includes(attachment.status)) return reply.code(409).send({ error: "Attachment is not ready" });
@@ -1247,6 +1485,12 @@ const staleTimer = setInterval(() => {
     new Date(Date.now() - taskCenterPolicy.unreadRetentionDays * 24 * 60 * 60 * 1000).toISOString(),
   );
   database.cleanupUiEvents(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+  const secretCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  database.cleanupAdminSessions(secretCutoff);
+  database.cleanupEnrollmentTokens(currentTime);
+  for (const [remote, attempt] of loginAttempts) {
+    if (attempt.resetAt <= Date.now()) loginAttempts.delete(remote);
+  }
 }, Math.min(config.offlineAfterMs, 15_000));
 
 const commandRetryTimer = setInterval(() => {

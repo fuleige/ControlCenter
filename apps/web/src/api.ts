@@ -4,6 +4,7 @@ import type {
   Conversation,
   ConversationDetail,
   GlobalSettings,
+  EnrollmentToken,
   NodeRecord,
   ReasoningEffort,
   Run,
@@ -17,21 +18,46 @@ const configuredApiUrl = (import.meta.env.VITE_API_URL as string | undefined)?.t
 // Leave the URL relative by default so local development and reverse-proxy
 // deployments do not require the browser to reach the control-plane port.
 export const API_URL = configuredApiUrl?.replace(/\/$/, "") ?? "";
-const adminToken = (import.meta.env.VITE_ADMIN_TOKEN as string | undefined) ?? "";
+
+export interface AuthSession {
+  authenticated: boolean;
+  expiresAt?: string;
+}
+
+async function responseBody<T>(response: Response): Promise<T & { error?: string }> {
+  if (response.status === 204) return undefined as unknown as T & { error?: string };
+  const text = await response.text();
+  if (!text) return undefined as unknown as T & { error?: string };
+  try { return JSON.parse(text) as T & { error?: string }; }
+  catch { return { error: text } as T & { error?: string }; }
+}
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  if (adminToken) headers.set("Authorization", `Bearer ${adminToken}`);
-  const response = await fetch(`${API_URL}${path}`, { ...init, headers });
-  const body = response.status === 204 ? undefined : await response.json() as T & { error?: string };
+  const response = await fetch(`${API_URL}${path}`, { ...init, headers, credentials: "include" });
+  const body = await responseBody<T>(response);
+  if (response.status === 401 && !path.startsWith("/api/auth/")) {
+    window.dispatchEvent(new CustomEvent("controller-center:unauthorized"));
+  }
   if (!response.ok) throw new Error(body?.error ?? `Request failed (${response.status})`);
   return body as T;
 }
 
+export function getAuthSession(): Promise<AuthSession> {
+  return api<AuthSession>("/api/auth/session");
+}
+
+export function loginAdmin(token: string): Promise<AuthSession> {
+  return api<AuthSession>("/api/auth/login", { method: "POST", body: JSON.stringify({ token }) });
+}
+
+export async function logoutAdmin(): Promise<void> {
+  await api<void>("/api/auth/logout", { method: "POST" });
+}
+
 export function streamUrl(after?: number): string {
   const url = new URL(`${API_URL}/api/stream`, window.location.origin);
-  if (adminToken) url.searchParams.set("token", adminToken);
   if (after && after > 0) url.searchParams.set("after", String(after));
   return url.toString();
 }
@@ -45,6 +71,10 @@ export async function updateNodeName(nodeId: string, name: string): Promise<Node
     method: "PATCH",
     body: JSON.stringify({ name }),
   })).node;
+}
+
+export async function revokeNodeAccess(nodeId: string): Promise<void> {
+  await api(`/api/nodes/${encodeURIComponent(nodeId)}/access/revoke`, { method: "POST" });
 }
 
 export async function listNodeWorkspaces(nodeId: string, includeArchived = true): Promise<Workspace[]> {
@@ -197,6 +227,22 @@ export async function updateSettings(input: Partial<GlobalSettings>): Promise<Gl
   })).settings;
 }
 
+export async function listEnrollmentTokens(): Promise<{ data: EnrollmentToken[]; lifetimeSeconds: number }> {
+  return api<{ data: EnrollmentToken[]; lifetimeSeconds: number }>("/api/enrollment-tokens");
+}
+
+export async function createEnrollmentToken(): Promise<{ enrollment: EnrollmentToken; token: string }> {
+  return api<{ enrollment: EnrollmentToken; token: string }>("/api/enrollment-tokens", { method: "POST" });
+}
+
+export async function getEnrollmentToken(id: string): Promise<EnrollmentToken> {
+  return (await api<{ enrollment: EnrollmentToken }>(`/api/enrollment-tokens/${encodeURIComponent(id)}`)).enrollment;
+}
+
+export async function revokeEnrollmentToken(id: string): Promise<void> {
+  await api<void>(`/api/enrollment-tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
 export async function getTaskCenter(): Promise<{ entries: TaskCenterEntry[]; unreadCount: number; policy: TaskCenterPolicy }> {
   const result = await api<{ data: TaskCenterEntry[]; unreadCount: number; policy?: TaskCenterPolicy }>("/api/task-center");
   return {
@@ -244,9 +290,9 @@ export async function createAttachmentUpload(input: {
 
 async function binaryRequest<T>(path: string, body: Blob): Promise<T> {
   const headers = new Headers({ "Content-Type": "application/octet-stream" });
-  if (adminToken) headers.set("Authorization", `Bearer ${adminToken}`);
-  const response = await fetch(`${API_URL}${path}`, { method: "PUT", headers, body });
-  const result = await response.json() as T & { error?: string };
+  const response = await fetch(`${API_URL}${path}`, { method: "PUT", headers, body, credentials: "include" });
+  const result = await responseBody<T>(response);
+  if (response.status === 401) window.dispatchEvent(new CustomEvent("controller-center:unauthorized"));
   if (!response.ok) throw new Error(result.error ?? `Request failed (${response.status})`);
   return result;
 }

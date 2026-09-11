@@ -28,6 +28,7 @@ export interface NodeRecord {
   maxConcurrentRuns: number;
   activeRuns: number;
   status: "online" | "offline";
+  accessMode: "enrolled" | "revoked" | "legacy";
   bootId: string | null;
   lastSeenAt: string;
   connectedAt: string | null;
@@ -128,6 +129,36 @@ export interface GlobalSettingsRecord {
   defaultEffort: string | null;
 }
 
+export interface AdminSessionRecord {
+  id: string;
+  tokenHash: string;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+  revokedAt: string | null;
+}
+
+export interface EnrollmentTokenRecord {
+  id: string;
+  tokenHash: string;
+  tokenCiphertext: string | null;
+  createdAt: string;
+  expiresAt: string;
+  usedAt: string | null;
+  revokedAt: string | null;
+  nodeId: string | null;
+  credentialId: string | null;
+}
+
+export interface NodeCredentialRecord {
+  id: string;
+  nodeId: string;
+  tokenHash: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
 export interface AttachmentRecord {
   id: string;
   conversationId: string | null;
@@ -222,17 +253,19 @@ function notificationPreview(value: string | null): string | null {
 export class ControlDatabase {
   readonly sqlite: DatabaseSync;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, options: { recoverRuntimeState?: boolean } = {}) {
     mkdirSync(path.dirname(databasePath), { recursive: true });
     this.sqlite = new DatabaseSync(databasePath);
     this.sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
-    this.sqlite.prepare("UPDATE nodes SET status = 'offline', active_runs = 0, connected_at = NULL").run();
-    const recoveryDeadline = new Date(Date.now() + 120_000).toISOString();
-    this.sqlite.prepare(`
-      UPDATE runs SET status = 'recovering', recovery_deadline_at = ?
-      WHERE status IN ('dispatching', 'running', 'waiting_approval')
-    `).run(recoveryDeadline);
+    if (options.recoverRuntimeState !== false) {
+      this.sqlite.prepare("UPDATE nodes SET status = 'offline', active_runs = 0, connected_at = NULL").run();
+      const recoveryDeadline = new Date(Date.now() + 120_000).toISOString();
+      this.sqlite.prepare(`
+        UPDATE runs SET status = 'recovering', recovery_deadline_at = ?
+        WHERE status IN ('dispatching', 'running', 'waiting_approval')
+      `).run(recoveryDeadline);
+    }
   }
 
   close(): void {
@@ -411,6 +444,41 @@ export class ControlDatabase {
         resource_id TEXT,
         occurred_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS admin_credentials (
+        id TEXT PRIMARY KEY CHECK (id = 'primary'),
+        token_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS admin_sessions (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS admin_sessions_expiry_idx ON admin_sessions(expires_at, revoked_at);
+      CREATE TABLE IF NOT EXISTS enrollment_tokens (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL,
+        token_ciphertext TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        revoked_at TEXT,
+        node_id TEXT,
+        credential_id TEXT
+      );
+      CREATE INDEX IF NOT EXISTS enrollment_tokens_expiry_idx ON enrollment_tokens(expires_at, used_at, revoked_at);
+      CREATE TABLE IF NOT EXISTS node_credentials (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS node_credentials_node_idx ON node_credentials(node_id, revoked_at);
     `);
     this.ensureColumn("nodes", "display_name", "TEXT");
     this.ensureColumn("nodes", "model_catalog_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -432,6 +500,7 @@ export class ControlDatabase {
     this.ensureColumn("runs", "recovery_deadline_at", "TEXT");
     this.ensureColumn("approvals", "summary", "TEXT NOT NULL DEFAULT '需要你的确认'");
     this.ensureColumn("approvals", "risk", "TEXT");
+    this.ensureColumn("enrollment_tokens", "token_ciphertext", "TEXT");
     this.sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS conversations_client_request_idx ON conversations(client_request_id) WHERE client_request_id IS NOT NULL;");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS conversations_node_order_idx ON conversations(node_id, pinned_at DESC, updated_at DESC, id DESC);");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS conversations_order_idx ON conversations(pinned_at DESC, updated_at DESC, id DESC);");
@@ -681,7 +750,12 @@ export class ControlDatabase {
   }
 
   listNodes(): NodeRecord[] {
-    const rows = this.sqlite.prepare("SELECT * FROM nodes ORDER BY status DESC, name").all() as Row[];
+    const rows = this.sqlite.prepare(`
+      SELECT n.*,
+        EXISTS(SELECT 1 FROM node_credentials nc WHERE nc.node_id = n.id) AS has_credentials,
+        EXISTS(SELECT 1 FROM node_credentials nc WHERE nc.node_id = n.id AND nc.revoked_at IS NULL) AS has_active_credentials
+      FROM nodes n ORDER BY n.status DESC, n.name
+    `).all() as Row[];
     const workspaceStatement = this.sqlite.prepare(`
       SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
       FROM workspaces w
@@ -699,6 +773,7 @@ export class ControlDatabase {
       maxConcurrentRuns: Number(row.max_concurrent_runs),
       activeRuns: Number(row.active_runs),
       status: text(row, "status") as NodeRecord["status"],
+      accessMode: Number(row.has_active_credentials) === 1 ? "enrolled" : Number(row.has_credentials) === 1 ? "revoked" : "legacy",
       bootId: nullableText(row, "boot_id"),
       lastSeenAt: text(row, "last_seen_at"),
       connectedAt: nullableText(row, "connected_at"),
@@ -1604,6 +1679,164 @@ export class ControlDatabase {
 
   deleteAttachment(id: string): void {
     this.sqlite.prepare("DELETE FROM attachments WHERE id = ?").run(id);
+  }
+
+  setAdminTokenHash(tokenHash: string, updatedAt: string): void {
+    this.sqlite.prepare(`
+      INSERT INTO admin_credentials (id, token_hash, updated_at)
+      VALUES ('primary', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET token_hash = excluded.token_hash, updated_at = excluded.updated_at
+    `).run(tokenHash, updatedAt);
+  }
+
+  getAdminTokenHash(): string | null {
+    const row = this.sqlite.prepare("SELECT token_hash FROM admin_credentials WHERE id = 'primary'").get() as Row | undefined;
+    return row ? text(row, "token_hash") : null;
+  }
+
+  createAdminSession(record: AdminSessionRecord): void {
+    this.sqlite.prepare(`
+      INSERT INTO admin_sessions (id, token_hash, created_at, last_seen_at, expires_at, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(record.id, record.tokenHash, record.createdAt, record.lastSeenAt, record.expiresAt, record.revokedAt);
+  }
+
+  getAdminSession(id: string): AdminSessionRecord | null {
+    const row = this.sqlite.prepare("SELECT * FROM admin_sessions WHERE id = ?").get(id) as Row | undefined;
+    return row ? {
+      id: text(row, "id"),
+      tokenHash: text(row, "token_hash"),
+      createdAt: text(row, "created_at"),
+      lastSeenAt: text(row, "last_seen_at"),
+      expiresAt: text(row, "expires_at"),
+      revokedAt: nullableText(row, "revoked_at"),
+    } : null;
+  }
+
+  touchAdminSession(id: string, lastSeenAt: string): void {
+    this.sqlite.prepare("UPDATE admin_sessions SET last_seen_at = ? WHERE id = ? AND revoked_at IS NULL").run(lastSeenAt, id);
+  }
+
+  revokeAdminSession(id: string, revokedAt: string): void {
+    this.sqlite.prepare("UPDATE admin_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").run(revokedAt, id);
+  }
+
+  revokeAllAdminSessions(revokedAt: string): number {
+    return Number(this.sqlite.prepare("UPDATE admin_sessions SET revoked_at = ? WHERE revoked_at IS NULL").run(revokedAt).changes);
+  }
+
+  cleanupAdminSessions(cutoff: string): number {
+    return Number(this.sqlite.prepare("DELETE FROM admin_sessions WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)").run(cutoff, cutoff).changes);
+  }
+
+  createEnrollmentToken(record: EnrollmentTokenRecord): void {
+    this.sqlite.prepare(`
+      INSERT INTO enrollment_tokens (id, token_hash, token_ciphertext, created_at, expires_at, used_at, revoked_at, node_id, credential_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.id, record.tokenHash, record.tokenCiphertext, record.createdAt, record.expiresAt, record.usedAt, record.revokedAt, record.nodeId, record.credentialId);
+  }
+
+  private enrollmentTokenFromRow(row: Row): EnrollmentTokenRecord {
+    return {
+      id: text(row, "id"),
+      tokenHash: text(row, "token_hash"),
+      tokenCiphertext: nullableText(row, "token_ciphertext"),
+      createdAt: text(row, "created_at"),
+      expiresAt: text(row, "expires_at"),
+      usedAt: nullableText(row, "used_at"),
+      revokedAt: nullableText(row, "revoked_at"),
+      nodeId: nullableText(row, "node_id"),
+      credentialId: nullableText(row, "credential_id"),
+    };
+  }
+
+  getEnrollmentToken(id: string): EnrollmentTokenRecord | null {
+    const row = this.sqlite.prepare("SELECT * FROM enrollment_tokens WHERE id = ?").get(id) as Row | undefined;
+    return row ? this.enrollmentTokenFromRow(row) : null;
+  }
+
+  listEnrollmentTokens(limit = 30): EnrollmentTokenRecord[] {
+    return (this.sqlite.prepare("SELECT * FROM enrollment_tokens ORDER BY created_at DESC LIMIT ?").all(Math.max(1, Math.min(100, limit))) as Row[])
+      .map((row) => this.enrollmentTokenFromRow(row));
+  }
+
+  revokeEnrollmentToken(id: string, revokedAt: string): boolean {
+    return this.sqlite.prepare(`
+      UPDATE enrollment_tokens SET revoked_at = ?
+      WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+    `).run(revokedAt, id, revokedAt).changes > 0;
+  }
+
+  cleanupEnrollmentTokens(expiredAt: string): number {
+    return Number(this.sqlite.prepare("DELETE FROM enrollment_tokens WHERE expires_at <= ?").run(expiredAt).changes);
+  }
+
+  consumeEnrollmentToken(input: {
+    id: string;
+    nodeId: string;
+    credentialId: string;
+    credentialHash: string;
+    usedAt: string;
+  }): boolean {
+    return this.transaction(() => {
+      const token = this.getEnrollmentToken(input.id);
+      if (!token || token.revokedAt || token.expiresAt <= input.usedAt) return false;
+      const credentialWithSameId = this.getNodeCredential(input.credentialId);
+      if (credentialWithSameId
+        && (credentialWithSameId.nodeId !== input.nodeId || credentialWithSameId.tokenHash !== input.credentialHash)) return false;
+      if (token.usedAt) {
+        const existing = credentialWithSameId;
+        return token.nodeId === input.nodeId
+          && token.credentialId === input.credentialId
+          && existing?.nodeId === input.nodeId
+          && existing.tokenHash === input.credentialHash
+          && !existing.revokedAt;
+      }
+      const claimed = this.sqlite.prepare(`
+        UPDATE enrollment_tokens
+        SET used_at = ?, node_id = ?, credential_id = ?
+        WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+      `).run(input.usedAt, input.nodeId, input.credentialId, input.id, input.usedAt);
+      if (claimed.changes === 0) return false;
+      this.sqlite.prepare(`
+        INSERT INTO node_credentials (id, node_id, token_hash, created_at, last_used_at, revoked_at)
+        VALUES (?, ?, ?, ?, NULL, NULL)
+        ON CONFLICT(id) DO UPDATE SET
+          node_id = excluded.node_id,
+          token_hash = excluded.token_hash,
+          created_at = excluded.created_at,
+          last_used_at = NULL,
+          revoked_at = NULL
+      `).run(input.credentialId, input.nodeId, input.credentialHash, input.usedAt);
+      return true;
+    });
+  }
+
+  getNodeCredential(id: string): NodeCredentialRecord | null {
+    const row = this.sqlite.prepare("SELECT * FROM node_credentials WHERE id = ?").get(id) as Row | undefined;
+    return row ? {
+      id: text(row, "id"),
+      nodeId: text(row, "node_id"),
+      tokenHash: text(row, "token_hash"),
+      createdAt: text(row, "created_at"),
+      lastUsedAt: nullableText(row, "last_used_at"),
+      revokedAt: nullableText(row, "revoked_at"),
+    } : null;
+  }
+
+  touchNodeCredential(id: string, usedAt: string): void {
+    this.sqlite.prepare("UPDATE node_credentials SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL").run(usedAt, id);
+  }
+
+  nodeHasCredentials(nodeId: string): boolean {
+    return Boolean(this.sqlite.prepare("SELECT 1 FROM node_credentials WHERE node_id = ? LIMIT 1").get(nodeId));
+  }
+
+  revokeNodeCredentials(nodeId: string, revokedAt: string): number {
+    return Number(this.sqlite.prepare(`
+      UPDATE node_credentials SET revoked_at = ?
+      WHERE node_id = ? AND revoked_at IS NULL
+    `).run(revokedAt, nodeId).changes);
   }
 
   createUiEvent(type: string, resourceId: string | null, occurredAt: string): UiEventRecord {

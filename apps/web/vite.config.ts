@@ -3,6 +3,10 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 const { version } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version: string };
+const allowedHosts = (process.env.WEB_ALLOWED_HOSTS ?? "c.llmdev.cn")
+  .split(",")
+  .map((host) => host.trim())
+  .filter(Boolean);
 
 export default defineConfig({
   plugins: [react()],
@@ -25,6 +29,7 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    allowedHosts,
     proxy: {
       "/api": {
         target: "http://127.0.0.1:8787",
@@ -33,6 +38,10 @@ export default defineConfig({
       "/agent/connect": {
         target: "ws://127.0.0.1:8787",
         ws: true,
+      },
+      "/agent/enroll": {
+        target: "http://127.0.0.1:8787",
+        changeOrigin: true,
       },
       "/agent/attachments": {
         target: "http://127.0.0.1:8787",

@@ -25,7 +25,7 @@ import { AppServerClient, type AppServerNotification, type AppServerRequest, typ
 import { loadConfig } from "./config.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.2.0";
+const AGENT_VERSION = "0.3.0";
 
 interface ActiveRun {
   conversationId: string;
@@ -539,7 +539,6 @@ function attachmentDownloadUrl(attachment: AttachmentDescriptor): string {
   url.protocol = url.protocol === "wss:" ? "https:" : "http:";
   url.pathname = `/agent/attachments/${attachment.id}`;
   url.search = "";
-  url.searchParams.set("token", attachment.downloadToken);
   return url.toString();
 }
 
@@ -557,7 +556,9 @@ async function prepareAttachmentInputs(attachments: AttachmentDescriptor[] = [])
       if (!validCache) unlinkSync(finalPath);
     }
     if (!validCache) {
-      const response = await fetch(attachmentDownloadUrl(attachment));
+      const response = await fetch(attachmentDownloadUrl(attachment), {
+        headers: { Authorization: `Bearer ${attachment.downloadToken}` },
+      });
       if (!response.ok) throw new Error(`无法下载附件 ${attachment.name} (${response.status})`);
       const content = Buffer.from(await response.arrayBuffer());
       if (content.length !== attachment.size) throw new Error(`附件大小校验失败：${attachment.name}`);

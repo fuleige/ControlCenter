@@ -50,6 +50,10 @@ export class AppServerClient extends EventEmitter {
     const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => this.onLine(line));
     child.stderr.on("data", (chunk: Buffer) => this.emit("stderr", chunk.toString()));
+    // A binary that exits during initialization can close stdin before the
+    // child "exit" event is observed. Always consume the stream error so an
+    // EPIPE cannot terminate the Agent process.
+    child.stdin.on("error", (error) => this.emit("clientError", error));
     child.on("error", (error) => this.emit("clientError", error));
     child.on("exit", (code, signal) => {
       if (this.process !== child) return;
@@ -67,7 +71,7 @@ export class AppServerClient extends EventEmitter {
       clientInfo: {
         name: "controller_center_agent",
         title: "Controller Center Agent",
-        version: "0.2.0",
+        version: "0.3.0",
       },
     });
     this.notify("initialized", {});

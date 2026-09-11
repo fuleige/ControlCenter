@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -41,5 +41,26 @@ describe("Agent workspace configuration", () => {
     const afterMovingAgent = loadConfig();
     expect(afterMovingAgent.workspaces[0]?.path).toBe(nextDirectory);
     expect(afterMovingAgent.workspaces[0]?.id).not.toBe("project-a");
+  });
+
+  it("uses the enrolled server and node credential when environment overrides are absent", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "controller-center-agent-enrolled-"));
+    directories.push(root);
+    const dataDirectory = path.join(root, "data");
+    const workspace = path.join(root, "workspace");
+    mkdirSync(dataDirectory);
+    mkdirSync(workspace);
+    writeFileSync(path.join(dataDirectory, "connection.json"), JSON.stringify({
+      controlUrl: "https://control.example.com/agent/connect",
+      credential: "ccn_credential.secret",
+    }));
+    process.env.AGENT_DATA_DIR = dataDirectory;
+    process.env.INIT_CWD = workspace;
+    process.env.AGENT_TOKEN = "legacy-shared-token";
+    delete process.env.CONTROL_CENTER_URL;
+
+    const config = loadConfig();
+    expect(config.controlUrl).toBe("wss://control.example.com/agent/connect");
+    expect(config.token).toBe("ccn_credential.secret");
   });
 });
