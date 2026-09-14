@@ -20,13 +20,50 @@ export interface AppServerRequest extends AppServerNotification {
   id: RpcRequestId;
 }
 
+export type AppServerApprovalPolicy = "on-request" | "never";
+export type ThreadSandboxMode = "workspace-write" | "danger-full-access";
+export type TurnSandboxPolicy =
+  | { type: "dangerFullAccess" }
+  | {
+    type: "workspaceWrite";
+    writableRoots: string[];
+    networkAccess: boolean;
+    excludeTmpdirEnvVar: boolean;
+    excludeSlashTmp: boolean;
+  };
+
+export function threadStartSecurity(yolo: boolean): {
+  approvalPolicy: AppServerApprovalPolicy;
+  sandbox: ThreadSandboxMode;
+} {
+  return yolo
+    ? { approvalPolicy: "never", sandbox: "danger-full-access" }
+    : { approvalPolicy: "on-request", sandbox: "workspace-write" };
+}
+
+export function turnSandboxPolicy(yolo: boolean, workspacePath: string, networkAccess: boolean): TurnSandboxPolicy {
+  return yolo
+    ? { type: "dangerFullAccess" }
+    : {
+      type: "workspaceWrite",
+      writableRoots: [workspacePath],
+      networkAccess,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+}
+
+export function appServerArguments(yolo: boolean): string[] {
+  return yolo ? ["--yolo", "app-server", "--stdio"] : ["app-server", "--stdio"];
+}
+
 export class AppServerClient extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private nextRequestId = 1;
   private readonly pending = new Map<RpcRequestId, RpcPending>();
   private starting: Promise<void> | null = null;
 
-  constructor(private readonly codexBinary: string) {
+  constructor(private readonly codexBinary: string, private readonly yolo = false) {
     super();
   }
 
@@ -42,7 +79,7 @@ export class AppServerClient extends EventEmitter {
   }
 
   private async startInternal(): Promise<void> {
-    const child = spawn(this.codexBinary, ["app-server", "--stdio"], {
+    const child = spawn(this.codexBinary, appServerArguments(this.yolo), {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
     });
@@ -71,7 +108,7 @@ export class AppServerClient extends EventEmitter {
       clientInfo: {
         name: "controller_center_agent",
         title: "Controller Center Agent",
-        version: "0.3.0",
+        version: "0.3.1",
       },
     });
     this.notify("initialized", {});

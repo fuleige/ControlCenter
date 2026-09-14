@@ -9,6 +9,7 @@ const node = {
   arch: "x64",
   agentVersion: "0.1.0",
   codexVersion: "codex-cli 0.153.0",
+  permissionMode: "danger-full-access",
   maxConcurrentRuns: 3,
   activeRuns: 1,
   status: "online",
@@ -220,6 +221,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await page.goto("/");
 
   const timeline = page.locator(".timeline");
+  await expect(page.locator(".node-permission-badge")).toHaveText("全权限");
   await expect(page.locator(".markdown-content").last()).toBeVisible();
   await expect.poll(() => page.locator(".virtual-timeline-row").count()).toBeLessThan(30);
   await expect(page.locator(".katex")).toHaveCount(4);
@@ -305,7 +307,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.3.0");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.1");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");

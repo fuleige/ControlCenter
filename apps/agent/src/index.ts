@@ -21,11 +21,19 @@ import {
   type RunProgressPhase,
   type WorkspaceDescriptor,
 } from "@controller-center/protocol";
-import { AppServerClient, type AppServerNotification, type AppServerRequest, type RpcRequestId } from "./app-server-client.js";
+import {
+  AppServerClient,
+  threadStartSecurity,
+  turnSandboxPolicy,
+  type AppServerNotification,
+  type AppServerRequest,
+  type RpcRequestId,
+} from "./app-server-client.js";
 import { loadConfig } from "./config.js";
+import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.3.0";
+const AGENT_VERSION = "0.3.1";
 
 interface ActiveRun {
   conversationId: string;
@@ -70,7 +78,8 @@ interface ModelListResult {
 const config = loadConfig();
 const bootId = randomUUID();
 const state = new AgentStateStore(config.dataDirectory);
-const appServer = new AppServerClient(config.codexBinary);
+const appServer = new AppServerClient(config.codexBinary, config.yolo);
+const outboundNetwork = new OutboundNetwork(config.codexProxyOnly);
 const conversationByThread = new Map<string, string>();
 const loadedThreads = new Set<string>();
 const activeRunsByTurn = new Map<string, ActiveRun>();
@@ -85,8 +94,7 @@ let reconnectTimer: NodeJS.Timeout | null = null;
 let attachmentCleanupTimer: NodeJS.Timeout | null = null;
 let reconnectAttempt = 0;
 let shuttingDown = false;
-let appServerApprovalPolicy: "on-request" | "unlessTrusted" = "on-request";
-let appServerSandboxMode: "workspace-write" | "workspaceWrite" = "workspace-write";
+const appServerSecurity = threadStartSecurity(config.yolo);
 let availableModels: ModelDescriptor[] = [];
 
 type AppServerUserInput =
@@ -508,30 +516,13 @@ async function ensureThreadLoaded(threadId: string): Promise<void> {
 }
 
 async function startThread(workspacePath: string, model?: string): Promise<ThreadResult> {
-  const flavors = [
-    { approvalPolicy: appServerApprovalPolicy, sandbox: appServerSandboxMode },
-    { approvalPolicy: "unlessTrusted" as const, sandbox: "workspaceWrite" as const },
-  ].filter((value, index, all) => all.findIndex((candidate) => candidate.approvalPolicy === value.approvalPolicy && candidate.sandbox === value.sandbox) === index);
-  let lastError: unknown;
-  for (const flavor of flavors) {
-    try {
-      const result = await appServer.request<ThreadResult>("thread/start", {
-        cwd: workspacePath,
-        approvalPolicy: flavor.approvalPolicy,
-        sandbox: flavor.sandbox,
-        serviceName: "controller_center",
-        ...(model ? { model } : {}),
-      });
-      appServerApprovalPolicy = flavor.approvalPolicy;
-      appServerSandboxMode = flavor.sandbox;
-      return result;
-    } catch (error) {
-      lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("unknown variant")) throw error;
-    }
-  }
-  throw lastError;
+  return appServer.request<ThreadResult>("thread/start", {
+    cwd: workspacePath,
+    approvalPolicy: appServerSecurity.approvalPolicy,
+    sandbox: appServerSecurity.sandbox,
+    serviceName: "controller_center",
+    ...(model ? { model } : {}),
+  });
 }
 
 function attachmentDownloadUrl(attachment: AttachmentDescriptor): string {
@@ -556,7 +547,7 @@ async function prepareAttachmentInputs(attachments: AttachmentDescriptor[] = [])
       if (!validCache) unlinkSync(finalPath);
     }
     if (!validCache) {
-      const response = await fetch(attachmentDownloadUrl(attachment), {
+      const response = await outboundNetwork.fetch(attachmentDownloadUrl(attachment), {
         headers: { Authorization: `Bearer ${attachment.downloadToken}` },
       });
       if (!response.ok) throw new Error(`无法下载附件 ${attachment.name} (${response.status})`);
@@ -617,14 +608,8 @@ async function startTurnForConversation(input: {
       threadId: input.threadId,
       input: [{ type: "text", text: input.prompt, text_elements: [] }, ...attachmentInputs],
       cwd: workspace.path,
-      approvalPolicy: appServerApprovalPolicy,
-      sandboxPolicy: {
-        type: "workspaceWrite",
-        writableRoots: [workspace.path],
-        networkAccess: config.networkAccess,
-        excludeTmpdirEnvVar: false,
-        excludeSlashTmp: false,
-      },
+      approvalPolicy: appServerSecurity.approvalPolicy,
+      sandboxPolicy: turnSandboxPolicy(config.yolo, workspace.path, config.networkAccess),
       ...(input.model ? { model: input.model } : {}),
       ...(input.effort ? { effort: input.effort } : {}),
     });
@@ -804,7 +789,7 @@ async function handleCommand(commandId: string, command: ControlCommand): Promis
     state.finishCommand(commandId);
     sendAck(commandId, "completed");
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatErrorChain(error);
     state.finishCommand(commandId, message);
     sendAck(commandId, "failed", message);
     const fatalContext = command.type === "conversation.start"
@@ -826,8 +811,10 @@ async function handleCommand(commandId: string, command: ControlCommand): Promis
 
 function connect(): void {
   if (shuttingDown) return;
+  const proxyAgent = outboundNetwork.webSocketAgent(config.controlUrl);
   const nextSocket = new WebSocket(config.controlUrl, {
     headers: { Authorization: `Bearer ${config.token}` },
+    ...(proxyAgent ? { agent: proxyAgent } : {}),
   });
   socket = nextSocket;
 
@@ -844,6 +831,7 @@ function connect(): void {
         arch: os.arch(),
         agentVersion: AGENT_VERSION,
         codexVersion: codexVersion(),
+        permissionMode: config.yolo ? "danger-full-access" : "workspace-write",
         maxConcurrentRuns: config.maxConcurrentRuns,
         workspaces: config.workspaces,
         models: availableModels,
@@ -912,7 +900,7 @@ function connect(): void {
     reconnectTimer = setTimeout(connect, delay);
   });
 
-  nextSocket.on("error", (error) => console.error("[agent] websocket error", error.message));
+  nextSocket.on("error", (error) => console.error("[agent] websocket error", formatErrorChain(error)));
 }
 
 function shutdown(): void {
@@ -922,6 +910,7 @@ function shutdown(): void {
   if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
   socket?.close(1000, "Agent shutting down");
   appServer.close();
+  void outboundNetwork.destroy();
   state.close();
 }
 
@@ -930,6 +919,10 @@ process.on("SIGTERM", () => { shutdown(); process.exit(0); });
 
 console.log(`[agent] node ${config.nodeName} (${config.nodeId})`);
 console.log(`[agent] workspaces: ${config.workspaces.map((workspace) => `${workspace.name}=${workspace.path}`).join(", ")}`);
+if (config.yolo) console.warn("[agent] 全权限模式已启用：Codex 命令不经过审批或沙箱隔离");
+if (config.codexProxyOnly) {
+  console.log(`[agent] 代理模式：仅 Codex 使用系统代理${hasProxyEnvironment() ? "" : "（当前未检测到代理环境变量）"}`);
+}
 
 async function bootstrap(): Promise<void> {
   cleanupAttachmentCache();

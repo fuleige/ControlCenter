@@ -25,7 +25,9 @@ describe("Agent workspace configuration", () => {
     process.env.AGENT_DATA_DIR = dataDirectory;
     process.env.INIT_CWD = initialDirectory;
     process.env.AGENT_WORKSPACES = JSON.stringify([{ id: "project-a", name: "Project A", path: initialDirectory }]);
-    const configured = loadConfig();
+    const configured = loadConfig(["--yolo", "--codex-proxy-only"]);
+    expect(configured.yolo).toBe(true);
+    expect(configured.codexProxyOnly).toBe(true);
     expect(configured.workspaces[0]).toMatchObject({
       id: "project-a",
       path: initialDirectory,
@@ -34,11 +36,13 @@ describe("Agent workspace configuration", () => {
     });
 
     delete process.env.AGENT_WORKSPACES;
-    const withoutDuplicateConfiguration = loadConfig();
+    const withoutDuplicateConfiguration = loadConfig([]);
+    expect(withoutDuplicateConfiguration.yolo).toBe(false);
+    expect(withoutDuplicateConfiguration.codexProxyOnly).toBe(false);
     expect(withoutDuplicateConfiguration.workspaces[0]?.id).toBe("project-a");
 
     process.env.INIT_CWD = nextDirectory;
-    const afterMovingAgent = loadConfig();
+    const afterMovingAgent = loadConfig([]);
     expect(afterMovingAgent.workspaces[0]?.path).toBe(nextDirectory);
     expect(afterMovingAgent.workspaces[0]?.id).not.toBe("project-a");
   });
@@ -59,7 +63,7 @@ describe("Agent workspace configuration", () => {
     process.env.AGENT_TOKEN = "legacy-shared-token";
     delete process.env.CONTROL_CENTER_URL;
 
-    const config = loadConfig();
+    const config = loadConfig([]);
     expect(config.controlUrl).toBe("wss://control.example.com/agent/connect");
     expect(config.token).toBe("ccn_credential.secret");
   });

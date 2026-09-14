@@ -3,6 +3,14 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { agentDataDirectory, loadOrCreateNodeId, type SavedAgentConnection } from "./config.js";
+import {
+  CODEX_PROXY_ONLY_ARGUMENT,
+  codexProxyOnlyFromArgv,
+  formatErrorChain,
+  networkErrorHint,
+  OutboundNetwork,
+  systemProxyForUrl,
+} from "./outbound-network.js";
 
 function option(name: string): string | null {
   const index = process.argv.indexOf(name);
@@ -74,6 +82,7 @@ function persistConnection(dataDirectory: string, connection: SavedAgentConnecti
 }
 
 async function main(): Promise<void> {
+  const codexProxyOnly = codexProxyOnlyFromArgv(process.argv.slice(2));
   const server = option("--server") ?? process.env.CONTROL_CENTER_URL;
   if (!server) throw new Error("缺少控制中心地址，请使用 --server https://control.example.com");
   const registrationToken = option("--token")
@@ -86,19 +95,40 @@ async function main(): Promise<void> {
   const nodeId = loadOrCreateNodeId(dataDirectory);
   const destination = enrollmentEndpoint(server);
   const credential = `ccn_${randomUUID()}.${randomBytes(32).toString("base64url")}`;
-  const response = await fetch(destination.endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${registrationToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ nodeId, credential }),
-  });
-  const result = await response.json().catch(() => ({})) as { error?: string };
-  if (!response.ok) throw new Error(result.error || `注册失败 (${response.status})`);
-  persistConnection(dataDirectory, { controlUrl: destination.controlUrl, credential });
-  process.stdout.write(`注册成功，节点身份已保存到 ${path.join(dataDirectory, "connection.json")}\n`);
-  process.stdout.write("现在可以启动 Agent。\n");
+  const outboundNetwork = new OutboundNetwork(codexProxyOnly);
+  try {
+    let response: Awaited<ReturnType<OutboundNetwork["fetch"]>>;
+    try {
+      response = await outboundNetwork.fetch(destination.endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${registrationToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ nodeId, credential }),
+      });
+    } catch (error) {
+      const route = codexProxyOnly
+        ? "直连（--codex-proxy-only）"
+        : systemProxyForUrl(destination.endpoint, false) ? "系统代理" : "直连（未匹配代理环境变量）";
+      const routeHint = codexProxyOnly
+        ? "可暂时去掉 --codex-proxy-only，对比系统代理路径。"
+        : "请同时核对 HTTPS_PROXY、ALL_PROXY 与 NO_PROXY。";
+      throw new Error([
+        `无法连接控制中心（${route}）`,
+        `地址：${destination.endpoint}`,
+        `原因：${formatErrorChain(error)}`,
+        `建议：${networkErrorHint(error)}${routeHint}`,
+      ].join("\n"), { cause: error });
+    }
+    const result = await response.json().catch(() => ({})) as { error?: string };
+    if (!response.ok) throw new Error(result.error || `注册失败 (${response.status})`);
+    persistConnection(dataDirectory, { controlUrl: destination.controlUrl, credential });
+    process.stdout.write(`注册成功，节点身份已保存到 ${path.join(dataDirectory, "connection.json")}\n`);
+    process.stdout.write(`现在可以启动 Agent${codexProxyOnly ? `，并继续传入 ${CODEX_PROXY_ONLY_ARGUMENT}` : ""}。\n`);
+  } finally {
+    await outboundNetwork.destroy();
+  }
 }
 
 main().catch((error) => {

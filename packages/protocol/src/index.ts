@@ -43,6 +43,7 @@ export interface NodeDescriptor {
   arch: string;
   agentVersion: string;
   codexVersion: string;
+  permissionMode?: "workspace-write" | "danger-full-access";
   maxConcurrentRuns: number;
   workspaces: WorkspaceDescriptor[];
   models?: ModelDescriptor[];

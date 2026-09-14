@@ -38,6 +38,7 @@ describe("ControlDatabase", () => {
       arch: "x64",
       agentVersion: "0.1.0",
       codexVersion: "codex-cli 0.153.0",
+      permissionMode: "danger-full-access",
       maxConcurrentRuns: 2,
       workspaces: [
         { id: "repo", name: "Repository", path: "/repo", source: "default", isDefault: true },
@@ -52,6 +53,7 @@ describe("ControlDatabase", () => {
       }],
     }, "boot-1", at)).toBe(false);
     expect(database.listNodes()[0]?.status).toBe("online");
+    expect(database.listNodes()[0]?.permissionMode).toBe("danger-full-access");
     expect(database.listNodes()[0]?.models[0]?.id).toBe("gpt-test");
     expect(database.getWorkspace("node-1", "repo")?.path).toBe("/repo");
     expect(database.updateNodeName("node-1", "我的构建机", at)).toBe(true);
@@ -259,6 +261,7 @@ describe("ControlDatabase", () => {
       ...descriptor,
       workspaces: [{ id: "default-a", name: "Project A", path: "/projects/a", source: "default", isDefault: true }],
     }, "boot-a", firstAt);
+    expect(database.listNodes()[0]?.permissionMode).toBe("workspace-write");
     expect(database.getWorkspace(descriptor.id, "default-a")?.isDefault).toBe(true);
 
     const managed = database.createWebWorkspace({

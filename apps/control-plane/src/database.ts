@@ -25,6 +25,7 @@ export interface NodeRecord {
   arch: string;
   agentVersion: string;
   codexVersion: string;
+  permissionMode: "workspace-write" | "danger-full-access";
   maxConcurrentRuns: number;
   activeRuns: number;
   status: "online" | "offline";
@@ -294,6 +295,7 @@ export class ControlDatabase {
         arch TEXT NOT NULL,
         agent_version TEXT NOT NULL,
         codex_version TEXT NOT NULL,
+        permission_mode TEXT NOT NULL DEFAULT 'workspace-write',
         max_concurrent_runs INTEGER NOT NULL DEFAULT 1,
         active_runs INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'offline',
@@ -482,6 +484,7 @@ export class ControlDatabase {
     `);
     this.ensureColumn("nodes", "display_name", "TEXT");
     this.ensureColumn("nodes", "model_catalog_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("nodes", "permission_mode", "TEXT NOT NULL DEFAULT 'workspace-write'");
     this.ensureColumn("workspaces", "source", "TEXT NOT NULL DEFAULT 'config'");
     this.ensureColumn("workspaces", "is_default", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("workspaces", "status", "TEXT NOT NULL DEFAULT 'valid'");
@@ -590,14 +593,15 @@ export class ControlDatabase {
       this.sqlite.prepare(`
         INSERT INTO nodes (
           id, name, platform, arch, agent_version, codex_version,
-          max_concurrent_runs, active_runs, status, boot_id, last_seen_at, connected_at, model_catalog_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?)
+          permission_mode, max_concurrent_runs, active_runs, status, boot_id, last_seen_at, connected_at, model_catalog_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           name = excluded.name,
           platform = excluded.platform,
           arch = excluded.arch,
           agent_version = excluded.agent_version,
           codex_version = excluded.codex_version,
+          permission_mode = excluded.permission_mode,
           max_concurrent_runs = excluded.max_concurrent_runs,
           status = 'online',
           boot_id = excluded.boot_id,
@@ -612,6 +616,7 @@ export class ControlDatabase {
         node.arch,
         node.agentVersion,
         node.codexVersion,
+        node.permissionMode === "danger-full-access" ? "danger-full-access" : "workspace-write",
         node.maxConcurrentRuns,
         bootId,
         now,
@@ -770,6 +775,7 @@ export class ControlDatabase {
       arch: text(row, "arch"),
       agentVersion: text(row, "agent_version"),
       codexVersion: text(row, "codex_version"),
+      permissionMode: text(row, "permission_mode") === "danger-full-access" ? "danger-full-access" : "workspace-write",
       maxConcurrentRuns: Number(row.max_concurrent_runs),
       activeRuns: Number(row.active_runs),
       status: text(row, "status") as NodeRecord["status"],

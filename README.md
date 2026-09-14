@@ -2,7 +2,7 @@
 
 一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据和工作区文件都不会交给控制中心。
 
-产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。代码按这些边界实施。
+产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。Agent 可用参数、环境变量、优先级和组合示例见 [Agent 客户端命令与配置](docs/agent-cli.md)。代码按这些边界实施。
 
 ## 组成
 
@@ -24,6 +24,8 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - Web 使用随机管理员 Token 登录，服务端建立 HttpOnly 会话；管理员原始 Token 不进入前端构建、Local Storage 或 URL。
 - Web 可生成 10 分钟有效的节点注册 Token；有效期内可在列表查看、复制和确认注册状态，到期自动删除；Agent 首次注册后使用与固定节点 ID 绑定的独立长期凭证。
 - Agent 注册、心跳、断线检测和自动重连；迁移期间仍兼容旧共享 Token。
+- Agent 可在启动时显式传入 `--yolo`，以关闭 Codex 审批和沙箱；节点会把当前权限模式上报给中心，Web 在节点名称旁持续显示“全权限”。
+- Agent 统一读取 Linux/macOS CLI 常用的代理环境变量；可通过 `--codex-proxy-only` 让控制中心注册、控制通道和附件下载强制直连，同时只让 Codex 子进程继承系统代理。
 - Agent 启动目录自动成为不可修改的默认工作空间；还可通过启动配置或 Web 设置为节点登记多个本地路径。
 - Web 添加工作空间时由对应 Agent 验证目录存在、可读写并返回规范路径；每次创建会话或新任务前再次验证。
 - 每个会话固定绑定一个工作空间；Agent 更换启动目录后，新目录成为默认，仍被会话使用的旧默认目录作为历史工作空间保留。
@@ -84,10 +86,10 @@ npm run admin -- admin-token show
 CONTROL_CENTER_URL=ws://127.0.0.1:8787/agent/connect \
 AGENT_TOKEN=local-agent-token \
 AGENT_NAME=local-dev \
-npm run dev:agent
+npm run dev:agent -- --yolo --codex-proxy-only
 ```
 
-Agent 启动命令所在目录就是默认工作空间（通过 npm 启动时使用 npm 保留的原始调用目录，而不是 workspace 包目录）。`AGENT_WORKSPACES` 仅用于追加由部署配置维护的工作空间；若其中包含启动目录，该项会被识别为默认项。
+`--yolo` 是显式的全权限开关：它会关闭 Codex 的审批与沙箱隔离；不传时仍使用默认的 `workspaceWrite` 安全模式。`--codex-proxy-only` 是进程级网络策略；不传时 Agent 与 Codex 都遵循系统代理环境变量，传入后 Agent 自身强制直连而 Codex 仍继承代理。Agent 启动命令所在目录就是默认工作空间（通过 npm 启动时使用 npm 保留的原始调用目录，而不是 workspace 包目录）。`AGENT_WORKSPACES` 仅用于追加由部署配置维护的工作空间；若其中包含启动目录，该项会被识别为默认项。
 
 终端三，启动 Web：
 
@@ -138,17 +140,29 @@ Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿�
 - `deploy/systemd/controller-center-agent.service`
 - `deploy/agent.env.example`
 
-Agent 的运行用户必须对配置的工作区具有适当权限，并且该用户需要完成本地 Codex 登录。
+Agent 的运行用户必须对配置的工作区具有适当权限，并且该用户需要完成本地 Codex 登录。`AGENT_DATA_DIR` 不设置时默认使用 `~/.controller-center-agent`，它保存稳定节点身份而不决定默认工作空间；默认工作空间仍由启动目录决定。
 systemd 的 `WorkingDirectory` 决定该节点的默认工作空间；示例中为 `/opt/controller-center`。
+仓库中的 systemd 示例已在 Agent 启动命令末尾添加 `--yolo --codex-proxy-only`；若节点需要审批和沙箱保护，删除 `--yolo`，若控制中心流量也应使用代理则删除 `--codex-proxy-only`。
+客户端运行与注册支持的完整参数列表见 [Agent 客户端命令与配置](docs/agent-cli.md)。
+
+独立客户端和发布压缩包提供快捷脚本，默认连接本项目的公开控制中心，并以全权限、控制链路直连模式启动：
+
+```bash
+./agent.sh login
+./agent.sh start
+./agent.sh status
+```
+
+可用 `./agent.sh start --safe` 恢复审批与沙箱，或用 `./agent.sh start --all-proxy` 让控制中心连接也按系统代理规则访问。
 
 新节点首次接入：先在 Web 的“设置 → 节点接入”生成注册 Token，再在节点执行以下命令。命令只要求控制中心域名，Token 会通过不回显的交互输入读取；公网地址必须为 HTTPS。
 
 ```bash
 AGENT_DATA_DIR=/var/lib/controller-center-agent \
-npm run agent:enroll -- --server https://control.example.com
+npm run agent:enroll -- --server https://control.example.com --codex-proxy-only
 ```
 
-注册成功后，中心地址与该节点的独立凭证保存到 `AGENT_DATA_DIR/connection.json`（权限 `0600`），之后启动 Agent 不再需要配置域名或 Token。自动化环境可临时使用 `CONTROLLER_CENTER_ENROLLMENT_TOKEN` 环境变量，避免把 Token 写入命令行参数和 shell 历史。
+注册命令是独立进程，因此若注册也需要绕过系统代理，必须同样传入 `--codex-proxy-only`。注册成功后，中心地址与该节点的独立凭证保存到 `AGENT_DATA_DIR/connection.json`（权限 `0600`），之后启动 Agent 不再需要配置域名或 Token。自动化环境可临时使用 `CONTROLLER_CENTER_ENROLLMENT_TOKEN` 环境变量，避免把 Token 写入命令行参数和 shell 历史。
 
 ## 常用配置
 
@@ -178,6 +192,11 @@ Agent：
 | `MAX_CONCURRENT_RUNS` | `2` | 节点最大活动任务数 |
 | `AGENT_NETWORK_ACCESS` | `false` | Codex workspace sandbox 默认网络权限 |
 | `CODEX_BIN` | `codex` | Codex CLI 路径 |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 系统 HTTP(S) 代理；支持大写和小写变量 |
+| `ALL_PROXY` | 空 | 未配置协议专用代理时的后备代理；当前支持 HTTP(S) 代理地址 |
+| `NO_PROXY` | 空 | 默认模式下不使用代理的地址；支持大写和小写变量 |
+
+Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 `--server`、`--token` 和 `--codex-proxy-only`。详细说明、安全注意事项及环境变量优先级见 [Agent 客户端命令与配置](docs/agent-cli.md)。
 
 ## API 概览
 
@@ -215,7 +234,8 @@ Agent：
 - 节点注册 Token 在 10 分钟有效期内可由已登录管理员查看和复制，但仍只能成功使用一次；数据库保存校验哈希及由本机独立密钥加密的临时展示内容，到期自动删除整条记录。节点长期凭证与固定节点 ID 绑定。
 - Agent 在保存和实际执行前都验证路径，并始终使用规范绝对路径；目录权限边界由 Agent 的操作系统用户决定。
 - 默认工作空间只能由 Agent 的进程启动目录决定，不能通过 Web 改名、迁移、停用或删除。
-- Agent 使用 `workspaceWrite` sandbox，默认关闭网络访问。
+- Agent 默认使用 `workspaceWrite` sandbox 并关闭网络访问；只有在本机启动命令显式传入 `--yolo` 时才切换为无审批、无沙箱的全权限模式，Web 会持续标识该状态。
+- 默认情况下 Agent 自身网络与 Codex 都遵循代理环境变量及 `NO_PROXY`；显式传入 `--codex-proxy-only` 后，Agent 自身连接强制直连，代理变量只由 Codex 子进程继承。
 - 不提供绕过 Codex 的远程 Shell API。
 - OpenAI/ChatGPT 凭据始终由节点本地的 Codex 管理。
 - Git commit、push 和其他远端写操作仍须在任务中得到明确授权。

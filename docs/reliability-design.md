@@ -39,6 +39,13 @@ Browser ⇄ Control Plane ⇄ Node Agent ⇄ Codex App Server
 - Agent 先写 SQLite Outbox，再发送。
 - Control Plane 在事务提交后才发送 Delivery Ack。
 - Agent 收到 Ack 后删除 Outbox 记录。
+
+### 2.4 出站代理策略
+
+- 默认模式下，注册 HTTP 请求、Agent 附件下载和 WSS 控制通道使用相同的环境代理解析规则，并遵循 `NO_PROXY`。
+- `--codex-proxy-only` 模式为 Agent 的上述连接显式选择直连 Dispatcher/Agent，不能依赖各网络库是否隐式读取环境变量。
+- 代理环境不被删除或改写，Codex App Server 子进程始终继承原始环境；这样切换只影响 Agent 自身网络，不影响 Codex。
+- 注册 CLI 是独立进程，必须独立解析同名参数。代理地址、用户名和密码不进入日志、协议或数据库。
 - Control Plane 对重复序列去重。
 
 当前实现已具备该基础；协议 v4 使用产品级消息和进度事件，并增加工作空间同步与在线验证。
@@ -101,6 +108,7 @@ interface MessageSnapshotPayload {
 ### 3.4 工作空间同步与验证
 
 - `agent.hello` 只发布 Agent 本地决定的默认工作空间和启动配置工作空间。
+- `agent.hello` 同时发布进程级权限模式；Control Plane 持久化最后一次握手值，旧 Agent 未上报时按 `workspace-write` 处理。
 - Control Plane 持久保存 Web 添加及历史保留工作空间，并在握手成功后通过 `control.workspaceSync` 下发到 Agent 内存注册表。
 - `control.workspaceValidate` / `agent.workspaceValidation` 使用独立 `requestId` 做一次性请求响应，默认 10 秒超时；节点断线或连接被替换时立即拒绝所有挂起验证。
 - Agent 返回 `realpath` 解析后的规范绝对路径，只认可存在、为目录且当前运行用户可读写的路径。
@@ -138,6 +146,7 @@ Agent Hello 后增加状态报告：
 - 已知活动 Run、Turn ID 和最后消息 revision。
 - Outbox 最小、最大待发送 sequence。
 - 当前启动目录决定的默认工作空间及启动配置工作空间。
+- 当前进程权限模式（`workspace-write` 或 `danger-full-access`）。
 
 Control Plane 对比数据库后返回协调指令：
 

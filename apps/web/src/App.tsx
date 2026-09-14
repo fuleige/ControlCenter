@@ -391,9 +391,12 @@ function NodePanel({
           <div className="node-entry" key={node.id}>
             <div className="node-row">
               <button className={`node-card ${selectedId === node.id ? "selected" : ""}`} onClick={() => onSelect(node)}>
-                <span className="node-identity" title={node.name}>{nodeShortLabel(node.name)}{nodeAttention > 0 && <i>{nodeAttention > 9 ? "9+" : nodeAttention}</i>}</span>
+                <span className={`node-identity ${node.permissionMode === "danger-full-access" ? "full-access" : ""}`} title={`${node.name}${node.permissionMode === "danger-full-access" ? " · 全权限" : ""}`}>{nodeShortLabel(node.name)}{nodeAttention > 0 && <i>{nodeAttention > 9 ? "9+" : nodeAttention}</i>}</span>
                 <span className={`presence ${node.status}`} />
-                <span className="node-main"><strong>{node.name}</strong><small>{node.platform} · {node.arch}</small></span>
+                <span className="node-main">
+                  <span className="node-title"><strong>{node.name}</strong>{node.permissionMode === "danger-full-access" && <em className="node-permission-badge" title="此节点启动时启用了 --yolo，不经过审批或 Codex 沙箱">全权限</em>}</span>
+                  <small>{node.platform} · {node.arch}</small>
+                </span>
                 <span className="node-load">{node.activeRuns}/{node.maxConcurrentRuns}</span>
               </button>
               <button
@@ -1032,7 +1035,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
     {nodes.length > 0 && <div className="enrollment-nodes">
       <header><strong>已登记节点</strong><span>丢失或停用节点时应立即撤销其长期凭证</span></header>
       {nodes.map((node) => <article key={node.id}>
-        <div><strong>{node.name}</strong><small>{node.accessMode === "enrolled" ? "独立凭证" : node.accessMode === "revoked" ? "接入已撤销" : "旧共享凭证"} · {node.status === "online" ? "在线" : "离线"}</small></div>
+        <div><strong>{node.name}</strong><small>{node.accessMode === "enrolled" ? "独立凭证" : node.accessMode === "revoked" ? "接入已撤销" : "旧共享凭证"} · {node.status === "online" ? "在线" : "离线"}{node.permissionMode === "danger-full-access" ? " · 全权限" : ""}</small></div>
         {confirmNodeId === node.id ? <div className="enrollment-node-confirm"><span>撤销后 Agent 会立即断开</span><button type="button" onClick={() => setConfirmNodeId(null)}>取消</button><button type="button" className="danger-text" disabled={busy} onClick={() => void revokeAccess(node)}>确认撤销</button></div>
           : <button type="button" disabled={busy || node.accessMode !== "enrolled"} onClick={() => setConfirmNodeId(node.id)}>撤销接入</button>}
       </article>)}

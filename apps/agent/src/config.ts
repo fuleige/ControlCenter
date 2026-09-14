@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { WorkspaceDescriptor } from "@controller-center/protocol";
+import { codexProxyOnlyFromArgv } from "./outbound-network.js";
 
 export interface AgentConfig {
   controlUrl: string;
@@ -13,6 +14,8 @@ export interface AgentConfig {
   codexBinary: string;
   maxConcurrentRuns: number;
   networkAccess: boolean;
+  yolo: boolean;
+  codexProxyOnly: boolean;
   workspaces: WorkspaceDescriptor[];
 }
 
@@ -133,7 +136,7 @@ export function loadSavedConnection(dataDirectory: string): SavedAgentConnection
   return { controlUrl: parsed.controlUrl, credential: parsed.credential };
 }
 
-export function loadConfig(): AgentConfig {
+export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig {
   const dataDirectory = agentDataDirectory();
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
   chmodSync(dataDirectory, 0o700);
@@ -150,6 +153,8 @@ export function loadConfig(): AgentConfig {
     codexBinary: process.env.CODEX_BIN ?? "codex",
     maxConcurrentRuns: integerEnv("MAX_CONCURRENT_RUNS", 2),
     networkAccess: process.env.AGENT_NETWORK_ACCESS === "true",
+    yolo: argv.includes("--yolo"),
+    codexProxyOnly: codexProxyOnlyFromArgv(argv),
     workspaces: parseWorkspaces(dataDirectory),
   };
 }
