@@ -60,6 +60,7 @@ Browser ⇄ Control Plane ⇄ Node Agent ⇄ Codex App Server
 - `run.started`
 - `run.progress`
 - `message.snapshot`
+- `conversation.tokenUsage`
 - `run.finished`
 - `interaction.requested`
 - `interaction.resolved`
@@ -114,6 +115,28 @@ interface MessageSnapshotPayload {
 - Agent 返回 `realpath` 解析后的规范绝对路径，只认可存在、为目录且当前运行用户可读写的路径。
 - 工作空间验证消息不进入耐久任务 Outbox；只有验证成功后的配置和任务创建才持久化，断线时由调用方明确失败并保留用户输入。
 - 每次创建会话、开始新轮次或重试前由 Control Plane 在线复验；Agent 在 `thread/start` / `turn/start` 前再次本地复验，避免验证后目录被删除、换成链接或失去权限。
+
+### 3.5 `conversation.tokenUsage`
+
+```ts
+interface ConversationTokenUsagePayload {
+  type: "conversation.tokenUsage";
+  conversationId: string;
+  remoteThreadId: string;
+  tokenUsage: {
+    totalTokens: number;
+    contextTokens: number;
+    modelContextWindow: number | null;
+    updatedAt: string;
+  };
+}
+```
+
+- Agent 复用 Codex App Server 主动推送的 `thread/tokenUsage/updated`，不增加模型目录轮询或额外 OpenAI 请求。
+- `totalTokens` 来自 Thread 累计统计；`contextTokens` 来自最近一轮统计，用于计算当前上下文占用比例；`modelContextWindow` 缺失时显示未知。
+- Agent 对相同 Thread 的相同统计值去重后再进入耐久 Outbox，Control Plane 只接受会话所属节点和远端 Thread ID 均匹配且时间不早于已有记录的数据。
+- Token 更新只刷新当前打开会话的详情，不改变会话排序，也不触发全量会话列表刷新。
+- 首次升级到支持该字段的版本时，Control Plane 在 Agent 握手响应中只下发 `token_usage_json` 为空的旧会话；Agent 顺序执行本地 `thread/resume` 并立即取消订阅以触发一次统计回填。回填成功后该会话不再进入后续握手任务，新会话始终使用实时通知。
 
 ## 4. Run 状态机
 

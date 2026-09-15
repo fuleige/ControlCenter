@@ -3,6 +3,8 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AgentErrorPayload,
+  ConversationTokenUsage,
+  ConversationTokenUsagePayload,
   InteractionRequestedPayload,
   MessageSnapshotPayload,
   ControlCommand,
@@ -66,6 +68,7 @@ export interface ConversationRecord {
   error: string | null;
   pinnedAt: string | null;
   latestRunStatus: RunRecord["status"] | null;
+  tokenUsage: ConversationTokenUsage | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -247,6 +250,21 @@ function nullableText(row: Row, key: string): string | null {
 
 function parseJson(value: unknown): unknown {
   return JSON.parse(String(value));
+}
+
+function conversationTokenUsage(value: unknown): ConversationTokenUsage | null {
+  if (value === null || value === undefined) return null;
+  try {
+    const usage = parseJson(value) as Partial<ConversationTokenUsage>;
+    if (!usage || typeof usage !== "object"
+      || !Number.isSafeInteger(usage.totalTokens) || Number(usage.totalTokens) < 0
+      || !Number.isSafeInteger(usage.contextTokens) || Number(usage.contextTokens) < 0
+      || usage.modelContextWindow !== null && (!Number.isSafeInteger(usage.modelContextWindow) || Number(usage.modelContextWindow) <= 0)
+      || typeof usage.updatedAt !== "string") return null;
+    return usage as ConversationTokenUsage;
+  } catch {
+    return null;
+  }
 }
 
 function notificationPreview(value: string | null): string | null {
@@ -509,6 +527,7 @@ export class ControlDatabase {
     this.ensureColumn("conversations", "effort", "TEXT");
     this.ensureColumn("conversations", "client_request_id", "TEXT");
     this.ensureColumn("conversations", "pinned_at", "TEXT");
+    this.ensureColumn("conversations", "token_usage_json", "TEXT");
     this.ensureColumn("runs", "client_request_id", "TEXT");
     this.ensureColumn("runs", "progress_phase", "TEXT");
     this.ensureColumn("runs", "progress_label", "TEXT");
@@ -953,6 +972,7 @@ export class ControlDatabase {
       latestRunStatus: hasEmbeddedLatestRun
         ? nullableText(row, "latest_run_status") as RunRecord["status"] | null
         : latestRun ? text(latestRun, "status") as RunRecord["status"] : null,
+      tokenUsage: conversationTokenUsage(row.token_usage_json),
       createdAt: text(row, "created_at"),
       updatedAt: text(row, "updated_at"),
     };
@@ -975,6 +995,19 @@ export class ControlDatabase {
       ? this.sqlite.prepare("SELECT * FROM conversations WHERE node_id = ? ORDER BY updated_at DESC").all(nodeId)
       : this.sqlite.prepare("SELECT * FROM conversations ORDER BY updated_at DESC").all()) as Row[];
     return rows.map((row) => this.conversationFromRow(row));
+  }
+
+  listTokenUsageBackfill(nodeId: string): Array<{ conversationId: string; threadId: string }> {
+    const rows = this.sqlite.prepare(`
+      SELECT id, remote_thread_id
+      FROM conversations
+      WHERE node_id = ? AND remote_thread_id IS NOT NULL AND token_usage_json IS NULL
+      ORDER BY updated_at DESC, id DESC
+    `).all(nodeId) as Row[];
+    return rows.map((row) => ({
+      conversationId: text(row, "id"),
+      threadId: text(row, "remote_thread_id"),
+    }));
   }
 
   listConversationPage(options: {
@@ -1071,6 +1104,23 @@ export class ControlDatabase {
     this.sqlite.prepare(
       "UPDATE conversations SET model = ?, effort = ?, updated_at = ? WHERE id = ?",
     ).run(model, effort, now, id);
+  }
+
+  updateConversationTokenUsage(nodeId: string, payload: ConversationTokenUsagePayload): boolean {
+    const conversation = this.sqlite.prepare(
+      "SELECT remote_thread_id, token_usage_json FROM conversations WHERE id = ? AND node_id = ?",
+    ).get(payload.conversationId, nodeId) as Row | undefined;
+    if (!conversation || nullableText(conversation, "remote_thread_id") !== payload.threadId) return false;
+    const previous = conversationTokenUsage(conversation.token_usage_json);
+    if (previous && previous.updatedAt > payload.updatedAt) return false;
+    return this.sqlite.prepare(
+      "UPDATE conversations SET token_usage_json = ? WHERE id = ? AND node_id = ?",
+    ).run(JSON.stringify({
+      totalTokens: payload.totalTokens,
+      contextTokens: payload.contextTokens,
+      modelContextWindow: payload.modelContextWindow,
+      updatedAt: payload.updatedAt,
+    } satisfies ConversationTokenUsage), payload.conversationId, nodeId).changes > 0;
   }
 
   updateConversation(id: string, input: { title?: string; pinned?: boolean }, now: string): ConversationRecord | null {

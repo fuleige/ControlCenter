@@ -40,7 +40,7 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - 任务追加指令、中止当前轮次和失败状态；中止后可在同一历史会话继续发起新轮次。
 - 主内容区任务中心只保留全局节点菜单，隐藏依赖当前节点的历史会话栏；仅在用户未查看对应会话时生成未读完成、失败或等待操作通知，并展示会话名与对应任务最新回复摘要。
 - 任务中心支持会话名称/节点名称搜索、节点与状态筛选、全部标为已读，以及失败任务幂等重新执行。
-- 全局快速切换支持按节点名称或会话名称搜索所有节点和跨节点历史会话；空关键词不加载历史会话，有关键词时最多返回 10 条会话结果。桌面端可使用 `Ctrl/Cmd + K`，移动端使用顶部搜索入口。
+- 全局快速切换支持按节点名称或会话名称搜索所有节点和跨节点历史会话；空关键词不加载历史会话，有关键词时最多返回 10 条会话结果。桌面端可使用 `Ctrl/Cmd + K`，移动端底部工具栏按“节点、消息、搜索、设置”排列，节点入口直接显示在线数/总数。
 - 会话列表使用服务端名称搜索与游标分页，每页 50 条；不会下载或检索消息正文、代码和附件内容。
 - 任务中心最多展示 200 条，摘要最多 120 个字符；已读通知保留 30 天、未读通知保留 90 天，通知清理不影响会话历史。
 - 全局默认模型和思考强度设置，节点不支持偏好模型时回退本机默认；设置页展示构建版本号。
@@ -145,7 +145,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可直接下载当前版本的完整客户端安装包；该包已经包含编译结果和生产依赖，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.5.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.6.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent

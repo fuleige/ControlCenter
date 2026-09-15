@@ -130,6 +130,23 @@ export interface MessageSnapshotPayload {
   occurredAt: string;
 }
 
+export interface ConversationTokenUsage {
+  /** Cumulative tokens consumed by every model call in this conversation. */
+  totalTokens: number;
+  /** Tokens present in the most recent model call, used for context occupancy. */
+  contextTokens: number;
+  /** Effective model context-window size reported by Codex, when available. */
+  modelContextWindow: number | null;
+  updatedAt: string;
+}
+
+export interface ConversationTokenUsagePayload extends ConversationTokenUsage {
+  type: "conversation.tokenUsage";
+  conversationId: string;
+  threadId: string;
+  turnId?: string;
+}
+
 export interface InteractionRequestedPayload {
   type: "interaction.requested";
   approvalId: string;
@@ -178,6 +195,7 @@ export type DurableAgentPayload =
   | RunStartedPayload
   | RunProgressPayload
   | MessageSnapshotPayload
+  | ConversationTokenUsagePayload
   | RunFinishedPayload
   | InteractionRequestedPayload
   | InteractionResolvedPayload
@@ -291,6 +309,11 @@ export interface ControlWelcomeMessage {
   nodeId: string;
   connectedAt: string;
   heartbeatIntervalMs: number;
+  /** Legacy conversations that need a one-time local token-usage backfill. */
+  tokenUsageBackfill?: Array<{
+    conversationId: string;
+    threadId: string;
+  }>;
 }
 
 export interface ControlDeliveryAckMessage {

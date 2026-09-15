@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appServerArguments, threadStartSecurity, turnSandboxPolicy } from "./app-server-client.js";
+import { appServerArguments, parseThreadTokenUsage, threadStartSecurity, turnSandboxPolicy } from "./app-server-client.js";
 
 describe("Codex App Server launch arguments", () => {
   it("uses the normal sandboxed mode by default", () => {
@@ -26,5 +26,23 @@ describe("Codex App Server sandbox protocol", () => {
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
     });
+  });
+});
+
+describe("Codex App Server token usage", () => {
+  it("extracts cumulative usage and the latest context footprint", () => {
+    expect(parseThreadTokenUsage({
+      threadId: "thread-1",
+      tokenUsage: {
+        total: { totalTokens: 456_789, inputTokens: 400_000, outputTokens: 56_789 },
+        last: { totalTokens: 123_456, inputTokens: 120_000, outputTokens: 3_456 },
+        modelContextWindow: 400_000,
+      },
+    })).toEqual({ totalTokens: 456_789, contextTokens: 123_456, modelContextWindow: 400_000 });
+  });
+
+  it("rejects malformed token usage notifications without crashing the Agent", () => {
+    expect(parseThreadTokenUsage({ tokenUsage: { total: {}, last: {}, modelContextWindow: 400_000 } })).toBeNull();
+    expect(parseThreadTokenUsage({ tokenUsage: { total: { totalTokens: 1 }, last: { totalTokens: -1 }, modelContextWindow: 400_000 } })).toBeNull();
   });
 });

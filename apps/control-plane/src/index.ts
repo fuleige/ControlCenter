@@ -461,6 +461,11 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
     case "message.snapshot":
       if (database.upsertMessageSnapshot(payload)) publishMessageUpdate(payload.messageId, payload.conversationId, payload.complete);
       break;
+    case "conversation.tokenUsage":
+      if (database.updateConversationTokenUsage(nodeId, payload)) {
+        publish("usage.updated", payload.conversationId, payload.conversationId);
+      }
+      break;
     case "run.finished":
       database.finishRun(payload);
       if (payload.status === "completed") notifyRun(payload.runId, "completed", "任务已完成", payload.finishedAt);
@@ -695,6 +700,7 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
           nodeId,
           connectedAt: now(),
           heartbeatIntervalMs: config.heartbeatIntervalMs,
+          tokenUsageBackfill: database.listTokenUsageBackfill(nodeId),
         });
         syncNodeWorkspaces(nodeId);
         initialized = true;
@@ -1006,6 +1012,7 @@ app.post<{
       error: null,
       pinnedAt: null,
       latestRunStatus: null,
+      tokenUsage: null,
       createdAt,
       updatedAt: createdAt,
     });
@@ -1076,6 +1083,7 @@ app.post<{
     error: null,
     pinnedAt: null,
     latestRunStatus: "queued",
+    tokenUsage: null,
     createdAt,
     updatedAt: createdAt,
   } as const;

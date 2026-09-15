@@ -29,6 +29,21 @@ describe("wire protocol", () => {
     );
   });
 
+  it("parses the one-time historical token usage backfill list", () => {
+    const message = parseControlMessage(JSON.stringify({
+      type: "control.welcome",
+      protocolVersion: CONTROL_PROTOCOL_VERSION,
+      nodeId: "node-1",
+      connectedAt: "2026-09-15T00:00:00.000Z",
+      heartbeatIntervalMs: 15_000,
+      tokenUsageBackfill: [{ conversationId: "conversation-1", threadId: "thread-1" }],
+    }));
+    expect(message.type).toBe("control.welcome");
+    if (message.type === "control.welcome") {
+      expect(message.tokenUsageBackfill).toEqual([{ conversationId: "conversation-1", threadId: "thread-1" }]);
+    }
+  });
+
   it("parses workspace validation messages", () => {
     expect(parseControlMessage(JSON.stringify({
       type: "control.workspaceValidate",

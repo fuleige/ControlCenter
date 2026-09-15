@@ -58,7 +58,15 @@ export interface Conversation {
   error: string | null;
   pinnedAt: string | null;
   latestRunStatus: Run["status"] | null;
+  tokenUsage: ConversationTokenUsage | null;
   createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationTokenUsage {
+  totalTokens: number;
+  contextTokens: number;
+  modelContextWindow: number | null;
   updatedAt: string;
 }
 

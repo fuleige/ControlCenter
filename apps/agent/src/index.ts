@@ -23,6 +23,7 @@ import {
 } from "@controller-center/protocol";
 import {
   AppServerClient,
+  parseThreadTokenUsage,
   threadStartSecurity,
   turnSandboxPolicy,
   type AppServerNotification,
@@ -33,7 +34,7 @@ import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.3.5";
+const AGENT_VERSION = "0.3.6";
 
 interface ActiveRun {
   conversationId: string;
@@ -87,6 +88,9 @@ const workspaceLocks = new Map<string, string>();
 const startingRunIds = new Set<string>();
 const pendingApprovals = new Map<string, PendingApproval>();
 const assistantMessages = new Map<string, BufferedAssistantMessage>();
+const tokenUsageSignatureByThread = new Map<string, string>();
+const tokenUsageBackfillQueue = new Map<string, string>();
+const tokenUsageBackfillLoads = new Map<string, Promise<void>>();
 const workspaceRegistry = new Map<string, WorkspaceDescriptor>(config.workspaces.map((workspace) => [workspace.id, workspace]));
 let socket: WebSocket | null = null;
 let heartbeatTimer: NodeJS.Timeout | null = null;
@@ -96,6 +100,7 @@ let attachmentCleanupTimer: NodeJS.Timeout | null = null;
 let reconnectAttempt = 0;
 let shuttingDown = false;
 let detectedCodexVersion: string | null = null;
+let tokenUsageBackfillRunning = false;
 const appServerSecurity = threadStartSecurity(config.yolo);
 let availableModels: ModelDescriptor[] = [];
 
@@ -339,6 +344,24 @@ function handleNotification(notification: AppServerNotification): void {
   const params = isRecord(notification.params) ? notification.params : null;
   const item = params && isRecord(params.item) ? params.item : null;
 
+  if (notification.method === "thread/tokenUsage/updated" && context.threadId && context.conversationId) {
+    const usage = parseThreadTokenUsage(notification.params);
+    if (usage) {
+      const signature = `${usage.totalTokens}:${usage.contextTokens}:${usage.modelContextWindow ?? "unknown"}`;
+      if (tokenUsageSignatureByThread.get(context.threadId) !== signature) {
+        tokenUsageSignatureByThread.set(context.threadId, signature);
+        emitDurable({
+          type: "conversation.tokenUsage",
+          conversationId: context.conversationId,
+          threadId: context.threadId,
+          ...(context.turnId ? { turnId: context.turnId } : {}),
+          ...usage,
+          updatedAt: timestamp(),
+        });
+      }
+    }
+  }
+
   if (context.run) {
     if (notification.method === "turn/plan/updated") reportProgress(context.run, "analyzing", "正在分析任务");
     if (notification.method === "item/started") {
@@ -514,6 +537,7 @@ appServer.on("stderr", (message: string) => process.stderr.write(`[codex] ${mess
 appServer.on("clientError", (error: Error) => console.error("[agent] app-server error", error.message));
 appServer.on("exit", (error: Error) => {
   loadedThreads.clear();
+  tokenUsageSignatureByThread.clear();
   for (const run of activeRunsByTurn.values()) {
     flushRunMessages(run.runId);
     emitDurable({
@@ -543,9 +567,57 @@ function workspaceFor(id: string) {
 }
 
 async function ensureThreadLoaded(threadId: string): Promise<void> {
+  const backfillLoad = tokenUsageBackfillLoads.get(threadId);
+  if (backfillLoad) await backfillLoad;
   if (loadedThreads.has(threadId)) return;
   await appServer.request("thread/resume", { threadId });
   loadedThreads.add(threadId);
+}
+
+async function backfillTokenUsage(): Promise<void> {
+  if (tokenUsageBackfillRunning) return;
+  tokenUsageBackfillRunning = true;
+  try {
+    while (tokenUsageBackfillQueue.size > 0 && !shuttingDown) {
+      const target = tokenUsageBackfillQueue.entries().next().value as [string, string] | undefined;
+      if (!target) break;
+      const [threadId, conversationId] = target;
+      tokenUsageBackfillQueue.delete(threadId);
+      conversationByThread.set(threadId, conversationId);
+      if (tokenUsageSignatureByThread.has(threadId)
+        || [...activeRunsByTurn.values()].some((run) => run.threadId === threadId)) continue;
+
+      const load = (async () => {
+        try {
+          await appServer.request("thread/resume", { threadId, excludeTurns: true });
+          await appServer.request("thread/unsubscribe", { threadId });
+          loadedThreads.delete(threadId);
+        } catch (error) {
+          console.warn(`[agent] unable to backfill token usage for ${conversationId}`, error instanceof Error ? error.message : error);
+        }
+      })();
+      tokenUsageBackfillLoads.set(threadId, load);
+      try {
+        await load;
+      } finally {
+        tokenUsageBackfillLoads.delete(threadId);
+      }
+    }
+  } finally {
+    tokenUsageBackfillRunning = false;
+    if (tokenUsageBackfillQueue.size > 0 && !shuttingDown) void backfillTokenUsage();
+  }
+}
+
+function scheduleTokenUsageBackfill(targets: Array<{ conversationId: string; threadId: string }> = []): void {
+  for (const target of targets) {
+    if (!target.conversationId || !target.threadId) continue;
+    conversationByThread.set(target.threadId, target.conversationId);
+    if (!tokenUsageSignatureByThread.has(target.threadId)) {
+      tokenUsageBackfillQueue.set(target.threadId, target.conversationId);
+    }
+  }
+  if (tokenUsageBackfillQueue.size > 0) void backfillTokenUsage();
 }
 
 async function startThread(workspacePath: string, model?: string): Promise<ThreadResult> {
@@ -746,6 +818,7 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
       await appServer.request("thread/delete", { threadId: command.threadId });
       conversationByThread.delete(command.threadId);
       loadedThreads.delete(command.threadId);
+      tokenUsageSignatureByThread.delete(command.threadId);
       break;
     case "run.start": {
       await startTurnForConversation({
@@ -892,6 +965,7 @@ function connect(): void {
           })),
           reportedAt: timestamp(),
         });
+        scheduleTokenUsageBackfill(message.tokenUsageBackfill);
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         heartbeatTimer = setInterval(() => {
           send({

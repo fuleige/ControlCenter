@@ -72,6 +72,7 @@ describe("ControlDatabase", () => {
       error: null,
       pinnedAt: null,
       latestRunStatus: null,
+      tokenUsage: null,
       createdAt: at,
       updatedAt: at,
     });
@@ -88,11 +89,46 @@ describe("ControlDatabase", () => {
       error: null,
       pinnedAt: null,
       latestRunStatus: null,
+      tokenUsage: null,
       createdAt: "2026-09-09T10:00:01.000Z",
       updatedAt: "2026-09-09T10:00:01.000Z",
     });
     expect(database.getConversationByClientRequestId("request-1")?.id).toBe("conversation-1");
     database.bindConversation("conversation-1", "thread-1", at);
+    expect(database.listTokenUsageBackfill("node-1")).toEqual(expect.arrayContaining([
+      { conversationId: "conversation-1", threadId: "thread-1" },
+      { conversationId: "conversation-2", threadId: "thread-2" },
+    ]));
+    expect(database.updateConversationTokenUsage("node-1", {
+      type: "conversation.tokenUsage",
+      conversationId: "conversation-1",
+      threadId: "another-thread",
+      turnId: "turn-1",
+      totalTokens: 200_000,
+      contextTokens: 80_000,
+      modelContextWindow: 400_000,
+      updatedAt: at,
+    })).toBe(false);
+    expect(database.updateConversationTokenUsage("node-1", {
+      type: "conversation.tokenUsage",
+      conversationId: "conversation-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      totalTokens: 200_000,
+      contextTokens: 80_000,
+      modelContextWindow: 400_000,
+      updatedAt: at,
+    })).toBe(true);
+    expect(database.getConversation("conversation-1")?.tokenUsage).toEqual({
+      totalTokens: 200_000,
+      contextTokens: 80_000,
+      modelContextWindow: 400_000,
+      updatedAt: at,
+    });
+    expect(database.listTokenUsageBackfill("node-1")).not.toContainEqual({
+      conversationId: "conversation-1",
+      threadId: "thread-1",
+    });
     database.createRun({
       id: "run-1",
       conversationId: "conversation-1",
@@ -318,6 +354,7 @@ describe("ControlDatabase", () => {
       error: null,
       pinnedAt: null,
       latestRunStatus: null,
+      tokenUsage: null,
       createdAt: firstAt,
       updatedAt: firstAt,
     });
@@ -334,6 +371,7 @@ describe("ControlDatabase", () => {
       error: null,
       pinnedAt: null,
       latestRunStatus: null,
+      tokenUsage: null,
       createdAt: firstAt,
       updatedAt: firstAt,
     });

@@ -63,6 +63,7 @@ import type {
   AttachmentRecord,
   Conversation,
   ConversationDetail,
+  ConversationTokenUsage,
   EnrollmentToken,
   GlobalSettings,
   Message,
@@ -169,6 +170,31 @@ function relativeTime(value: string): string {
   return formatDate(value);
 }
 
+function compactTokenCount(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "--";
+  if (value < 1_000) return Math.round(value).toLocaleString("zh-CN");
+  if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
+  return `${(value / 1_000_000).toFixed(value < 10_000_000 ? 1 : 0)}m`;
+}
+
+function ConversationUsageBar({ usage, draft }: { usage: ConversationTokenUsage | null; draft: boolean }) {
+  if (draft) return null;
+  const contextWindow = usage?.modelContextWindow ?? null;
+  const contextPercent = usage && contextWindow
+    ? Math.max(0, Math.round(usage.contextTokens / contextWindow * 100))
+    : null;
+  const exact = (value: number | null | undefined) => value === null || value === undefined ? "尚未获取" : `${value.toLocaleString("zh-CN")} Token`;
+  return (
+    <section className={`conversation-usage ${usage ? "" : "pending"}`} aria-label="当前会话 Token 使用情况">
+      <span title={exact(usage?.totalTokens)}><small>总计</small><strong>{compactTokenCount(usage?.totalTokens)}</strong></span>
+      <span title={exact(contextWindow)}><small>窗口</small><strong>{compactTokenCount(contextWindow)}</strong></span>
+      <span title={usage && contextWindow ? `${usage.contextTokens.toLocaleString("zh-CN")} / ${contextWindow.toLocaleString("zh-CN")} Token` : "尚未获取"}>
+        <small>占用</small><strong>{contextPercent === null ? "--" : `${contextPercent}%`}</strong>
+      </span>
+    </section>
+  );
+}
+
 const statusText: Record<string, string> = {
   draft: "草稿",
   creating: "正在创建",
@@ -255,6 +281,10 @@ function HistoryIcon() {
 
 function SettingsIcon() {
   return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m16.4 11.2 1.1.9-1.5 2.6-1.4-.5c-.5.4-1 .7-1.6.9l-.3 1.4h-3l-.3-1.4c-.6-.2-1.1-.5-1.6-.9l-1.4.5-1.5-2.6 1.1-.9a6.5 6.5 0 0 1 0-1.9l-1.1-.9 1.5-2.6 1.4.5c.5-.4 1-.7 1.6-.9l.3-1.4h3l.3 1.4c.6.2 1.1.5 1.6.9l1.4-.5 1.5 2.6-1.1.9a6.5 6.5 0 0 1 0 1.9ZM11.2 8a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4Z" /></svg>;
+}
+
+function NodesIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 2.8h12a1.7 1.7 0 0 1 1.7 1.7v3A1.7 1.7 0 0 1 16 9.2H4a1.7 1.7 0 0 1-1.7-1.7v-3A1.7 1.7 0 0 1 4 2.8Zm0 1.5a.2.2 0 0 0-.2.2v3c0 .1.1.2.2.2h12a.2.2 0 0 0 .2-.2v-3a.2.2 0 0 0-.2-.2H4Zm0 6.5h12a1.7 1.7 0 0 1 1.7 1.7v3a1.7 1.7 0 0 1-1.7 1.7H4a1.7 1.7 0 0 1-1.7-1.7v-3A1.7 1.7 0 0 1 4 10.8Zm0 1.5a.2.2 0 0 0-.2.2v3c0 .1.1.2.2.2h12a.2.2 0 0 0 .2-.2v-3a.2.2 0 0 0-.2-.2H4Zm1.2-6.8h1.6V7H5.2V5.5Zm0 8h1.6V15H5.2v-1.5Z" /></svg>;
 }
 
 function PinIcon() {
@@ -1845,17 +1875,8 @@ function ChatPanel({
   const activeEffortText = activeRun?.effort ? effortLabels[activeRun.effort] : "默认思考强度";
 
   return (
-    <main className={`chat-pane ${isDraft ? "draft-state" : ""}`}>
-      <header className="chat-header">
-        <button className="icon-button mobile-back" onClick={onBack} aria-label="打开历史会话"><HistoryIcon /></button>
-        <div className="chat-title">
-          <strong>{detail?.conversation.title ?? "新会话"}</strong>
-          <span>{node.name} / {workspace?.name ?? workspaceId}</span>
-        </div>
-        <div className="chat-header-status">
-          {isDraft ? <span className="status status-draft">草稿</span> : !activeRun && <StatusBadge status={conversation?.status ?? "creating"} />}
-        </div>
-      </header>
+    <main className={`chat-pane ${isDraft ? "draft-state" : ""}`} aria-label={isDraft ? "新会话" : `对话：${conversation?.title ?? "正在加载"}`}>
+      <h1 className="chat-title visually-hidden"><strong>{detail?.conversation.title ?? "新会话"}</strong></h1>
       <div className="timeline-shell">
         <div
           className="timeline"
@@ -1937,6 +1958,7 @@ function ChatPanel({
       </div>
       <form className="composer" onSubmit={submit} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
         {error && <div className="composer-error">{error}</div>}
+        <ConversationUsageBar usage={conversation?.tokenUsage ?? null} draft={isDraft} />
         {uploads.length > 0 && <div className="upload-list">{uploads.map((upload) => <div className={`upload-item upload-${upload.status}`} key={upload.localId}>
           {upload.previewUrl ? <img src={upload.previewUrl} alt="" /> : <span className="upload-file-icon">DOC</span>}
           <span className="upload-copy"><strong>{upload.file.name || "粘贴的图片"}</strong><small>{upload.status === "ready" ? `${(upload.file.size / 1024).toFixed(0)} KB · 已就绪` : upload.status === "failed" ? upload.error : `上传中 ${Math.round(upload.progress / upload.file.size * 100)}%`}</small></span>
@@ -1963,6 +1985,7 @@ function ChatPanel({
         />
         <div className="composer-footer">
           <div className="composer-toolbar" aria-label="会话选项">
+            <button className="mobile-history-button" type="button" onClick={onBack} aria-label="打开历史会话"><HistoryIcon /><span>历史</span></button>
             <input ref={fileInputElement} className="file-input" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
             <button className="attach-button" type="button" onClick={() => fileInputElement.current?.click()} disabled={busy || uploads.length >= 10} title="上传文件或图片">＋ 附件</button>
             {isDraft && (
@@ -2510,6 +2533,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         } else if (data.type.startsWith("conversation.")) {
           schedule("conversations", () => void refreshConversations(), 400);
           if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 400);
+        } else if (data.type.startsWith("usage.")) {
+          if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 400);
         } else if (data.type.startsWith("message.")) {
           if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 500);
           schedule("conversations", () => void refreshConversations(), 1_500);
@@ -2640,13 +2665,11 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     void markConversationRead(entry.conversationId).then(refreshTasks).catch(() => undefined);
   }
 
+  const onlineNodeCount = nodes.filter((node) => node.status === "online").length;
+
   return (
     <div className="app-root">
       {backgroundIssue && <div className="connection-banner" role="status"><span>{backgroundIssue.message}</span><button type="button" onClick={refreshAll}>立即重试</button></div>}
-      <div className="mobile-topbar">
-        <strong>Controller Center</strong>
-        <div><button aria-label="快速切换" onClick={openQuickSwitcher}><SearchIcon /></button><button aria-label="任务中心" onClick={() => { setOverlay(null); setPrimaryView("tasks"); }}><BellIcon />{unreadTaskCount > 0 && <b>{unreadTaskCount}</b>}</button><button aria-label="设置" onClick={() => setOverlay("settings")}><SettingsIcon /></button></div>
-      </div>
       <div className={`layout mobile-${mobilePane} ${primaryView === "tasks" ? "task-center-active" : ""} ${nodesCollapsed ? "nodes-collapsed" : ""} ${historyCollapsed ? "history-collapsed" : ""}`}>
         <NodePanel
           nodes={nodes}
@@ -2718,6 +2741,33 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           settings={settings}
         />}
       </div>
+      <nav className="mobile-toolbar" aria-label="移动端主导航">
+        <button
+          className={primaryView === "workspace" && mobilePane === "nodes" && overlay === null ? "active" : ""}
+          type="button"
+          aria-label={`查看节点，${onlineNodeCount} 个在线，共 ${nodes.length} 个节点`}
+          aria-current={primaryView === "workspace" && mobilePane === "nodes" && overlay === null ? "page" : undefined}
+          onClick={() => { setOverlay(null); setPrimaryView("workspace"); setMobilePane("nodes"); }}
+        >
+          <NodesIcon />
+          <span className="mobile-nav-label">节点<small title={`${onlineNodeCount} 个在线，共 ${nodes.length} 个节点`}>{onlineNodeCount}/{nodes.length}</small></span>
+        </button>
+        <button
+          className={primaryView === "tasks" ? "active" : ""}
+          type="button"
+          aria-label="消息中心"
+          aria-current={primaryView === "tasks" ? "page" : undefined}
+          onClick={() => { setOverlay(null); setPrimaryView("tasks"); }}
+        >
+          <BellIcon /><span>消息</span>{unreadTaskCount > 0 && <b>{unreadTaskCount > 99 ? "99+" : unreadTaskCount}</b>}
+        </button>
+        <button className={overlay === "switcher" ? "active" : ""} type="button" aria-label="快速切换" onClick={openQuickSwitcher}>
+          <SearchIcon /><span>搜索</span>
+        </button>
+        <button className={overlay === "settings" ? "active" : ""} type="button" aria-label="设置" onClick={() => setOverlay("settings")}>
+          <SettingsIcon /><span>设置</span>
+        </button>
+      </nav>
       {overlay === "settings" && <SettingsPanel settings={settings} nodes={nodes} selectedNodeId={selectedNodeId} onClose={() => setOverlay(null)} onSaved={setSettings} onNodesChanged={refreshNodes} onLogout={onLogout} />}
       {overlay === "switcher" && <QuickSwitcher
         nodes={nodes}

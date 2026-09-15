@@ -51,6 +51,12 @@ const conversation = {
   error: null,
   pinnedAt: null,
   latestRunStatus: "running",
+  tokenUsage: {
+    totalTokens: 456_789,
+    contextTokens: 123_456,
+    modelContextWindow: 400_000,
+    updatedAt: now,
+  },
   createdAt: now,
   updatedAt: now,
 };
@@ -222,6 +228,10 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
 
   const timeline = page.locator(".timeline");
   await expect(page.locator(".node-permission-badge")).toHaveText("全权限");
+  await expect(page.locator(".composer .conversation-usage")).toContainText("总计457k");
+  await expect(page.locator(".composer .conversation-usage")).toContainText("窗口400k");
+  await expect(page.locator(".composer .conversation-usage")).toContainText("占用31%");
+  await expect(page.locator(".chat-header")).toHaveCount(0);
   await expect(page.locator(".markdown-content").last()).toBeVisible();
   await expect.poll(() => page.locator(".virtual-timeline-row").count()).toBeLessThan(30);
   await expect(page.locator(".katex")).toHaveCount(4);
@@ -285,6 +295,19 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   const composerBottom = await page.locator(".composer").evaluate((element) => element.getBoundingClientRect().bottom);
   expect(composerBottom).toBeLessThanOrEqual(await page.evaluate(() => window.innerHeight));
   if (testInfo.project.name !== "desktop") {
+    const mobileToolbar = page.locator(".mobile-toolbar");
+    await expect(mobileToolbar).toBeVisible();
+    const toolbarPosition = await mobileToolbar.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      return { top: bounds.top, bottom: bounds.bottom, viewportHeight: window.innerHeight };
+    });
+    expect(toolbarPosition.top).toBeGreaterThan(toolbarPosition.viewportHeight / 2);
+    expect(toolbarPosition.bottom).toBeLessThanOrEqual(toolbarPosition.viewportHeight);
+    await mobileToolbar.getByRole("button", { name: "查看节点" }).click();
+    await expect(page.locator(".nodes-pane")).toBeVisible();
+    await page.locator(".node-card").filter({ hasText: node.name }).click();
+    await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
+    await expect(page.getByRole("button", { name: "打开历史会话" })).toBeVisible();
     const actionBounds = await page.locator(".send-button, .run-float .stop-button").evaluateAll((elements) => elements.map((element) => {
       const bounds = element.getBoundingClientRect();
       return { left: bounds.left, right: bounds.right, viewport: window.innerWidth };
@@ -310,7 +333,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
 
   await page.screenshot({ path: `/tmp/controller-center-${testInfo.project.name}.png`, fullPage: true });
 
-  const globalNavigation = testInfo.project.name === "desktop" ? page.locator(".node-footer") : page.locator(".mobile-topbar");
+  const globalNavigation = testInfo.project.name === "desktop" ? page.locator(".node-footer") : page.locator(".mobile-toolbar");
   await globalNavigation.getByRole("button", { name: /快速切换/ }).click();
   const switcher = page.getByRole("dialog", { name: "快速切换" });
   await expect(switcher).toBeVisible();
@@ -326,7 +349,16 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.3.5");
+  if (testInfo.project.name !== "desktop") {
+    const mobileToolbar = page.locator(".mobile-toolbar");
+    await expect(mobileToolbar).toBeVisible();
+    await expect(mobileToolbar.locator("button").nth(0)).toContainText("节点1/1");
+    await expect(mobileToolbar.locator("button").nth(1)).toContainText("消息");
+    await expect(mobileToolbar.locator("button").nth(2)).toContainText("搜索");
+    await expect(mobileToolbar.locator("button").nth(3)).toContainText("设置");
+    await expect(mobileToolbar.locator(".node-count")).toHaveCount(0);
+  }
+  await expect(page.locator(".settings-version")).toContainText("v0.3.6");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -340,7 +372,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
     await page.locator(".node-card").filter({ hasText: node.name }).click();
     await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   }
-  await globalNavigation.getByRole("button", { name: /任务中心|全局任务中心/ }).click();
+  await globalNavigation.getByRole("button", { name: /消息中心|任务中心|全局任务中心/ }).click();
   await expect(page.getByRole("main", { name: "全局任务中心" })).toBeVisible();
   await expect(page.getByText("这是最新回复的摘要，点击后可以直接返回对应会话。")).toBeVisible();
   await expect(page.getByText("最多展示最近 200 条", { exact: false })).toBeVisible();
@@ -368,7 +400,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   } else {
     await page.getByRole("button", { name: "返回工作台" }).click();
   }
-  await globalNavigation.getByRole("button", { name: /任务中心|全局任务中心/ }).click();
+  await globalNavigation.getByRole("button", { name: /消息中心|任务中心|全局任务中心/ }).click();
   await page.locator(".task-center-item").filter({ hasText: conversation.title }).click();
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await expect.poll(() => presenceReports.some((report) => report.conversationId === conversation.id && report.visible === true)).toBe(true);
@@ -578,7 +610,7 @@ test("在不同节点之间切换时恢复各自最后打开的会话", async ({
   async function switchNode(name: string): Promise<void> {
     const trigger = testInfo.project.name === "desktop"
       ? page.locator(".node-footer").getByRole("button", { name: /快速切换/ })
-      : page.locator(".mobile-topbar").getByRole("button", { name: "快速切换" });
+      : page.locator(".mobile-toolbar").getByRole("button", { name: "快速切换" });
     await trigger.click();
     const switcher = page.getByRole("dialog", { name: "快速切换" });
     await switcher.getByRole("textbox", { name: "搜索节点或历史会话" }).fill(name);
@@ -842,14 +874,14 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
     } else if (url.pathname === "/api/agent-package/download") {
       await route.fulfill({
         contentType: "application/gzip",
-        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.5.tar.gz\"" },
+        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.6.tar.gz\"" },
         body: "portable-agent-package",
       });
     } else if (url.pathname === "/api/agent-package") {
       await route.fulfill({ json: { package: {
         available: true,
-        version: "0.3.5",
-        fileName: "controller-center-agent-v0.3.5.tar.gz",
+        version: "0.3.6",
+        fileName: "controller-center-agent-v0.3.6.tar.gz",
         size: 580_000,
         sha256: "cb9bd8bd4ff984ee13b78a4f9b1ff9a72b950ed2a468d69e20fc0abe1bda2aa6",
         builtAt: now,
@@ -867,10 +899,10 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
-  await expect(page.getByText("v0.3.5 · 566 KB · Linux / macOS")).toBeVisible();
+  await expect(page.getByText("v0.3.6 · 566 KB · Linux / macOS")).toBeVisible();
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载客户端" }).click();
-  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.5.tar.gz");
+  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.6.tar.gz");
   await page.getByRole("button", { name: "生成注册 Token" }).click();
   await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
   await expect(page.getByText(registrationToken)).toBeVisible();

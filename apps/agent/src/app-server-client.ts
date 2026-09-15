@@ -3,6 +3,36 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 import { isRecord } from "@controller-center/protocol";
 
+export interface ThreadTokenUsageSummary {
+  totalTokens: number;
+  contextTokens: number;
+  modelContextWindow: number | null;
+}
+
+function nonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** Parse the stable subset of Codex's thread/tokenUsage/updated payload used by the UI. */
+export function parseThreadTokenUsage(params: unknown): ThreadTokenUsageSummary | null {
+  if (!isRecord(params) || !isRecord(params.tokenUsage)) return null;
+  const total = params.tokenUsage.total;
+  const last = params.tokenUsage.last;
+  if (!isRecord(total) || !isRecord(last)) return null;
+  const totalTokens = nonNegativeInteger(total.totalTokens);
+  const contextTokens = nonNegativeInteger(last.totalTokens);
+  const rawContextWindow = params.tokenUsage.modelContextWindow;
+  const modelContextWindow = rawContextWindow === null
+    ? null
+    : nonNegativeInteger(rawContextWindow);
+  if (totalTokens === null || contextTokens === null || modelContextWindow === null && rawContextWindow !== null) return null;
+  return {
+    totalTokens,
+    contextTokens,
+    modelContextWindow: modelContextWindow && modelContextWindow > 0 ? modelContextWindow : null,
+  };
+}
+
 export type RpcRequestId = string | number;
 
 interface RpcPending {
@@ -108,7 +138,7 @@ export class AppServerClient extends EventEmitter {
       clientInfo: {
         name: "controller_center_agent",
         title: "Controller Center Agent",
-        version: "0.3.5",
+        version: "0.3.6",
       },
     });
     this.notify("initialized", {});

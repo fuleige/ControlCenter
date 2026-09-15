@@ -1,17 +1,21 @@
 import { defineConfig } from "@playwright/test";
 
+const requestedPort = process.env.PLAYWRIGHT_PORT ?? "5173";
+const port = /^\d+$/.test(requestedPort) ? requestedPort : "5173";
+const baseURL = `http://127.0.0.1:${port}`;
+
 export default defineConfig({
   testDir: "./e2e",
   testMatch: "**/*.e2e.ts",
   fullyParallel: true,
   reporter: "line",
   use: {
-    baseURL: "http://127.0.0.1:5173",
+    baseURL,
     locale: "zh-CN",
   },
   webServer: {
-    command: "npm run dev",
-    url: "http://127.0.0.1:5173",
+    command: `npm run dev -- --host 127.0.0.1 --port ${port} --strictPort`,
+    url: baseURL,
     reuseExistingServer: true,
   },
   projects: [
