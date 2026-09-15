@@ -307,7 +307,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.3.2");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.3");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -660,7 +660,7 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   const registrationToken = "cce_00000000-0000-4000-8000-000000000001.test-registration-secret-value";
   let created = false;
   let registrationStatus: "pending" | "used" = "pending";
-  const expiresAt = new Date(Date.now() + 6_000).toISOString();
+  const expiresAt = new Date(Date.now() + 15_000).toISOString();
   const enrollment = () => ({
     id: "00000000-0000-4000-8000-000000000001",
     token: registrationToken,
@@ -705,11 +705,11 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
   await expect(page.getByText(registrationToken)).toBeVisible();
   await expect(page.getByText("未注册", { exact: true })).toBeVisible();
-  await expect(page.getByText(/剩余 0:0[1-6]/)).toBeVisible();
+  await expect(page.getByText(/剩余 0:(0[1-9]|1[0-5])/)).toBeVisible();
   await expect(page.getByRole("button", { name: "复制" })).toBeVisible();
 
   registrationStatus = "used";
-  await expect(page.getByText("已注册", { exact: true })).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText("已注册", { exact: true })).toBeVisible({ timeout: 12_000 });
   await expect(page.getByText(registrationToken)).toHaveCount(0, { timeout: 8_000 });
   await expect(page.getByText("当前没有有效的注册 Token")).toBeVisible();
 });

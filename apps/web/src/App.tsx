@@ -62,6 +62,7 @@ import type {
   ConversationDetail,
   EnrollmentToken,
   GlobalSettings,
+  Message,
   NodeRecord,
   ReasoningEffort,
   Run,
@@ -87,6 +88,10 @@ const nodesCollapsedStorageKey = "controller-center:nodes-collapsed";
 const historyCollapsedStorageKey = "controller-center:history-collapsed";
 const streamRevisionStorageKey = "controller-center:stream-revision";
 const browserSessionStorageKey = "controller-center:browser-session";
+const enrollmentRefreshIntervalMs = 10_000;
+const connectedSafetySyncIntervalMs = 60_000;
+const disconnectedFallbackSyncIntervalMs = 10_000;
+const presenceHeartbeatIntervalMs = 25_000;
 
 function storedValue(key: string): string | null {
   try { return window.localStorage.getItem(key); } catch { return null; }
@@ -171,6 +176,36 @@ export function buildTimeline(detail: ConversationDetail | null): TimelineEntry[
     }))
     .filter((entry) => entry.content.trim())
     .sort((left, right) => left.at.localeCompare(right.at));
+}
+
+function compareMessages(left: Message, right: Message): number {
+  const timeOrder = left.createdAt.localeCompare(right.createdAt);
+  if (timeOrder !== 0) return timeOrder;
+  const roleOrder = (left.role === "user" ? 0 : 1) - (right.role === "user" ? 0 : 1);
+  return roleOrder || left.id.localeCompare(right.id);
+}
+
+function mergedConversationDetail(
+  current: ConversationDetail | null,
+  incoming: ConversationDetail,
+  pageMode: "preserve" | "older" = "preserve",
+): ConversationDetail {
+  if (!current || current.conversation.id !== incoming.conversation.id) return incoming;
+  const messages = new Map(current.messages.map((message) => [message.id, message]));
+  for (const message of incoming.messages) {
+    const existing = messages.get(message.id);
+    if (!existing || message.revision >= existing.revision) messages.set(message.id, message);
+  }
+  const mergedMessages = [...messages.values()].sort(compareMessages);
+  const referencedAttachments = new Set(mergedMessages.flatMap((message) => message.attachmentIds));
+  const attachments = new Map(current.attachments.map((attachment) => [attachment.id, attachment]));
+  for (const attachment of incoming.attachments) attachments.set(attachment.id, attachment);
+  return {
+    ...incoming,
+    messages: mergedMessages,
+    attachments: [...attachments.values()].filter((attachment) => referencedAttachments.has(attachment.id)),
+    messagePage: pageMode === "older" ? incoming.messagePage : current.messagePage,
+  };
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -1002,7 +1037,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   useEffect(() => {
     const update = () => void refresh().catch(() => undefined);
     update();
-    const timer = window.setInterval(update, 2_000);
+    const timer = window.setInterval(update, enrollmentRefreshIntervalMs);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -1387,6 +1422,7 @@ function ChatPanel({
   node,
   pendingApprovals,
   onRefresh,
+  onLoadEarlier,
   onBack,
   draftRequestId,
   isDraft,
@@ -1397,6 +1433,7 @@ function ChatPanel({
   node: NodeRecord | null;
   pendingApprovals: Approval[];
   onRefresh: () => void;
+  onLoadEarlier: () => Promise<void>;
   onBack: () => void;
   draftRequestId: string;
   isDraft: boolean;
@@ -1412,6 +1449,8 @@ function ChatPanel({
   const [messageRequestId, setMessageRequestId] = useState(newDraftRequestId);
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [loadEarlierError, setLoadEarlierError] = useState<string | null>(null);
   const timelineElement = useRef<HTMLDivElement>(null);
   const promptElement = useRef<HTMLTextAreaElement>(null);
   const fileInputElement = useRef<HTMLInputElement>(null);
@@ -1547,6 +1586,27 @@ function ChatPanel({
     followStreamingOutput.current = true;
     setShowScrollToBottom(false);
     element.scrollTo({ top: element.scrollHeight, behavior: "auto" });
+  }
+
+  async function loadEarlierMessages(): Promise<void> {
+    const element = timelineElement.current;
+    const previousHeight = element?.scrollHeight ?? 0;
+    const previousTop = element?.scrollTop ?? 0;
+    setLoadingEarlier(true);
+    setLoadEarlierError(null);
+    try {
+      await onLoadEarlier();
+      programmaticTimelineScroll.current = true;
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        const current = timelineElement.current;
+        if (current) current.scrollTop = previousTop + Math.max(0, current.scrollHeight - previousHeight);
+        programmaticTimelineScroll.current = false;
+      }));
+    } catch (reason) {
+      setLoadEarlierError(formatErrorMessage(reason, "加载更早消息"));
+    } finally {
+      setLoadingEarlier(false);
+    }
   }
 
   function updateUpload(localId: string, patch: Partial<PendingUpload>): void {
@@ -1737,6 +1797,14 @@ function ChatPanel({
             setShowScrollToBottom(awayFromBottom);
           }}
         >
+          {!isDraft && detail?.messagePage.hasMore && (
+            <div className="message-page-control">
+              <button type="button" disabled={loadingEarlier} onClick={() => void loadEarlierMessages()}>
+                {loadingEarlier ? "正在加载…" : "加载更早消息"}
+              </button>
+              {loadEarlierError && <span>{loadEarlierError}</span>}
+            </div>
+          )}
           {isDraft ? (
             <div className="draft-welcome">
               <EmptyConversationGraphic />
@@ -1903,6 +1971,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const [nodesCollapsed, setNodesCollapsed] = useState(() => storedBoolean(nodesCollapsedStorageKey));
   const [historyCollapsed, setHistoryCollapsed] = useState(() => storedBoolean(historyCollapsedStorageKey));
   const [mobilePane, setMobilePane] = useState<MobilePane>(() => storedValue(selectedConversationStorageKey) ? "chat" : "nodes");
+  const [streamConnected, setStreamConnected] = useState(false);
   const [backgroundIssues, setBackgroundIssues] = useState<Partial<Record<BackgroundIssueSource, BackgroundIssue>>>({});
   const selectedNodeIdRef = useRef(selectedNodeId);
   const selectedConversationIdRef = useRef(selectedConversationId);
@@ -1920,6 +1989,14 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const conversationDetailAppliedRef = useRef(0);
   const taskCenterRequestRef = useRef(0);
   const taskCenterAppliedRef = useRef(0);
+  const detailRef = useRef<ConversationDetail | null>(null);
+  const presenceContextRef = useRef({
+    selectedConversationId,
+    primaryView,
+    overlay,
+    mobilePane,
+  });
+  const presenceReporterRef = useRef<(force?: boolean) => void>(() => undefined);
   const [browserSessionId] = useState(() => {
     try {
       const existing = window.sessionStorage.getItem(browserSessionStorageKey);
@@ -1948,6 +2025,12 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     conversationDetailAppliedRef.current = conversationDetailRequestRef.current;
     setSelectedConversationId(conversationId);
   }, []);
+
+  useEffect(() => {
+    detailRef.current = detail;
+  }, [detail]);
+
+  presenceContextRef.current = { selectedConversationId, primaryView, overlay, mobilePane };
 
   const commitDraftRequestId = useCallback((requestId: string) => {
     draftRequestIdRef.current = requestId;
@@ -2067,7 +2150,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       const result = await getConversation(requestedConversationId);
       if (selectedConversationIdRef.current === requestedConversationId && requestRevision > conversationDetailAppliedRef.current) {
         conversationDetailAppliedRef.current = requestRevision;
-        setDetail(result);
+        setDetail((current) => mergedConversationDetail(current, result));
         clearBackgroundIssue("detail");
       }
     } catch (error) {
@@ -2087,6 +2170,18 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       }
     }
   }, [clearBackgroundIssue, commitDraftRequestId, commitSelectedConversation, reportBackgroundIssue]);
+
+  const loadEarlierMessages = useCallback(async () => {
+    const requestedConversationId = selectedConversationIdRef.current;
+    const beforeMessage = detailRef.current?.conversation.id === requestedConversationId
+      ? detailRef.current.messagePage.before
+      : null;
+    if (!requestedConversationId || !beforeMessage) return;
+    const result = await getConversation(requestedConversationId, { beforeMessage });
+    if (selectedConversationIdRef.current !== requestedConversationId) return;
+    setDetail((current) => mergedConversationDetail(current, result, "older"));
+    clearBackgroundIssue("detail");
+  }, [clearBackgroundIssue]);
 
   const refreshApprovals = useCallback(async () => {
     const requestRevision = ++approvalsRequestRef.current;
@@ -2171,9 +2266,22 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     void refreshApprovals();
     void refreshSettings();
     void refreshTasks();
-    const interval = window.setInterval(refreshAll, 10_000);
-    return () => window.clearInterval(interval);
-  }, [refreshAll, refreshNodes, refreshApprovals, refreshSettings, refreshTasks]);
+  }, [refreshApprovals, refreshNodes, refreshSettings, refreshTasks]);
+
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") refreshAll();
+    };
+    const interval = window.setInterval(
+      refreshWhenVisible,
+      streamConnected ? connectedSafetySyncIntervalMs : disconnectedFallbackSyncIntervalMs,
+    );
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [refreshAll, streamConnected]);
 
   useEffect(() => {
     if (nodes.length === 0) return;
@@ -2233,54 +2341,117 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   }, [selectedConversationId, refreshDetail]);
 
   useEffect(() => {
-    const report = () => {
-      const chatIsVisible = primaryView === "workspace"
-        && overlay === null
-        && (window.innerWidth > 840 || mobilePane === "chat");
-      void updatePresence(
-        browserSessionId,
-        chatIsVisible ? selectedConversationId : null,
-        document.visibilityState === "visible",
-      ).catch(() => undefined);
+    let lastPresence = "";
+    let resizeTimer: number | null = null;
+    const report = (force = false) => {
+      const context = presenceContextRef.current;
+      const pageIsVisible = document.visibilityState === "visible";
+      const chatIsVisible = context.primaryView === "workspace"
+        && context.overlay === null
+        && (window.innerWidth > 840 || context.mobilePane === "chat");
+      const conversationId = pageIsVisible && chatIsVisible ? context.selectedConversationId : null;
+      const signature = `${conversationId ?? ""}:${pageIsVisible}`;
+      if (!force && signature === lastPresence) return;
+      lastPresence = signature;
+      void updatePresence(browserSessionId, conversationId, pageIsVisible).catch(() => undefined);
     };
-    report();
-    const interval = window.setInterval(report, 15_000);
-    document.addEventListener("visibilitychange", report);
-    window.addEventListener("resize", report);
+    const onVisibilityChange = () => report(true);
+    const onResize = () => {
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null;
+        report(false);
+      }, 300);
+    };
+    presenceReporterRef.current = report;
+    report(true);
+    const interval = window.setInterval(() => report(true), presenceHeartbeatIntervalMs);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("resize", onResize);
     return () => {
+      presenceReporterRef.current = () => undefined;
       window.clearInterval(interval);
-      document.removeEventListener("visibilitychange", report);
-      window.removeEventListener("resize", report);
-      void updatePresence(browserSessionId, selectedConversationId, false).catch(() => undefined);
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("resize", onResize);
+      void updatePresence(browserSessionId, presenceContextRef.current.selectedConversationId, false).catch(() => undefined);
     };
-  }, [browserSessionId, mobilePane, overlay, primaryView, selectedConversationId]);
+  }, [browserSessionId]);
+
+  useEffect(() => {
+    presenceReporterRef.current(false);
+  }, [mobilePane, overlay, primaryView, selectedConversationId]);
 
   useEffect(() => {
     const storedRevision = Number(storedValue(streamRevisionStorageKey) ?? 0);
     const source = new EventSource(streamUrl(Number.isSafeInteger(storedRevision) ? storedRevision : 0), { withCredentials: true });
-    let refreshTimer: number | null = null;
-    const scheduleRefresh = () => {
-      if (refreshTimer !== null) return;
-      refreshTimer = window.setTimeout(() => {
-        refreshTimer = null;
-        refreshAll();
-      }, 100);
+    const refreshTimers = new Map<string, number>();
+    let hasBeenReady = false;
+    const schedule = (key: string, callback: () => void, delay: number) => {
+      if (refreshTimers.has(key)) return;
+      const timer = window.setTimeout(() => {
+        refreshTimers.delete(key);
+        callback();
+      }, delay);
+      refreshTimers.set(key, timer);
     };
+    source.addEventListener("ready", () => {
+      setStreamConnected(true);
+      if (hasBeenReady) schedule("all", refreshAll, 100);
+      hasBeenReady = true;
+    });
+    source.onerror = () => setStreamConnected(false);
     source.addEventListener("update", (event) => {
       const message = event as MessageEvent<string>;
       try {
-        const data = JSON.parse(message.data) as { revision?: number };
+        const data = JSON.parse(message.data) as {
+          revision?: number;
+          type?: string;
+          resourceId?: string | null;
+          conversationId?: string | null;
+        };
         if (typeof data.revision === "number") storeValue(streamRevisionStorageKey, String(data.revision));
+        if (typeof data.type !== "string") {
+          schedule("all", refreshAll, 1_000);
+          return;
+        }
+        const conversationId = data.conversationId
+          ?? (data.type.startsWith("conversation.") ? data.resourceId : null);
+        const selectedConversationAffected = !conversationId || conversationId === selectedConversationIdRef.current;
+        if (data.type.startsWith("node.")) {
+          schedule("nodes", () => void refreshNodes(), 250);
+        } else if (data.type.startsWith("workspace.")) {
+          schedule("nodes", () => void refreshNodes(), 400);
+        } else if (data.type.startsWith("conversation.")) {
+          schedule("conversations", () => void refreshConversations(), 400);
+          if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 400);
+        } else if (data.type.startsWith("message.")) {
+          if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 500);
+          schedule("conversations", () => void refreshConversations(), 1_500);
+        } else if (data.type.startsWith("run.") || data.type === "agent.error") {
+          if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 500);
+          schedule("conversations", () => void refreshConversations(), 1_000);
+        } else if (data.type.startsWith("approval.")) {
+          schedule("approvals", () => void refreshApprovals(), 300);
+          if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 500);
+        } else if (data.type.startsWith("notification.")) {
+          schedule("tasks", () => void refreshTasks(), 300);
+        } else if (data.type.startsWith("settings.")) {
+          schedule("settings", () => void refreshSettings(), 300);
+        } else if (data.type.startsWith("enrollment.")) {
+          schedule("nodes", () => void refreshNodes(), 500);
+        } else if (!data.type.startsWith("command.")) {
+          schedule("all", refreshAll, 1_000);
+        }
       } catch {
-        // A malformed lightweight event is harmless because the REST refresh is authoritative.
+        schedule("all", refreshAll, 1_000);
       }
-      scheduleRefresh();
     });
     return () => {
-      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      for (const timer of refreshTimers.values()) window.clearTimeout(timer);
       source.close();
     };
-  }, [refreshAll]);
+  }, [refreshAll, refreshApprovals, refreshConversations, refreshDetail, refreshNodes, refreshSettings, refreshTasks]);
 
   function beginNewConversation() {
     commitSelectedConversation(null);
@@ -2341,7 +2512,14 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     }
     if (selectedConversationIdRef.current !== null || draftRequestIdRef.current !== originatingDraftRequestId) return;
     commitSelectedConversation(conversation.id);
-    setDetail({ conversation, runs: [run], messages: [], attachments: [], approvals: [] });
+    setDetail({
+      conversation,
+      runs: [run],
+      messages: [],
+      messagePage: { hasMore: false, before: null },
+      attachments: [],
+      approvals: [],
+    });
     commitDraftRequestId(newDraftRequestId());
     setMobilePane("chat");
   }
@@ -2435,6 +2613,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           node={selectedNode}
           pendingApprovals={pendingApprovals}
           onRefresh={refreshAll}
+          onLoadEarlier={loadEarlierMessages}
           onBack={() => setMobilePane("conversations")}
           draftRequestId={draftRequestId}
           isDraft={selectedConversationId === null}

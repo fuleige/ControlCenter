@@ -114,6 +114,10 @@ export interface ConversationDetail {
   conversation: Conversation;
   runs: Run[];
   messages: Message[];
+  messagePage: {
+    hasMore: boolean;
+    before: string | null;
+  };
   attachments: AttachmentRecord[];
   approvals: Approval[];
 }

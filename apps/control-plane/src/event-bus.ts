@@ -4,6 +4,7 @@ export interface UiEvent {
   revision: number;
   type: string;
   resourceId: string | null;
+  conversationId: string | null;
   occurredAt: string;
 }
 

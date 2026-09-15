@@ -570,6 +570,11 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
   -webkit-overflow-scrolling: touch;
 }
 .timeline-shell { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.message-page-control { display: grid; justify-items: center; gap: 6px; margin: 0 0 16px; }
+.message-page-control button { min-height: 32px; padding: 0 13px; border: 1px solid #cbd7e7; border-radius: 99px; background: #fff; color: #526176; font-size: 10px; font-weight: 650; cursor: pointer; }
+.message-page-control button:hover:not(:disabled) { border-color: #9db5d6; color: var(--accent); }
+.message-page-control button:disabled { cursor: default; opacity: .58; }
+.message-page-control span { max-width: min(720px, 100%); color: var(--danger); font-size: 10px; text-align: center; }
 .virtual-timeline { position: relative; width: 100%; }
 .virtual-timeline-row { position: absolute; top: 0; left: 0; width: 100%; padding-bottom: 15px; }
 .virtual-timeline-row .timeline-card { margin-bottom: 0; }

@@ -135,6 +135,18 @@ describe("ControlDatabase", () => {
     expect(database.listConversationPage({ query: "searchable", limit: 10, includeTotal: false }).total).toBeUndefined();
     expect(database.listConversationPage({ nodeId: "node-1", runStatus: "active", limit: 10 }).data.map((conversation) => conversation.id)).toEqual(["conversation-1"]);
 
+    database.createCommand("command-1", "node-1", {
+      type: "run.interrupt",
+      conversationId: "conversation-1",
+      runId: "run-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    }, at);
+    expect(database.listPendingCommands("node-1").map((command) => command.id)).toEqual(["command-1"]);
+    database.updateCommand("command-1", "accepted", null, at);
+    expect(database.listPendingCommands("node-1")).toEqual([]);
+    expect(database.listPendingCommands("node-1", true).map((command) => command.id)).toEqual(["command-1"]);
+
     database.insertUserMessage({
       id: "message-user-1",
       conversationId: "conversation-1",
@@ -165,6 +177,10 @@ describe("ControlDatabase", () => {
       occurredAt: at,
     })).toBe(false);
     expect(database.listMessages("conversation-1").map((message) => message.content)).toEqual(["Run tests", "done"]);
+    const latestMessagePage = database.listMessagePage("conversation-1", 1);
+    expect(latestMessagePage.data.map((message) => message.content)).toEqual(["done"]);
+    expect(latestMessagePage.nextCursor).not.toBeNull();
+    expect(database.listMessagePage("conversation-1", 1, latestMessagePage.nextCursor!).data.map((message) => message.content)).toEqual(["Run tests"]);
 
     database.markNodeOffline("node-1", at);
     expect(database.getRun("run-1")?.status).toBe("recovering");
@@ -191,8 +207,8 @@ describe("ControlDatabase", () => {
     database.bindAttachments(["attachment-1"], "conversation-1");
     expect(database.listConversationAttachments("conversation-1")[0]?.status).toBe("consumed");
 
-    expect(database.createUiEvent("message.updated", "conversation-1", at).revision).toBe(1);
-    expect(database.listUiEventsAfter(0)[0]?.type).toBe("message.updated");
+    expect(database.createUiEvent("message.updated", "message-agent-1", at, "conversation-1").revision).toBe(1);
+    expect(database.listUiEventsAfter(0)[0]).toMatchObject({ type: "message.updated", conversationId: "conversation-1" });
 
     database.insertApproval("node-1", {
       type: "interaction.requested",

@@ -33,7 +33,7 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - 节点、工作区、Conversation/Thread 和 Run/Turn 管理；历史会话支持搜索、重命名、置顶、筛选和删除。
 - 多节点、多对话；不同工作区在节点并发额度内并行，同一工作区的多个任务接受后按顺序排队。
 - 新会话在首次发送时原子创建，使用持久化幂等号避免双击、刷新和重试产生重复会话。
-- Agent 通过 `model/list` 发布本机可用模型及思考强度，Web 可按会话选择。
+- Agent 通过 `model/list` 发布本机可用模型及思考强度，结果按 Codex 版本在本机缓存 24 小时，Web 可按会话选择。
 - 只持久化用户消息、Codex 回复和简洁进度；命令输出、Diff、推理增量和原始事件不会发送到中心。
 - 命令执行与文件修改的最小必要确认信息，以及 `request_user_input` 表单。
 - 任务追加指令、中止当前轮次和失败状态；中止后可在同一历史会话继续发起新轮次。
@@ -45,9 +45,9 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - 全局默认模型和思考强度设置，节点不支持偏好模型时回退本机默认；设置页展示构建版本号。
 - 文件上传、拖拽和粘贴图片；分片续传、SHA-256 校验和 Agent 本地缓存。
 - Agent 本地 SQLite inbox/outbox、命令去重、消息补发和重连状态协调。
-- 浏览器 SSE 使用持久游标重放，刷新或断线后重新拉取权威状态并继续流式显示。
+- 浏览器 SSE 使用持久游标重放并按资源精准刷新；正常连接时每 60 秒权威同步，断线时每 10 秒兜底轮询，页面恢复可见时立即同步。
 - 回复流式刷新时同步渲染 Markdown 和 KaTeX，兼容 `$...$`、`$$...$$`、`\(...\)` 与 `\[...\]`。
-- 长对话使用动态高度虚拟列表，仅渲染视口附近消息，并保持刷新恢复、流式跟随和回到底部行为一致。
+- 长对话默认读取最近 60 条消息，可按游标加载更早消息；同时使用动态高度虚拟列表，并保持刷新恢复、流式跟随和回到底部行为一致。
 - 控制中心 SQLite WAL 持久化与审计数据。
 - 手机端分层导航、底部输入区、安全区适配和全宽审批卡片。
 
@@ -209,7 +209,7 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 - `GET/POST /api/conversations`
 - `PATCH /api/conversations/:id`（重命名、置顶）
 - `POST /api/conversations/start`（首次发送时幂等创建会话和首轮任务）
-- `GET /api/conversations/:id`
+- `GET /api/conversations/:id?messageLimit=60&beforeMessage=<cursor>`（最近消息与向前分页）
 - `DELETE /api/conversations/:id`
 - `POST /api/conversations/:id/runs`
 - `POST /api/runs/:id/steer`

@@ -255,8 +255,17 @@ export async function listConversations(options: {
   };
 }
 
-export async function getConversation(id: string): Promise<ConversationDetail> {
-  return api<ConversationDetail>(`/api/conversations/${id}`);
+export async function getConversation(id: string, options: { beforeMessage?: string; messageLimit?: number } = {}): Promise<ConversationDetail> {
+  const parameters = new URLSearchParams();
+  if (options.beforeMessage) parameters.set("beforeMessage", options.beforeMessage);
+  if (options.messageLimit) parameters.set("messageLimit", String(options.messageLimit));
+  const suffix = parameters.size ? `?${parameters}` : "";
+  const result = await api<ConversationDetail>(`/api/conversations/${encodeURIComponent(id)}${suffix}`);
+  return {
+    ...result,
+    // Allows the Web and Control Plane to be restarted independently during a rolling deployment.
+    messagePage: result.messagePage ?? { hasMore: false, before: null },
+  };
 }
 
 export async function createConversation(input: {

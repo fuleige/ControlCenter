@@ -82,6 +82,17 @@ export interface ConversationPage {
   nextCursor: ConversationListCursor | null;
 }
 
+export interface MessageListCursor {
+  createdAt: string;
+  roleOrder: 0 | 1;
+  id: string;
+}
+
+export interface MessagePage {
+  data: MessageRecord[];
+  nextCursor: MessageListCursor | null;
+}
+
 export interface RunRecord {
   id: string;
   conversationId: string;
@@ -180,6 +191,7 @@ export interface UiEventRecord {
   revision: number;
   type: string;
   resourceId: string | null;
+  conversationId: string | null;
   occurredAt: string;
 }
 
@@ -444,6 +456,7 @@ export class ControlDatabase {
         revision INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL,
         resource_id TEXT,
+        conversation_id TEXT,
         occurred_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS admin_credentials (
@@ -504,11 +517,13 @@ export class ControlDatabase {
     this.ensureColumn("approvals", "summary", "TEXT NOT NULL DEFAULT '需要你的确认'");
     this.ensureColumn("approvals", "risk", "TEXT");
     this.ensureColumn("enrollment_tokens", "token_ciphertext", "TEXT");
+    this.ensureColumn("ui_events", "conversation_id", "TEXT");
     this.sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS conversations_client_request_idx ON conversations(client_request_id) WHERE client_request_id IS NOT NULL;");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS conversations_node_order_idx ON conversations(node_id, pinned_at DESC, updated_at DESC, id DESC);");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS conversations_order_idx ON conversations(pinned_at DESC, updated_at DESC, id DESC);");
     this.sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS runs_client_request_idx ON runs(client_request_id) WHERE client_request_id IS NOT NULL;");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS workspaces_node_status_idx ON workspaces(node_id, archived_at, is_default DESC, name);");
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS ui_events_occurred_idx ON ui_events(occurred_at);");
     this.sqlite.prepare("UPDATE workspaces SET created_at = CASE WHEN created_at = '' THEN ? ELSE created_at END, updated_at = CASE WHEN updated_at = '' THEN ? ELSE updated_at END").run(new Date().toISOString(), new Date().toISOString());
     this.migrateLegacyMessages();
   }
@@ -1159,6 +1174,15 @@ export class ControlDatabase {
       .map((row) => this.runFromRow(row));
   }
 
+  listRecentRuns(conversationId: string, limit = 100): RunRecord[] {
+    const normalizedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    return (this.sqlite.prepare(`
+      SELECT * FROM runs WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?
+    `).all(conversationId, normalizedLimit) as Row[])
+      .reverse()
+      .map((row) => this.runFromRow(row));
+  }
+
   canDispatchQueuedRun(nodeId: string, workspaceId: string): boolean {
     const node = this.sqlite.prepare("SELECT max_concurrent_runs FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
     const workspace = this.sqlite.prepare("SELECT path FROM workspaces WHERE node_id = ? AND id = ?").get(nodeId, workspaceId) as Row | undefined;
@@ -1301,11 +1325,8 @@ export class ControlDatabase {
     return result.changes > 0;
   }
 
-  listMessages(conversationId: string): MessageRecord[] {
-    const rows = this.sqlite.prepare(
-      "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, CASE role WHEN 'user' THEN 0 ELSE 1 END, id",
-    ).all(conversationId) as Row[];
-    return rows.map((row) => ({
+  private messageFromRow(row: Row): MessageRecord {
+    return {
       id: text(row, "id"),
       conversationId: text(row, "conversation_id"),
       runId: nullableText(row, "run_id"),
@@ -1316,7 +1337,58 @@ export class ControlDatabase {
       attachmentIds: parseJson(row.attachment_ids_json ?? "[]") as string[],
       createdAt: text(row, "created_at"),
       updatedAt: text(row, "updated_at"),
-    }));
+    };
+  }
+
+  listMessages(conversationId: string): MessageRecord[] {
+    const rows = this.sqlite.prepare(
+      "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, CASE role WHEN 'user' THEN 0 ELSE 1 END, id",
+    ).all(conversationId) as Row[];
+    return rows.map((row) => this.messageFromRow(row));
+  }
+
+  listMessagePage(conversationId: string, limit: number, before?: MessageListCursor): MessagePage {
+    const normalizedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+    const roleOrder = "CASE role WHEN 'user' THEN 0 ELSE 1 END";
+    const rows = (before
+      ? this.sqlite.prepare(`
+          SELECT * FROM messages
+          WHERE conversation_id = ? AND (
+            created_at < ?
+            OR (created_at = ? AND ${roleOrder} < ?)
+            OR (created_at = ? AND ${roleOrder} = ? AND id < ?)
+          )
+          ORDER BY created_at DESC, ${roleOrder} DESC, id DESC
+          LIMIT ?
+        `).all(
+          conversationId,
+          before.createdAt,
+          before.createdAt,
+          before.roleOrder,
+          before.createdAt,
+          before.roleOrder,
+          before.id,
+          normalizedLimit + 1,
+        )
+      : this.sqlite.prepare(`
+          SELECT * FROM messages
+          WHERE conversation_id = ?
+          ORDER BY created_at DESC, ${roleOrder} DESC, id DESC
+          LIMIT ?
+        `).all(conversationId, normalizedLimit + 1)) as Row[];
+    const pageRows = rows.slice(0, normalizedLimit);
+    const earliest = pageRows.at(-1);
+    const nextCursor = rows.length > normalizedLimit && earliest
+      ? {
+          createdAt: text(earliest, "created_at"),
+          roleOrder: (text(earliest, "role") === "user" ? 0 : 1) as 0 | 1,
+          id: text(earliest, "id"),
+        }
+      : null;
+    return {
+      data: pageRows.reverse().map((row) => this.messageFromRow(row)),
+      nextCursor,
+    };
   }
 
   insertApproval(nodeId: string, approval: InteractionRequestedPayload): void {
@@ -1433,9 +1505,11 @@ export class ControlDatabase {
     ).run(status, error, now, id);
   }
 
-  listPendingCommands(nodeId: string): CommandRecord[] {
-    const rows = this.sqlite.prepare(`
+  listPendingCommands(nodeId: string, includeAccepted = false): CommandRecord[] {
+    const rows = this.sqlite.prepare(includeAccepted ? `
       SELECT * FROM commands WHERE node_id = ? AND status IN ('queued', 'accepted') ORDER BY created_at
+    ` : `
+      SELECT * FROM commands WHERE node_id = ? AND status = 'queued' ORDER BY created_at
     `).all(nodeId) as Row[];
     return rows.map((row) => ({
       id: text(row, "id"),
@@ -1845,11 +1919,11 @@ export class ControlDatabase {
     `).run(revokedAt, nodeId).changes);
   }
 
-  createUiEvent(type: string, resourceId: string | null, occurredAt: string): UiEventRecord {
+  createUiEvent(type: string, resourceId: string | null, occurredAt: string, conversationId: string | null = null): UiEventRecord {
     const result = this.sqlite.prepare(
-      "INSERT INTO ui_events (type, resource_id, occurred_at) VALUES (?, ?, ?)",
-    ).run(type, resourceId, occurredAt);
-    return { revision: Number(result.lastInsertRowid), type, resourceId, occurredAt };
+      "INSERT INTO ui_events (type, resource_id, conversation_id, occurred_at) VALUES (?, ?, ?, ?)",
+    ).run(type, resourceId, conversationId, occurredAt);
+    return { revision: Number(result.lastInsertRowid), type, resourceId, conversationId, occurredAt };
   }
 
   listUiEventsAfter(revision: number, limit = 1000): UiEventRecord[] {
@@ -1859,6 +1933,7 @@ export class ControlDatabase {
       revision: Number(row.revision),
       type: text(row, "type"),
       resourceId: nullableText(row, "resource_id"),
+      conversationId: nullableText(row, "conversation_id"),
       occurredAt: text(row, "occurred_at"),
     }));
   }

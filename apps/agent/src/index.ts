@@ -33,7 +33,7 @@ import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.3.2";
+const AGENT_VERSION = "0.3.3";
 
 interface ActiveRun {
   conversationId: string;
@@ -91,9 +91,11 @@ const workspaceRegistry = new Map<string, WorkspaceDescriptor>(config.workspaces
 let socket: WebSocket | null = null;
 let heartbeatTimer: NodeJS.Timeout | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
+let reconnectStabilityTimer: NodeJS.Timeout | null = null;
 let attachmentCleanupTimer: NodeJS.Timeout | null = null;
 let reconnectAttempt = 0;
 let shuttingDown = false;
+let detectedCodexVersion: string | null = null;
 const appServerSecurity = threadStartSecurity(config.yolo);
 let availableModels: ModelDescriptor[] = [];
 
@@ -108,11 +110,13 @@ function timestamp(): string {
 }
 
 function codexVersion(): string {
+  if (detectedCodexVersion !== null) return detectedCodexVersion;
   try {
-    return execFileSync(config.codexBinary, ["--version"], { encoding: "utf8" }).trim();
+    detectedCodexVersion = execFileSync(config.codexBinary, ["--version"], { encoding: "utf8" }).trim();
   } catch {
-    return "unavailable";
+    detectedCodexVersion = "unavailable";
   }
+  return detectedCodexVersion;
 }
 
 function send(message: AgentToControlMessage): boolean {
@@ -201,6 +205,35 @@ function parseModelCatalog(result: ModelListResult): ModelDescriptor[] {
       supportedReasoningEfforts,
     }];
   });
+}
+
+const MODEL_CACHE_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+function readModelCache(): { models: ModelDescriptor[]; fresh: boolean } | null {
+  const cachePath = path.join(config.dataDirectory, "model-cache.json");
+  if (!existsSync(cachePath)) return null;
+  try {
+    const cached = JSON.parse(readFileSync(cachePath, "utf8")) as { codexVersion?: unknown; fetchedAt?: unknown; models?: unknown };
+    if (cached.codexVersion !== codexVersion()
+      || typeof cached.fetchedAt !== "string"
+      || !Array.isArray(cached.models)) return null;
+    const models = parseModelCatalog({ data: cached.models });
+    return {
+      models,
+      fresh: Number.isFinite(Date.parse(cached.fetchedAt))
+        && Date.parse(cached.fetchedAt) >= Date.now() - MODEL_CACHE_LIFETIME_MS,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeModelCache(models: ModelDescriptor[]): void {
+  writeFileSync(path.join(config.dataDirectory, "model-cache.json"), `${JSON.stringify({
+    codexVersion: codexVersion(),
+    fetchedAt: timestamp(),
+    models,
+  }, null, 2)}\n`, { mode: 0o600 });
 }
 
 function contextFor(params: unknown): { threadId?: string; turnId?: string; conversationId?: string; run?: ActiveRun } {
@@ -819,7 +852,6 @@ function connect(): void {
   socket = nextSocket;
 
   nextSocket.on("open", () => {
-    reconnectAttempt = 0;
     send({
       type: "agent.hello",
       protocolVersion: CONTROL_PROTOCOL_VERSION,
@@ -843,6 +875,11 @@ function connect(): void {
     try {
       const message = parseControlMessage(data.toString());
       if (message.type === "control.welcome") {
+        if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
+        reconnectStabilityTimer = setTimeout(() => {
+          reconnectAttempt = 0;
+          reconnectStabilityTimer = null;
+        }, 30_000);
         flushOutbox();
         emitDurable({
           type: "agent.stateReport",
@@ -893,6 +930,8 @@ function connect(): void {
     if (socket === nextSocket) socket = null;
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     heartbeatTimer = null;
+    if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
+    reconnectStabilityTimer = null;
     if (shuttingDown) return;
     const baseDelay = Math.min(30_000, 1_000 * 2 ** reconnectAttempt++);
     const delay = baseDelay + Math.floor(Math.random() * 500);
@@ -907,6 +946,7 @@ function shutdown(): void {
   shuttingDown = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
   if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
   socket?.close(1000, "Agent shutting down");
   appServer.close();
@@ -929,11 +969,28 @@ async function bootstrap(): Promise<void> {
   attachmentCleanupTimer = setInterval(cleanupAttachmentCache, 60 * 60 * 1000);
   try {
     await appServer.start();
-    availableModels = parseModelCatalog(await appServer.request<ModelListResult>("model/list", {
-      limit: 100,
-      includeHidden: false,
-    }));
-    console.log(`[agent] models: ${availableModels.map((model) => model.displayName).join(", ") || "local default"}`);
+    const cachedModels = readModelCache();
+    if (cachedModels?.fresh) {
+      availableModels = cachedModels.models;
+      console.log(`[agent] models: ${availableModels.map((model) => model.displayName).join(", ") || "local default"} (cached)`);
+    } else {
+      try {
+        availableModels = parseModelCatalog(await appServer.request<ModelListResult>("model/list", {
+          limit: 100,
+          includeHidden: false,
+        }));
+        try {
+          writeModelCache(availableModels);
+        } catch (error) {
+          console.warn("[agent] unable to persist model cache", error instanceof Error ? error.message : error);
+        }
+        console.log(`[agent] models: ${availableModels.map((model) => model.displayName).join(", ") || "local default"}`);
+      } catch (error) {
+        if (!cachedModels) throw error;
+        availableModels = cachedModels.models;
+        console.warn("[agent] unable to refresh models; using stale cache", error instanceof Error ? error.message : error);
+      }
+    }
   } catch (error) {
     console.warn("[agent] unable to discover models; using local default", error instanceof Error ? error.message : error);
   }

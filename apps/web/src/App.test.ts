@@ -62,6 +62,7 @@ describe("buildTimeline", () => {
         createdAt: "2026-09-09T10:00:02.000Z",
         updatedAt: "2026-09-09T10:00:02.100Z",
       }],
+      messagePage: { hasMore: false, before: null },
       attachments: [],
       approvals: [],
     };

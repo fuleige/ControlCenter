@@ -18,7 +18,7 @@ import {
 } from "@controller-center/protocol";
 import { loadConfig } from "./config.js";
 import { AgentConnections } from "./connections.js";
-import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type WorkspaceRecord } from "./database.js";
+import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type MessageListCursor, type WorkspaceRecord } from "./database.js";
 import { UiEventBus } from "./event-bus.js";
 import {
   ADMIN_SESSION_IDLE_MS,
@@ -94,6 +94,25 @@ function decodeConversationCursor(value: string | undefined): ConversationListCu
       || typeof decoded.id !== "string"
       || !decoded.id) return null;
     return { pinned: decoded.pinned, updatedAt: decoded.updatedAt, id: decoded.id };
+  } catch {
+    return null;
+  }
+}
+
+function encodeMessageCursor(cursor: MessageListCursor | null): string | null {
+  return cursor ? Buffer.from(JSON.stringify(cursor)).toString("base64url") : null;
+}
+
+function decodeMessageCursor(value: string | undefined): MessageListCursor | null {
+  if (!value || value.length > 512) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<MessageListCursor>;
+    if (typeof decoded.createdAt !== "string"
+      || !Number.isFinite(Date.parse(decoded.createdAt))
+      || (decoded.roleOrder !== 0 && decoded.roleOrder !== 1)
+      || typeof decoded.id !== "string"
+      || !decoded.id) return null;
+    return { createdAt: decoded.createdAt, roleOrder: decoded.roleOrder, id: decoded.id };
   } catch {
     return null;
   }
@@ -247,8 +266,8 @@ function dispatch(command: CommandRecord): boolean {
   return sent;
 }
 
-function dispatchPending(nodeId: string): void {
-  for (const command of database.listPendingCommands(nodeId)) dispatch(command);
+function dispatchPending(nodeId: string, includeAccepted = false): void {
+  for (const command of database.listPendingCommands(nodeId, includeAccepted)) dispatch(command);
 }
 
 function syncNodeWorkspaces(nodeId: string): boolean {
@@ -306,9 +325,32 @@ async function validateWorkspaceForUse(nodeId: string, workspaceId: string): Pro
   }
 }
 
-function publish(type: string, resourceId?: string): void {
-  const event = database.createUiEvent(type, resourceId ?? null, now());
+function publish(type: string, resourceId?: string, conversationId?: string): void {
+  const event = database.createUiEvent(type, resourceId ?? null, now(), conversationId ?? null);
   events.publish(event);
+}
+
+const pendingMessageUiEvents = new Map<string, { messageId: string; timer: NodeJS.Timeout }>();
+
+function publishMessageUpdate(messageId: string, conversationId: string, complete: boolean): void {
+  const pending = pendingMessageUiEvents.get(conversationId);
+  if (complete) {
+    if (pending) clearTimeout(pending.timer);
+    pendingMessageUiEvents.delete(conversationId);
+    publish("message.updated", messageId, conversationId);
+    return;
+  }
+  if (pending) {
+    pending.messageId = messageId;
+    return;
+  }
+  const timer = setTimeout(() => {
+    const latest = pendingMessageUiEvents.get(conversationId);
+    if (!latest || latest.timer !== timer) return;
+    pendingMessageUiEvents.delete(conversationId);
+    publish("message.updated", latest.messageId, conversationId);
+  }, 500);
+  pendingMessageUiEvents.set(conversationId, { messageId, timer });
 }
 
 interface UiPresence {
@@ -320,7 +362,7 @@ interface UiPresence {
 const uiPresence = new Map<string, UiPresence>();
 
 function conversationIsVisible(conversationId: string): boolean {
-  const cutoff = Date.now() - 45_000;
+  const cutoff = Date.now() - 60_000;
   return [...uiPresence.values()].some((entry) => entry.visible && entry.conversationId === conversationId && entry.seenAt >= cutoff);
 }
 
@@ -337,7 +379,7 @@ function notifyRun(runId: string, kind: "completed" | "failed" | "waiting_user",
     title,
     createdAt: occurredAt,
   });
-  publish("notification.created", runId);
+  publish("notification.created", runId, conversation.id);
 }
 
 function normalizedAttachmentName(value: string): string {
@@ -403,46 +445,48 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
     switch (payload.type) {
     case "conversation.bound":
       database.bindConversation(payload.conversationId, payload.threadId, receivedAt);
-      publish("conversation.updated", payload.conversationId);
+      publish("conversation.updated", payload.conversationId, payload.conversationId);
       break;
     case "run.started":
       database.startRun(payload);
-      publish("run.updated", payload.runId);
+      publish("run.updated", payload.runId, payload.conversationId);
       break;
     case "run.progress":
       database.updateRunProgress(payload);
-      publish("run.updated", payload.runId);
+      publish("run.updated", payload.runId, payload.conversationId);
       break;
     case "message.snapshot":
-      if (database.upsertMessageSnapshot(payload)) publish("message.updated", payload.conversationId);
+      if (database.upsertMessageSnapshot(payload)) publishMessageUpdate(payload.messageId, payload.conversationId, payload.complete);
       break;
     case "run.finished":
       database.finishRun(payload);
       if (payload.status === "completed") notifyRun(payload.runId, "completed", "任务已完成", payload.finishedAt);
       if (payload.status === "failed") notifyRun(payload.runId, "failed", payload.error ?? "任务执行失败", payload.finishedAt);
-      publish("run.updated", payload.runId);
+      publish("run.updated", payload.runId, payload.conversationId);
       shouldDispatchPending = true;
       break;
     case "interaction.requested":
       database.insertApproval(nodeId, payload);
       if (payload.runId) notifyRun(payload.runId, "waiting_user", payload.summary, payload.requestedAt);
-      publish("approval.created", payload.approvalId);
+      publish("approval.created", payload.approvalId, payload.conversationId);
       break;
-    case "interaction.resolved":
+    case "interaction.resolved": {
+      const approval = database.getApproval(payload.approvalId);
       database.resolveApproval(payload.approvalId, payload.response, payload.resolvedAt);
-      publish("approval.updated", payload.approvalId);
+      publish("approval.updated", payload.approvalId, approval?.conversationId);
       break;
+    }
     case "agent.stateReport":
       for (const failedRunId of database.reconcileNodeRuns(nodeId, payload.activeRuns.map((run) => run.runId), payload.reportedAt)) {
         notifyRun(failedRunId, "failed", "节点重启后无法确认原任务状态", payload.reportedAt);
-        publish("run.updated", failedRunId);
+        publish("run.updated", failedRunId, database.getRun(failedRunId)?.conversationId);
       }
       shouldDispatchPending = true;
       break;
     case "agent.error":
       database.applyAgentError(payload, receivedAt);
       if (payload.runId) notifyRun(payload.runId, "failed", payload.message, receivedAt);
-      publish("agent.error", payload.runId ?? payload.conversationId);
+      publish("agent.error", payload.runId ?? payload.conversationId, payload.conversationId);
       shouldDispatchPending = true;
       break;
     }
@@ -620,7 +664,9 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
         initialized = true;
         publish("node.online", nodeId);
         if (restarted) publish("node.restarted", nodeId);
-        dispatchPending(nodeId);
+        // A reconnect is the only time an accepted command needs to be replayed.
+        // The Agent persists command ids and will acknowledge without executing it twice.
+        dispatchPending(nodeId, true);
         return;
       }
 
@@ -833,19 +879,36 @@ app.patch<{ Params: { id: string }; Body: { title?: string; pinned?: boolean } }
   if (Object.keys(input).length === 0) return reply.code(400).send({ error: "请提供会话标题或置顶状态" });
   const conversation = database.updateConversation(request.params.id, input, now());
   if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
-  publish("conversation.updated", conversation.id);
+  publish("conversation.updated", conversation.id, conversation.id);
   return { conversation };
 });
 
-app.get<{ Params: { id: string } }>("/api/conversations/:id", async (request, reply) => {
+app.get<{
+  Params: { id: string };
+  Querystring: { messageLimit?: string; beforeMessage?: string };
+}>("/api/conversations/:id", async (request, reply) => {
   const conversation = database.getConversation(request.params.id);
   if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
+  const messageLimit = Number.parseInt(request.query.messageLimit ?? "60", 10);
+  if (!Number.isSafeInteger(messageLimit) || messageLimit < 1 || messageLimit > 100) {
+    return reply.code(400).send({ error: "每页消息数量必须在 1 到 100 之间" });
+  }
+  const beforeMessage = decodeMessageCursor(request.query.beforeMessage);
+  if (request.query.beforeMessage && !beforeMessage) {
+    return reply.code(400).send({ error: "消息分页位置无效，请重新打开会话" });
+  }
+  const messagePage = database.listMessagePage(conversation.id, messageLimit, beforeMessage ?? undefined);
+  const attachmentIds = [...new Set(messagePage.data.flatMap((message) => message.attachmentIds))];
   return {
     conversation,
-    runs: database.listRuns(conversation.id),
-    messages: database.listMessages(conversation.id),
-    attachments: database.listConversationAttachments(conversation.id).map(({ downloadToken: _downloadToken, storageKey: _storageKey, ...attachment }) => attachment),
-    approvals: database.listApprovals(undefined, conversation.id),
+    runs: database.listRecentRuns(conversation.id),
+    messages: messagePage.data,
+    messagePage: {
+      hasMore: messagePage.nextCursor !== null,
+      before: encodeMessageCursor(messagePage.nextCursor),
+    },
+    attachments: database.listAttachments(attachmentIds).map(({ downloadToken: _downloadToken, storageKey: _storageKey, ...attachment }) => attachment),
+    approvals: database.listApprovals("pending", conversation.id),
   };
 });
 
@@ -867,7 +930,7 @@ app.delete<{ Params: { id: string } }>("/api/conversations/:id", async (request,
     dispatch(command);
   }
   database.deleteConversation(conversation.id);
-  publish("conversation.deleted", conversation.id);
+  publish("conversation.deleted", conversation.id, conversation.id);
   return reply.code(204).send();
 });
 
@@ -913,7 +976,7 @@ app.post<{
     return database.createCommand(randomUUID(), nodeId, command, createdAt);
   });
   const dispatched = dispatch(commandRecord);
-  publish("conversation.created", conversationId);
+  publish("conversation.created", conversationId, conversationId);
   return reply.code(201).send({ conversation: database.getConversation(conversationId), dispatched });
 });
 
@@ -1025,8 +1088,8 @@ app.post<{
   });
   dispatchPending(nodeId);
   const dispatched = database.getRun(runId)?.status === "dispatching";
-  publish("conversation.created", conversationId);
-  publish("run.created", runId);
+  publish("conversation.created", conversationId, conversationId);
+  publish("run.created", runId, conversationId);
   return reply.code(201).send({
     conversation: database.getConversation(conversationId),
     run: database.getRun(runId),
@@ -1111,7 +1174,7 @@ app.post<{
   });
   dispatchPending(conversation.nodeId);
   const dispatched = database.getRun(runId)?.status === "dispatching";
-  publish("run.created", runId);
+  publish("run.created", runId, conversation.id);
   return reply.code(201).send({ run: database.getRun(runId), dispatched });
 });
 
@@ -1195,7 +1258,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
     database.createCommand(`run:${clientRequestId}`, conversation.nodeId, command, createdAt);
   });
   dispatchPending(conversation.nodeId);
-  publish("run.created", runId);
+  publish("run.created", runId, conversation.id);
   return reply.code(201).send({ run: database.getRun(runId), dispatched: database.getRun(runId)?.status === "dispatching", deduplicated: false });
 });
 
@@ -1259,7 +1322,7 @@ app.post<{ Params: { id: string }; Body: { prompt?: string; clientRequestId?: st
     if (preparedAttachments.ids.length) database.bindAttachments(preparedAttachments.ids, conversation.id);
     return createdCommand;
   });
-  publish("message.updated", conversation.id);
+  publish("message.updated", `user:${clientRequestId}`, conversation.id);
   return reply.code(202).send({ dispatched: dispatch(command) });
 });
 
@@ -1278,7 +1341,7 @@ app.post<{ Params: { id: string }; Body: { response?: JsonValue } }>("/api/appro
     response: request.body.response as JsonValue,
   }, now());
   const dispatched = dispatch(command);
-  publish("approval.updated", approval.id);
+  publish("approval.updated", approval.id, approval.conversationId);
   return reply.code(202).send({ dispatched });
 });
 
@@ -1321,7 +1384,7 @@ app.post<{ Params: { id: string } }>("/api/notifications/:id/read", async (reque
 
 app.post<{ Params: { id: string } }>("/api/conversations/:id/read", async (request, reply) => {
   if (!database.getConversation(request.params.id)) return reply.code(404).send({ error: "会话不存在或已被删除" });
-  if (database.markConversationNotificationsRead(request.params.id, now()) > 0) publish("notification.updated", request.params.id);
+  if (database.markConversationNotificationsRead(request.params.id, now()) > 0) publish("notification.updated", request.params.id, request.params.id);
   return reply.code(204).send();
 });
 
@@ -1490,16 +1553,27 @@ const staleTimer = setInterval(() => {
   }
   for (const runId of database.failExpiredRecoveringRuns(currentTime)) {
     notifyRun(runId, "failed", "无法确认远端任务状态", currentTime);
-    publish("run.updated", runId);
+    publish("run.updated", runId, database.getRun(runId)?.conversationId);
   }
   for (const [sessionId, presence] of uiPresence) {
-    if (presence.seenAt < Date.now() - 45_000) uiPresence.delete(sessionId);
+    if (presence.seenAt < Date.now() - 60_000) uiPresence.delete(sessionId);
   }
+}, Math.min(config.offlineAfterMs, 15_000));
+
+function cleanupExpiringResources(): void {
+  const currentTime = now();
   for (const attachment of database.listExpiredAttachments(currentTime)) {
     const filePath = path.join(config.attachmentDirectory, attachment.storageKey);
     if (existsSync(filePath)) unlinkSync(filePath);
     database.deleteAttachment(attachment.id);
   }
+  database.cleanupEnrollmentTokens(currentTime);
+  for (const [remote, attempt] of loginAttempts) {
+    if (attempt.resetAt <= Date.now()) loginAttempts.delete(remote);
+  }
+}
+
+function cleanupRetainedRecords(): void {
   database.cleanupNotifications(
     new Date(Date.now() - taskCenterPolicy.readRetentionDays * 24 * 60 * 60 * 1000).toISOString(),
     new Date(Date.now() - taskCenterPolicy.unreadRetentionDays * 24 * 60 * 60 * 1000).toISOString(),
@@ -1507,11 +1581,12 @@ const staleTimer = setInterval(() => {
   database.cleanupUiEvents(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
   const secretCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   database.cleanupAdminSessions(secretCutoff);
-  database.cleanupEnrollmentTokens(currentTime);
-  for (const [remote, attempt] of loginAttempts) {
-    if (attempt.resetAt <= Date.now()) loginAttempts.delete(remote);
-  }
-}, Math.min(config.offlineAfterMs, 15_000));
+}
+
+cleanupExpiringResources();
+cleanupRetainedRecords();
+const expiryCleanupTimer = setInterval(cleanupExpiringResources, 60_000);
+const retentionCleanupTimer = setInterval(cleanupRetainedRecords, 60 * 60 * 1000);
 
 const commandRetryTimer = setInterval(() => {
   for (const node of database.listNodes()) {
@@ -1527,6 +1602,10 @@ async function shutdown(signal: string): Promise<void> {
   app.log.info({ signal }, "Shutting down control plane");
   clearInterval(staleTimer);
   clearInterval(commandRetryTimer);
+  clearInterval(expiryCleanupTimer);
+  clearInterval(retentionCleanupTimer);
+  for (const pending of pendingMessageUiEvents.values()) clearTimeout(pending.timer);
+  pendingMessageUiEvents.clear();
   connections.closeAll();
   for (const stream of uiStreams) stream.end();
   uiStreams.clear();
