@@ -228,6 +228,10 @@ function SearchIcon() {
   return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.7 3a5.7 5.7 0 1 0 3.5 10.2l3.9 3.9 1-1-3.9-3.9A5.7 5.7 0 0 0 8.7 3Zm0 1.5a4.2 4.2 0 1 1 0 8.4 4.2 4.2 0 0 1 0-8.4Z" /></svg>;
 }
 
+function HistoryIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4.5h12V6H4V4.5Zm0 4.75h12v1.5H4v-1.5ZM4 14h8v1.5H4V14Z" /></svg>;
+}
+
 function SettingsIcon() {
   return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m16.4 11.2 1.1.9-1.5 2.6-1.4-.5c-.5.4-1 .7-1.6.9l-.3 1.4h-3l-.3-1.4c-.6-.2-1.1-.5-1.6-.9l-1.4.5-1.5-2.6 1.1-.9a6.5 6.5 0 0 1 0-1.9l-1.1-.9 1.5-2.6 1.4.5c.5-.4 1-.7 1.6-.9l.3-1.4h3l.3 1.4c.6.2 1.1.5 1.6.9l1.4-.5 1.5 2.6-1.1.9a6.5 6.5 0 0 1 0 1.9ZM11.2 8a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4Z" /></svg>;
 }
@@ -583,7 +587,7 @@ function ConversationPanel({
     <aside className="pane conversations-pane">
       <div className="mobile-pane-title">
         <button className="icon-button" onClick={onBack} aria-label="返回节点">‹</button>
-        <span>{node?.name ?? "对话"}</span>
+        <span>历史会话</span>
       </div>
       <button
         className="sidebar-toggle history-toggle"
@@ -1773,9 +1777,9 @@ function ChatPanel({
   const activeEffortText = activeRun?.effort ? effortLabels[activeRun.effort] : "默认思考强度";
 
   return (
-    <main className="chat-pane">
+    <main className={`chat-pane ${isDraft ? "draft-state" : ""}`}>
       <header className="chat-header">
-        <button className="icon-button mobile-back" onClick={onBack} aria-label="返回对话">‹</button>
+        <button className="icon-button mobile-back" onClick={onBack} aria-label="打开历史会话"><HistoryIcon /></button>
         <div className="chat-title">
           <strong>{detail?.conversation.title ?? "新会话"}</strong>
           <span>{node.name} / {workspace?.name ?? workspaceId}</span>
@@ -1890,7 +1894,7 @@ function ChatPanel({
           }}
         />
         <div className="composer-footer">
-          <div className="composer-toolbar">
+          <div className="composer-toolbar" aria-label="会话选项">
             <input ref={fileInputElement} className="file-input" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
             <button className="attach-button" type="button" onClick={() => fileInputElement.current?.click()} disabled={busy || uploads.length >= 10} title="上传文件或图片">＋ 附件</button>
             {isDraft && (
@@ -2474,8 +2478,13 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     setConversationSearch("");
     setConversationFilter("all");
     commitSelectedNode(node.id);
+    commitSelectedConversation(null);
     setConversations([]);
-    beginNewConversation();
+    setDetail(null);
+    commitDraftRequestId(newDraftRequestId());
+    setPrimaryView("workspace");
+    setMobilePane("chat");
+    setOverlay(null);
   }
 
   function selectConversation(conversation: Conversation) {
@@ -2592,6 +2601,12 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           hasMore={Boolean(conversationNextCursor)}
           onLoadMore={() => void refreshConversations({ mode: "append" })}
         />
+        <button
+          type="button"
+          className="mobile-history-backdrop"
+          aria-label="关闭历史会话"
+          onClick={() => setMobilePane("chat")}
+        />
         {primaryView === "tasks" ? (
           <TaskCenterPage
             entries={taskEntries}
@@ -2630,8 +2645,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         onClose={() => setOverlay(null)}
         onSearch={searchQuickConversations}
         onNode={(node) => {
-          if (selectedNodeIdRef.current === node.id) beginNewConversation();
-          else selectNode(node);
+          selectNode(node);
           setOverlay(null);
         }}
         onConversation={selectConversation}

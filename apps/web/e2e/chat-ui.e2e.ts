@@ -284,6 +284,25 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect.poll(() => composerInput.evaluate((element) => element.getBoundingClientRect().height)).toBeGreaterThan(initialInputHeight);
   const composerBottom = await page.locator(".composer").evaluate((element) => element.getBoundingClientRect().bottom);
   expect(composerBottom).toBeLessThanOrEqual(await page.evaluate(() => window.innerHeight));
+  if (testInfo.project.name !== "desktop") {
+    const actionBounds = await page.locator(".send-button, .run-float .stop-button").evaluateAll((elements) => elements.map((element) => {
+      const bounds = element.getBoundingClientRect();
+      return { left: bounds.left, right: bounds.right, viewport: window.innerWidth };
+    }));
+    expect(actionBounds.every(({ left, right, viewport }) => left >= 0 && right <= viewport)).toBe(true);
+    if (testInfo.project.name === "compact-mobile") {
+      const toolbar = page.locator(".composer-toolbar");
+      const toolbarOverflow = await toolbar.evaluate((element) => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth }));
+      expect(toolbarOverflow.scrollWidth).toBeGreaterThan(toolbarOverflow.clientWidth);
+      await toolbar.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
+      const effortVisible = await page.getByRole("combobox", { name: "选择思考强度" }).evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const toolbarBounds = element.closest(".composer-toolbar")!.getBoundingClientRect();
+        return bounds.left >= toolbarBounds.left && bounds.right <= toolbarBounds.right;
+      });
+      expect(effortVisible).toBe(true);
+    }
+  }
   await composerInput.fill("");
 
   await timeline.evaluate((element) => { element.scrollTop = 120; });
@@ -307,7 +326,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.3.3");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.4");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -453,17 +472,17 @@ test("后台运行会话的延迟刷新不会抢回当前会话", async ({ page 
 
   await page.goto("/");
   if (testInfo.project.name !== "desktop") {
-    await page.getByRole("button", { name: "返回对话" }).click();
+    await page.getByRole("button", { name: "打开历史会话" }).click();
   }
   await page.locator(".conversation-card").filter({ hasText: selectedConversation.title }).click();
   await expect(page.locator(".chat-title strong")).toHaveText(selectedConversation.title);
   await expect(page.getByText("这是当前会话的内容")).toBeVisible();
 
   for (let index = 0; index < 3; index += 1) {
-    if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "返回对话" }).click();
+    if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "打开历史会话" }).click();
     await page.locator(".conversation-card").filter({ hasText: backgroundConversation.title }).click();
     await expect(page.locator(".chat-title strong")).toHaveText(backgroundConversation.title);
-    if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "返回对话" }).click();
+    if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "打开历史会话" }).click();
     await page.locator(".conversation-card").filter({ hasText: selectedConversation.title }).click();
     await expect(page.locator(".chat-title strong")).toHaveText(selectedConversation.title);
   }
@@ -609,12 +628,28 @@ test("新会话创建结果不会抢占用户后来选择的会话", async ({ pa
   await page.goto("/");
   if (testInfo.project.name !== "desktop") {
     await page.locator(".node-card").filter({ hasText: node.name }).click();
+    await expect(page.locator(".chat-pane")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "开始一个新会话" })).toBeVisible();
+    await expect(page.locator(".conversations-pane")).toBeHidden();
+    await page.getByRole("button", { name: "打开历史会话" }).click();
+    await expect(page.locator(".conversations-pane")).toBeVisible();
+    await expect(page.locator(".chat-pane")).toBeVisible();
+    await expect(page.getByRole("button", { name: "关闭历史会话" })).toBeVisible();
+    await page.screenshot({ path: `/tmp/controller-center-history-${testInfo.project.name}.png`, fullPage: true });
+    await page.getByRole("button", { name: "新建会话" }).click();
+    const draftAlignment = await page.locator(".draft-welcome").evaluate((element) => {
+      const graphic = element.querySelector(".empty-visual")!.getBoundingClientRect();
+      const timeline = element.closest(".timeline")!.getBoundingClientRect();
+      return Math.abs(graphic.left + graphic.width / 2 - (timeline.left + timeline.width / 2));
+    });
+    expect(draftAlignment).toBeLessThanOrEqual(1);
+    await page.screenshot({ path: `/tmp/controller-center-draft-${testInfo.project.name}.png`, fullPage: true });
   }
   await expect(page.getByRole("combobox", { name: "选择工作空间" })).toHaveValue("qa-workspace");
   await page.locator(".composer textarea").fill("创建一个后台会话");
   await page.getByRole("button", { name: "发送" }).click();
 
-  if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "返回对话" }).click();
+  if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "打开历史会话" }).click();
   await page.locator(".conversation-card").filter({ hasText: existingConversation.title }).click();
   await expect(page.locator(".chat-title strong")).toHaveText(existingConversation.title);
 
