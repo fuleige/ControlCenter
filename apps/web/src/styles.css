@@ -879,7 +879,9 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .run-error { margin-bottom: 12px; padding: 10px 13px; border: 1px solid #f3bbb5; border-radius: 9px; background: var(--danger-soft); color: var(--danger); font-size: 11px; }
-.connection-banner { position: fixed; z-index: 100; top: 14px; left: 50%; transform: translateX(-50%); padding: 9px 14px; border: 1px solid #f3bbb5; border-radius: 9px; background: #fff7f6; color: var(--danger); font-size: 11px; box-shadow: var(--shadow-md); }
+.connection-banner { position: fixed; z-index: 100; top: 14px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; max-width: min(760px, calc(100% - 28px)); padding: 9px 10px 9px 14px; border: 1px solid #f3bbb5; border-radius: 9px; background: #fff7f6; color: var(--danger); font-size: 11px; box-shadow: var(--shadow-md); }
+.connection-banner span { min-width: 0; overflow-wrap: anywhere; }
+.connection-banner button { flex: none; min-height: 28px; padding: 0 9px; border: 1px solid #e8aaa4; border-radius: 7px; background: #fff; color: var(--danger); font: inherit; cursor: pointer; }
 .mobile-topbar, .mobile-pane-title, .mobile-back { display: none; }
 
 .overlay-backdrop { position: fixed; z-index: 90; inset: 0; padding: 34px; display: grid; place-items: center; background: rgb(24 34 52 / 28%); backdrop-filter: blur(5px); }

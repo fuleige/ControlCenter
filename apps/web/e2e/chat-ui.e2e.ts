@@ -307,7 +307,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.3.1");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.2");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -471,6 +471,92 @@ test("后台运行会话的延迟刷新不会抢回当前会话", async ({ page 
   await page.waitForTimeout(800);
   await expect(page.locator(".chat-title strong")).toHaveText(selectedConversation.title);
   await expect(page.locator(".conversation-card").filter({ hasText: backgroundConversation.title })).not.toHaveClass(/selected/);
+});
+
+test("本地缓存的会话已被删除时自动回到当前节点的新会话", async ({ page }) => {
+  const missingConversationId = "deleted-conversation";
+  await page.addInitScript(({ nodeId, conversationId }) => {
+    localStorage.setItem("controller-center:selected-node", nodeId);
+    localStorage.setItem("controller-center:selected-conversation", conversationId);
+  }, { nodeId: node.id, conversationId: missingConversationId });
+
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
+    } else if (url.pathname === "/api/stream") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
+    } else if (url.pathname === "/api/nodes") {
+      await route.fulfill({ json: { data: [node] } });
+    } else if (url.pathname === "/api/conversations" && url.searchParams.has("nodeId")) {
+      await route.fulfill({ json: { data: [conversation], total: 1, nextCursor: null } });
+    } else if (url.pathname === `/api/conversations/${missingConversationId}`) {
+      await route.fulfill({ status: 404, json: { error: "Conversation not found" } });
+    } else if (url.pathname === "/api/approvals") {
+      await route.fulfill({ json: { data: [] } });
+    } else if (url.pathname === "/api/settings") {
+      await route.fulfill({ json: { settings: { defaultModel: null, defaultEffort: null } } });
+    } else if (url.pathname === "/api/task-center") {
+      await route.fulfill({ json: { data: [], unreadCount: 0 } });
+    } else {
+      await route.fulfill({ status: 204 });
+    }
+  });
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "开始一个新会话" })).toBeVisible();
+  await expect(page.locator(".connection-banner")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("controller-center:selected-conversation"))).toBeNull();
+  await expect(page.locator(".node-card").filter({ hasText: node.name })).toHaveClass(/selected/);
+});
+
+test("后台刷新显示真实错误上下文并在重试成功后清除", async ({ page }) => {
+  let conversationRequests = 0;
+  await page.addInitScript((nodeId) => {
+    localStorage.setItem("controller-center:selected-node", nodeId);
+    localStorage.removeItem("controller-center:selected-conversation");
+  }, node.id);
+
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
+    } else if (url.pathname === "/api/stream") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
+    } else if (url.pathname === "/api/nodes") {
+      await route.fulfill({ json: { data: [node] } });
+    } else if (url.pathname === "/api/conversations" && url.searchParams.has("nodeId")) {
+      conversationRequests += 1;
+      if (conversationRequests === 1) {
+        await route.fulfill({
+          status: 503,
+          headers: { "X-Request-Id": "conversation-refresh-503" },
+          json: { error: "会话数据库暂时不可用" },
+        });
+      } else {
+        await route.fulfill({ json: { data: [conversation], total: 1, nextCursor: null } });
+      }
+    } else if (url.pathname === "/api/approvals") {
+      await route.fulfill({ json: { data: [] } });
+    } else if (url.pathname === "/api/settings") {
+      await route.fulfill({ json: { settings: { defaultModel: null, defaultEffort: null } } });
+    } else if (url.pathname === "/api/task-center") {
+      await route.fulfill({ json: { data: [], unreadCount: 0 } });
+    } else {
+      await route.fulfill({ status: 204 });
+    }
+  });
+
+  await page.goto("/");
+  const banner = page.locator(".connection-banner");
+  await expect(banner).toContainText("刷新会话列表失败：会话数据库暂时不可用");
+  await expect(banner).toContainText("HTTP 503");
+  await expect(banner).toContainText("请求 ID conversation-refresh-503");
+  await expect(banner).not.toContainText("无法连接控制中心：");
+
+  await banner.getByRole("button", { name: "立即重试" }).click();
+  await expect(banner).toHaveCount(0);
+  await expect.poll(() => conversationRequests).toBeGreaterThanOrEqual(2);
 });
 
 test("新会话创建结果不会抢占用户后来选择的会话", async ({ page }, testInfo) => {

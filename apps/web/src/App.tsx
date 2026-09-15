@@ -17,6 +17,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
+  ApiError,
   deleteConversation,
   createEnrollmentToken,
   createNodeWorkspace,
@@ -52,6 +53,7 @@ import {
   updateSettings,
   uploadAttachmentContent,
   validateNodeWorkspace,
+  formatErrorMessage,
 } from "./api";
 import type {
   Approval,
@@ -70,6 +72,13 @@ import type {
 
 type MobilePane = "nodes" | "conversations" | "chat";
 type JsonRecord = Record<string, unknown>;
+type BackgroundIssueSource = "nodes" | "conversations" | "detail" | "approvals" | "settings" | "tasks";
+
+interface BackgroundIssue {
+  source: BackgroundIssueSource;
+  message: string;
+  occurredAt: number;
+}
 
 const selectedNodeStorageKey = "controller-center:selected-node";
 const selectedConversationStorageKey = "controller-center:selected-conversation";
@@ -362,7 +371,7 @@ function NodePanel({
       onRenamed(updated);
       setEditingId(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "重命名节点"));
     } finally {
       setBusy(false);
     }
@@ -508,7 +517,7 @@ function ConversationPanel({
     try {
       await onDelete(conversation);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "删除会话"));
     } finally {
       setDeletingId(null);
     }
@@ -522,7 +531,16 @@ function ConversationPanel({
       await onUpdate(conversation, { title });
       setEditingId(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "重命名会话"));
+    }
+  }
+
+  async function togglePinned(conversation: Conversation): Promise<void> {
+    setError(null);
+    try {
+      await onUpdate(conversation, { pinned: !conversation.pinnedAt });
+    } catch (reason) {
+      setError(formatErrorMessage(reason, conversation.pinnedAt ? "取消置顶会话" : "置顶会话"));
     }
   }
 
@@ -577,7 +595,7 @@ function ConversationPanel({
                 </span>
               </button>
               <div className="conversation-actions">
-                <button className={`row-action ${conversation.pinnedAt ? "active" : ""}`} title={conversation.pinnedAt ? "取消置顶" : "置顶"} aria-label={conversation.pinnedAt ? `取消置顶 ${conversation.title}` : `置顶 ${conversation.title}`} onClick={() => void onUpdate(conversation, { pinned: !conversation.pinnedAt })}><PinIcon /></button>
+                <button className={`row-action ${conversation.pinnedAt ? "active" : ""}`} title={conversation.pinnedAt ? "取消置顶" : "置顶"} aria-label={conversation.pinnedAt ? `取消置顶 ${conversation.title}` : `置顶 ${conversation.title}`} onClick={() => void togglePinned(conversation)}><PinIcon /></button>
                 <button className="row-action" title="重命名会话" aria-label={`重命名 ${conversation.title}`} onClick={() => { setEditingId(conversation.id); setTitleDraft(conversation.title); }}><PencilIcon /></button>
               <button
                 className="row-action danger"
@@ -657,7 +675,7 @@ function ApprovalCard({ approval, onDone }: { approval: Approval; onDone: () => 
       await resolveApproval(approval.id, response);
       onDone();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "处理确认请求"));
     } finally {
       setBusy(false);
     }
@@ -786,7 +804,7 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
         setError(null);
       }
     } catch (reason) {
-      if (revision === requestRevision.current) setError(reason instanceof Error ? reason.message : String(reason));
+      if (revision === requestRevision.current) setError(formatErrorMessage(reason, "读取工作空间"));
     } finally {
       if (revision === requestRevision.current) setLoading(false);
     }
@@ -794,7 +812,7 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
 
   useEffect(() => { void refresh(); }, [refresh]);
 
-  async function finishMutation(operation: () => Promise<unknown>, busyKey: string): Promise<boolean> {
+  async function finishMutation(operation: () => Promise<unknown>, busyKey: string, operationName: string): Promise<boolean> {
     setBusyId(busyKey);
     setError(null);
     try {
@@ -805,7 +823,7 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
       setConfirmation(null);
       return true;
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
+      const message = formatErrorMessage(reason, operationName);
       await refresh();
       setError(message);
       return false;
@@ -820,6 +838,7 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
     const added = await finishMutation(
       () => createNodeWorkspace(nodeId, { path: newPath.trim(), ...(newName.trim() ? { name: newName.trim() } : {}) }),
       "add",
+      "添加工作空间",
     );
     if (!added) return;
     setNewName("");
@@ -852,6 +871,7 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
         ...(workspacePath !== workspace.path ? { path: workspacePath } : {}),
       }),
       workspace.id,
+      "更新工作空间",
     );
   }
 
@@ -866,11 +886,12 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
           confirmMigration: true,
         }),
         workspace.id,
+        "迁移工作空间路径",
       );
     } else if (confirmation.kind === "archive") {
-      await finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: true }), workspace.id);
+      await finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: true }), workspace.id, "停用工作空间");
     } else {
-      await finishMutation(() => deleteNodeWorkspace(nodeId, workspace.id), workspace.id);
+      await finishMutation(() => deleteNodeWorkspace(nodeId, workspace.id), workspace.id, "删除工作空间");
     }
   }
 
@@ -911,10 +932,10 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
               <button type="button" onClick={() => setEditingId(null)}>取消</button>
               <button type="button" className="primary-button" disabled={busyId === workspace.id} onClick={() => void saveEditing(workspace)}>保存</button>
             </> : <>
-              {!workspace.archivedAt && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => validateNodeWorkspace(nodeId, workspace.id), workspace.id)}>验证</button>}
+              {!workspace.archivedAt && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => validateNodeWorkspace(nodeId, workspace.id), workspace.id, "验证工作空间")}>验证</button>}
               {editable && <button type="button" onClick={() => startEditing(workspace)}>编辑</button>}
               {editable && <button type="button" className="danger-text" onClick={() => setConfirmation({ kind: workspace.conversationCount > 0 ? "archive" : "delete", workspace })}>{workspace.conversationCount > 0 ? "停用" : "删除"}</button>}
-              {workspace.archivedAt && workspace.source !== "config" && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: false }), workspace.id)}>恢复</button>}
+              {workspace.archivedAt && workspace.source !== "config" && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: false }), workspace.id, "恢复工作空间")}>恢复</button>}
             </>}
           </div>
         </article>;
@@ -952,23 +973,34 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   const [busy, setBusy] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [confirmNodeId, setConfirmNodeId] = useState<string | null>(null);
   const [clock, setClock] = useState(Date.now());
   const usedIds = useRef(new Set<string>());
+  const refreshRevision = useRef(0);
 
   const refresh = useCallback(async () => {
-    const result = await listEnrollmentTokens();
+    const revision = ++refreshRevision.current;
+    let result: Awaited<ReturnType<typeof listEnrollmentTokens>>;
+    try {
+      result = await listEnrollmentTokens();
+    } catch (reason) {
+      if (revision === refreshRevision.current) setRefreshError(formatErrorMessage(reason, "刷新注册 Token"));
+      throw reason;
+    }
+    if (revision !== refreshRevision.current) return;
     const currentTime = Date.now();
     const visibleEntries = result.data.filter((entry) => Date.parse(entry.expiresAt) > currentTime);
     const nextUsedIds = new Set(visibleEntries.filter((entry) => entry.status === "used").map((entry) => entry.id));
     const hasNewRegistration = [...nextUsedIds].some((id) => !usedIds.current.has(id));
     usedIds.current = nextUsedIds;
     setEntries(visibleEntries);
+    setRefreshError(null);
     if (hasNewRegistration) await onNodesChanged();
   }, [onNodesChanged]);
 
   useEffect(() => {
-    const update = () => void refresh().catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    const update = () => void refresh().catch(() => undefined);
     update();
     const timer = window.setInterval(update, 2_000);
     return () => window.clearInterval(timer);
@@ -992,7 +1024,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
       const entry = { ...created.enrollment, token: created.enrollment.token ?? created.token };
       setEntries((current) => [entry, ...current.filter((candidate) => candidate.id !== entry.id)]);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "生成注册 Token"));
     } finally {
       setBusy(false);
     }
@@ -1005,7 +1037,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
       await revokeEnrollmentToken(entry.id);
       await refresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "撤销注册 Token"));
     } finally {
       setBusy(false);
     }
@@ -1019,7 +1051,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
       setConfirmNodeId(null);
       await onNodesChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "撤销节点接入"));
     } finally {
       setBusy(false);
     }
@@ -1031,7 +1063,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
       <div><strong>注册新节点</strong><span>在目标机器准备好控制中心 HTTPS 地址，然后粘贴这里生成的 Token。</span></div>
       <button type="button" className="primary-button" disabled={busy} onClick={() => void create()}>{busy ? "生成中…" : "生成注册 Token"}</button>
     </div>
-    {error && <p className="form-error workspace-settings-error">{error}</p>}
+    {(error ?? refreshError) && <p className="form-error workspace-settings-error">{error ?? refreshError}</p>}
     {nodes.length > 0 && <div className="enrollment-nodes">
       <header><strong>已登记节点</strong><span>丢失或停用节点时应立即撤销其长期凭证</span></header>
       {nodes.map((node) => <article key={node.id}>
@@ -1060,7 +1092,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
             {entry.token && <button type="button" className="copy-token" onClick={() => void copyToClipboard(entry.token!).then(() => {
               setCopiedId(entry.id);
               window.setTimeout(() => setCopiedId((current) => current === entry.id ? null : current), 1_500);
-            }).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))}>{copiedId === entry.id ? "已复制" : "复制"}</button>}
+            }).catch((reason) => setError(formatErrorMessage(reason, "复制注册 Token")))}>{copiedId === entry.id ? "已复制" : "复制"}</button>}
             {entry.status === "pending" && <button type="button" disabled={busy} onClick={() => void revoke(entry)}>撤销</button>}
           </div>
         </article>;
@@ -1106,7 +1138,19 @@ function SettingsPanel({
       onSaved(await updateSettings({ defaultModel: model || null, defaultEffort: effort || null }));
       onClose();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "保存设置"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function logout(): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      await onLogout();
+    } catch (reason) {
+      setError(formatErrorMessage(reason, "退出登录"));
     } finally {
       setBusy(false);
     }
@@ -1120,7 +1164,7 @@ function SettingsPanel({
           <button type="button" className={section === "defaults" ? "active" : ""} onClick={() => setSection("defaults")}>对话默认值</button>
           <button type="button" className={section === "workspaces" ? "active" : ""} onClick={() => setSection("workspaces")}>工作空间</button>
           <button type="button" className={section === "enrollment" ? "active" : ""} onClick={() => setSection("enrollment")}>节点接入</button>
-          <button type="button" className="settings-logout" onClick={() => void onLogout()}>退出登录</button>
+          <button type="button" className="settings-logout" disabled={busy} onClick={() => void logout()}>退出登录</button>
           <div className="settings-version"><span>Controller Center</span><strong>v{__APP_VERSION__}</strong></div>
         </nav>
         {section === "defaults" ? <form className="settings-form" onSubmit={(event) => void save(event)}>
@@ -1267,11 +1311,11 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
       || filter === "attention" && ["failed", "waiting_approval", "waiting_user"].includes(entry.status)
       || filter === "completed" && entry.status === "completed"));
 
-  async function runAction(key: string, action: () => Promise<void>): Promise<void> {
+  async function runAction(key: string, operation: string, action: () => Promise<void>): Promise<void> {
     setBusyAction(key);
     setError(null);
     try { await action(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { setError(formatErrorMessage(reason, operation)); }
     finally { setBusyAction(null); }
   }
 
@@ -1294,12 +1338,12 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
             <option value="all">全部节点</option>
             {nodes.map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
           </select>
-          <button type="button" disabled={unreadCount === 0 || busyAction !== null} onClick={() => void runAction("read-all", onMarkAllRead)}>{busyAction === "read-all" ? "处理中…" : "全部标为已读"}</button>
+          <button type="button" disabled={unreadCount === 0 || busyAction !== null} onClick={() => void runAction("read-all", "标记全部通知为已读", onMarkAllRead)}>{busyAction === "read-all" ? "处理中…" : "全部标为已读"}</button>
         </div>
         <div className="task-center-filters" role="group" aria-label="按状态筛选">
           {([['all', '全部'], ['active', '进行中'], ['attention', '需要关注'], ['completed', '已完成']] as const).map(([value, label]) => <button type="button" key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{label}</button>)}
         </div>
-        {error && <div className="task-center-error">操作失败：{error}</div>}
+        {error && <div className="task-center-error">{error}</div>}
         <div className="task-center-list">
         {visible.map((entry) => <div key={entry.id} className={`task-center-item ${entry.unread ? "unread" : ""}`}>
           <button type="button" className="task-center-open" onClick={() => onOpen(entry)}>
@@ -1315,7 +1359,7 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
             type="button"
             className="task-retry"
             disabled={busyAction !== null}
-            onClick={() => void runAction(`retry:${entry.id}`, () => onRetry(entry))}
+            onClick={() => void runAction(`retry:${entry.id}`, "重新执行任务", () => onRetry(entry))}
           >{busyAction === `retry:${entry.id}` ? "正在重试…" : "重新执行"}</button>}
         </div>)}
         {visible.length === 0 && <div className="empty"><strong>这里暂时没有任务</strong><span>运行中的任务和需要你关注的结果会显示在这里。</span></div>}
@@ -1521,7 +1565,7 @@ function ChatPanel({
       const ready = await uploadAttachmentContent(file, attachment, (progress) => updateUpload(localId, { progress }));
       updateUpload(localId, { attachment: ready, progress: ready.size, status: "ready", error: null });
     } catch (reason) {
-      updateUpload(localId, { status: "failed", error: reason instanceof Error ? reason.message : String(reason) });
+      updateUpload(localId, { status: "failed", error: formatErrorMessage(reason, "上传附件") });
     }
   }
 
@@ -1603,7 +1647,8 @@ function ChatPanel({
       }
       onRefresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      const operation = !detail ? "创建会话" : activeRun?.remoteTurnId ? "追加任务指令" : "发送消息";
+      setError(formatErrorMessage(reason, operation));
     } finally {
       setBusy(false);
     }
@@ -1617,7 +1662,7 @@ function ChatPanel({
       await interruptRun(activeRun.id);
       onRefresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "中止任务"));
     } finally {
       setBusy(false);
     }
@@ -1858,10 +1903,13 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const [nodesCollapsed, setNodesCollapsed] = useState(() => storedBoolean(nodesCollapsedStorageKey));
   const [historyCollapsed, setHistoryCollapsed] = useState(() => storedBoolean(historyCollapsedStorageKey));
   const [mobilePane, setMobilePane] = useState<MobilePane>(() => storedValue(selectedConversationStorageKey) ? "chat" : "nodes");
-  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [backgroundIssues, setBackgroundIssues] = useState<Partial<Record<BackgroundIssueSource, BackgroundIssue>>>({});
   const selectedNodeIdRef = useRef(selectedNodeId);
   const selectedConversationIdRef = useRef(selectedConversationId);
   const draftRequestIdRef = useRef(draftRequestId);
+  const nodesRequestRef = useRef(0);
+  const approvalsRequestRef = useRef(0);
+  const settingsRequestRef = useRef(0);
   const conversationListRequestRef = useRef(0);
   const conversationListAppliedRef = useRef(0);
   const conversationSearchRef = useRef("");
@@ -1906,11 +1954,37 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     setDraftRequestId(requestId);
   }, []);
 
+  const clearBackgroundIssue = useCallback((source: BackgroundIssueSource) => {
+    setBackgroundIssues((current) => {
+      if (!current[source]) return current;
+      const next = { ...current };
+      delete next[source];
+      return next;
+    });
+  }, []);
+
+  const reportBackgroundIssue = useCallback((source: BackgroundIssueSource, reason: unknown, operation: string) => {
+    setBackgroundIssues((current) => ({
+      ...current,
+      [source]: {
+        source,
+        message: `${formatErrorMessage(reason, operation)}；系统将自动重试`,
+        occurredAt: Date.now(),
+      },
+    }));
+  }, []);
+
+  const backgroundIssue = useMemo(() => Object.values(backgroundIssues)
+    .filter((issue): issue is BackgroundIssue => Boolean(issue))
+    .sort((left, right) => right.occurredAt - left.occurredAt)[0] ?? null, [backgroundIssues]);
+
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
 
   const refreshNodes = useCallback(async () => {
+    const requestRevision = ++nodesRequestRef.current;
     try {
       const result = await listNodes();
+      if (requestRevision !== nodesRequestRef.current) return;
       setNodes(result);
       if (result.length === 0 && (selectedNodeIdRef.current || selectedConversationIdRef.current)) {
         commitSelectedNode(null);
@@ -1919,11 +1993,11 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         setConversationTotal(0);
         setDetail(null);
       }
-      setConnectionError(null);
+      clearBackgroundIssue("nodes");
     } catch (error) {
-      setConnectionError(error instanceof Error ? error.message : String(error));
+      if (requestRevision === nodesRequestRef.current) reportBackgroundIssue("nodes", error, "刷新节点状态");
     }
-  }, [commitSelectedConversation, commitSelectedNode]);
+  }, [clearBackgroundIssue, commitSelectedConversation, commitSelectedNode, reportBackgroundIssue]);
 
   const refreshConversations = useCallback(async (options: {
     mode?: "refresh" | "replace" | "append";
@@ -1931,7 +2005,10 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     filter?: "all" | "active" | "failed";
   } = {}) => {
     const requestedNodeId = selectedNodeIdRef.current;
-    if (!requestedNodeId) return;
+    if (!requestedNodeId) {
+      clearBackgroundIssue("conversations");
+      return;
+    }
     const mode = options.mode ?? "refresh";
     const requestedQuery = options.query ?? conversationSearchRef.current;
     const requestedFilter = options.filter ?? conversationFilterRef.current;
@@ -1968,45 +2045,72 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         conversationNextCursorRef.current = result.nextCursor;
         setConversationNextCursor(result.nextCursor);
         setConversationTotal(result.total);
+        clearBackgroundIssue("conversations");
       }
     } catch (error) {
       if (selectedNodeIdRef.current === requestedNodeId && requestRevision > conversationListAppliedRef.current) {
-        setConnectionError(error instanceof Error ? error.message : String(error));
+        reportBackgroundIssue("conversations", error, "刷新会话列表");
       }
     } finally {
       if (requestRevision === conversationListRequestRef.current) setConversationLoading(false);
     }
-  }, []);
+  }, [clearBackgroundIssue, reportBackgroundIssue]);
 
   const refreshDetail = useCallback(async () => {
     const requestedConversationId = selectedConversationIdRef.current;
-    if (!requestedConversationId) return;
+    if (!requestedConversationId) {
+      clearBackgroundIssue("detail");
+      return;
+    }
     const requestRevision = ++conversationDetailRequestRef.current;
     try {
       const result = await getConversation(requestedConversationId);
       if (selectedConversationIdRef.current === requestedConversationId && requestRevision > conversationDetailAppliedRef.current) {
         conversationDetailAppliedRef.current = requestRevision;
         setDetail(result);
+        clearBackgroundIssue("detail");
       }
     } catch (error) {
       if (selectedConversationIdRef.current === requestedConversationId && requestRevision > conversationDetailAppliedRef.current) {
-        setConnectionError(error instanceof Error ? error.message : String(error));
+        if (error instanceof ApiError
+          && error.status === 404
+          && ["Conversation not found", "会话不存在或已被删除"].includes(error.message)) {
+          conversationDetailAppliedRef.current = requestRevision;
+          clearBackgroundIssue("detail");
+          commitSelectedConversation(null);
+          setDetail(null);
+          commitDraftRequestId(newDraftRequestId());
+          setMobilePane("chat");
+          return;
+        }
+        reportBackgroundIssue("detail", error, "恢复会话");
       }
     }
-  }, []);
+  }, [clearBackgroundIssue, commitDraftRequestId, commitSelectedConversation, reportBackgroundIssue]);
 
   const refreshApprovals = useCallback(async () => {
+    const requestRevision = ++approvalsRequestRef.current;
     try {
-      setPendingApprovals(await listPendingApprovals());
+      const result = await listPendingApprovals();
+      if (requestRevision !== approvalsRequestRef.current) return;
+      setPendingApprovals(result);
+      clearBackgroundIssue("approvals");
     } catch (error) {
-      setConnectionError(error instanceof Error ? error.message : String(error));
+      if (requestRevision === approvalsRequestRef.current) reportBackgroundIssue("approvals", error, "刷新待处理请求");
     }
-  }, []);
+  }, [clearBackgroundIssue, reportBackgroundIssue]);
 
   const refreshSettings = useCallback(async () => {
-    try { setSettings(await getSettings()); }
-    catch (error) { setConnectionError(error instanceof Error ? error.message : String(error)); }
-  }, []);
+    const requestRevision = ++settingsRequestRef.current;
+    try {
+      const result = await getSettings();
+      if (requestRevision !== settingsRequestRef.current) return;
+      setSettings(result);
+      clearBackgroundIssue("settings");
+    } catch (error) {
+      if (requestRevision === settingsRequestRef.current) reportBackgroundIssue("settings", error, "刷新全局设置");
+    }
+  }, [clearBackgroundIssue, reportBackgroundIssue]);
 
   const refreshTasks = useCallback(async () => {
     const requestRevision = ++taskCenterRequestRef.current;
@@ -2017,13 +2121,14 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         setTaskEntries(result.entries);
         setUnreadTaskCount(result.unreadCount);
         setTaskPolicy(result.policy);
+        clearBackgroundIssue("tasks");
       }
     } catch (error) {
       if (requestRevision > taskCenterAppliedRef.current) {
-        setConnectionError(error instanceof Error ? error.message : String(error));
+        reportBackgroundIssue("tasks", error, "刷新任务中心");
       }
     }
-  }, []);
+  }, [clearBackgroundIssue, reportBackgroundIssue]);
 
   const refreshAll = useCallback(() => {
     void refreshNodes();
@@ -2047,7 +2152,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       const result = await listConversations({ query: keyword, limit: 10, includeTotal: false });
       if (requestRevision === quickSearchRequestRef.current) setQuickConversations(result.data);
     } catch (reason) {
-      if (requestRevision === quickSearchRequestRef.current) setQuickError(reason instanceof Error ? reason.message : String(reason));
+      if (requestRevision === quickSearchRequestRef.current) setQuickError(formatErrorMessage(reason, "搜索节点和会话"));
     } finally {
       if (requestRevision === quickSearchRequestRef.current) setQuickLoading(false);
     }
@@ -2268,7 +2373,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
 
   return (
     <div className="app-root">
-      {connectionError && <div className="connection-banner">无法连接控制中心：{connectionError}</div>}
+      {backgroundIssue && <div className="connection-banner" role="status"><span>{backgroundIssue.message}</span><button type="button" onClick={refreshAll}>立即重试</button></div>}
       <div className="mobile-topbar">
         <strong>Controller Center</strong>
         <div><button aria-label="快速切换" onClick={openQuickSwitcher}><SearchIcon /></button><button aria-label="任务中心" onClick={() => { setOverlay(null); setPrimaryView("tasks"); }}><BellIcon />{unreadTaskCount > 0 && <b>{unreadTaskCount}</b>}</button><button aria-label="设置" onClick={() => setOverlay("settings")}><SettingsIcon /></button></div>
@@ -2375,7 +2480,7 @@ function LoginScreen({ initialError, onAuthenticated, onRetry }: {
       setToken("");
       onAuthenticated();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "登录"));
     } finally {
       setBusy(false);
     }
@@ -2406,7 +2511,7 @@ export function App() {
       const session = await getAuthSession();
       setState(session.authenticated ? "authenticated" : "anonymous");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(formatErrorMessage(reason, "检查登录状态"));
       setState("error");
     }
   }, []);
@@ -2427,6 +2532,7 @@ export function App() {
     />;
   }
   return <AuthenticatedApp onLogout={async () => {
-    try { await logoutAdmin(); } finally { setState("anonymous"); }
+    await logoutAdmin();
+    setState("anonymous");
   }} />;
 }

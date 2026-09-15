@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+// The displayed version is fixed when Vite starts; restart the dev server after a version bump.
 const { version } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version: string };
 const allowedHosts = (process.env.WEB_ALLOWED_HOSTS ?? "c.llmdev.cn")
   .split(",")

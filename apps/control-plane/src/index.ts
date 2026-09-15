@@ -53,8 +53,28 @@ await app.register(cors, {
     ? true
     : config.corsOrigin.split(",").map((value) => value.trim()),
   credentials: true,
+  exposedHeaders: ["X-Request-Id"],
 });
 await app.register(websocket, { options: { maxPayload: 16 * 1024 * 1024 } });
+
+app.addHook("onRequest", async (request, reply) => {
+  reply.header("X-Request-Id", request.id);
+});
+
+app.setErrorHandler((error, request, reply) => {
+  const candidateStatus = typeof error === "object" && error !== null && "statusCode" in error
+    ? Number(error.statusCode)
+    : null;
+  const statusCode = typeof candidateStatus === "number" && candidateStatus >= 400 && candidateStatus < 600
+    ? candidateStatus
+    : 500;
+  if (statusCode >= 500) request.log.error({ err: error, requestId: request.id }, "Unhandled control-plane request error");
+  else request.log.warn({ err: error, requestId: request.id }, "Rejected control-plane request");
+  return reply.code(statusCode).send({
+    error: statusCode >= 500 ? "控制中心内部错误" : error instanceof Error ? error.message : String(error),
+    requestId: request.id,
+  });
+});
 
 function now(): string {
   return new Date().toISOString();
@@ -171,7 +191,7 @@ app.addHook("onRequest", async (request, reply) => {
     || pathname === "/api/auth/session") return;
   if (!originAllowed(request)) return reply.code(403).send({ error: "请求来源不受信任" });
   if (requestHasValidAdminToken(request) || authenticatedSession(request, true)) return;
-  return reply.code(401).send({ error: "Unauthorized" });
+  return reply.code(401).send({ error: "登录状态已失效" });
 });
 
 function enrollmentStatus(record: { expiresAt: string; usedAt: string | null; revokedAt: string | null }): "pending" | "used" | "revoked" | "expired" {
@@ -327,17 +347,17 @@ function normalizedAttachmentName(value: string): string {
 function prepareAttachments(ids: unknown, messageClientId: string): { ids: string[]; descriptors: AttachmentDescriptor[]; error?: string } {
   if (ids === undefined || ids === null) return { ids: [], descriptors: [] };
   if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || !id.trim())) {
-    return { ids: [], descriptors: [], error: "attachmentIds must be an array of IDs" };
+    return { ids: [], descriptors: [], error: "附件 ID 必须是有效的数组" };
   }
   const uniqueIds = [...new Set(ids.map((id) => id.trim()))];
-  if (uniqueIds.length > 10) return { ids: [], descriptors: [], error: "A message can contain at most 10 attachments" };
+  if (uniqueIds.length > 10) return { ids: [], descriptors: [], error: "单条消息最多包含 10 个附件" };
   const records = database.listAttachments(uniqueIds);
-  if (records.length !== uniqueIds.length) return { ids: [], descriptors: [], error: "One or more attachments do not exist" };
+  if (records.length !== uniqueIds.length) return { ids: [], descriptors: [], error: "一个或多个附件不存在或已被删除" };
   if (records.some((record) => record.status !== "ready" || !record.sha256)) {
-    return { ids: [], descriptors: [], error: "All attachments must finish uploading before sending" };
+    return { ids: [], descriptors: [], error: "所有附件上传完成后才能发送" };
   }
   if (records.some((record) => record.messageClientId !== messageClientId)) {
-    return { ids: [], descriptors: [], error: "An attachment belongs to a different message" };
+    return { ids: [], descriptors: [], error: "附件属于另一条消息，不能重复使用" };
   }
   return {
     ids: uniqueIds,
@@ -636,11 +656,11 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
 app.get("/api/nodes", async () => ({ data: database.listNodes() }));
 
 app.patch<{ Params: { id: string }; Body: { name?: string | null } }>("/api/nodes/:id", async (request, reply) => {
-  if (!("name" in (request.body ?? {}))) return reply.code(400).send({ error: "name is required" });
+  if (!("name" in (request.body ?? {}))) return reply.code(400).send({ error: "节点名称不能为空" });
   const name = typeof request.body.name === "string" ? request.body.name.trim() : "";
-  if (name.length > 64) return reply.code(400).send({ error: "name must be 64 characters or fewer" });
+  if (name.length > 64) return reply.code(400).send({ error: "节点名称不能超过 64 个字符" });
   if (!database.updateNodeName(request.params.id, name || null, now())) {
-    return reply.code(404).send({ error: "Node not found" });
+    return reply.code(404).send({ error: "节点不存在或已被删除" });
   }
   publish("node.updated", request.params.id);
   const node = database.listNodes().find((candidate) => candidate.id === request.params.id);
@@ -778,18 +798,18 @@ app.delete<{ Params: { nodeId: string; workspaceId: string } }>("/api/nodes/:nod
 
 app.get<{ Querystring: { nodeId?: string; q?: string; status?: string; limit?: string; cursor?: string; includeTotal?: string } }>("/api/conversations", async (request, reply) => {
   const query = request.query.q?.trim() ?? "";
-  if (query.length > 100) return reply.code(400).send({ error: "q must not exceed 100 characters" });
+  if (query.length > 100) return reply.code(400).send({ error: "搜索内容不能超过 100 个字符" });
   const requestedLimit = Number.parseInt(request.query.limit ?? "50", 10);
   if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
-    return reply.code(400).send({ error: "limit must be between 1 and 100" });
+    return reply.code(400).send({ error: "每页数量必须在 1 到 100 之间" });
   }
   const cursor = decodeConversationCursor(request.query.cursor);
-  if (request.query.cursor && !cursor) return reply.code(400).send({ error: "Invalid conversation cursor" });
+  if (request.query.cursor && !cursor) return reply.code(400).send({ error: "会话分页位置无效，请重新加载列表" });
   if (request.query.status && !["active", "failed"].includes(request.query.status)) {
-    return reply.code(400).send({ error: "status must be active or failed" });
+    return reply.code(400).send({ error: "会话状态筛选值只能是 active 或 failed" });
   }
   if (request.query.includeTotal && !["true", "false"].includes(request.query.includeTotal)) {
-    return reply.code(400).send({ error: "includeTotal must be true or false" });
+    return reply.code(400).send({ error: "includeTotal 参数必须是 true 或 false" });
   }
   const page = database.listConversationPage({
     ...(request.query.nodeId?.trim() ? { nodeId: request.query.nodeId.trim() } : {}),
@@ -806,20 +826,20 @@ app.patch<{ Params: { id: string }; Body: { title?: string; pinned?: boolean } }
   const input: { title?: string; pinned?: boolean } = {};
   if (typeof request.body?.title === "string") {
     const title = request.body.title.trim();
-    if (!title || title.length > 80) return reply.code(400).send({ error: "title must contain 1 to 80 characters" });
+    if (!title || title.length > 80) return reply.code(400).send({ error: "会话标题必须为 1 到 80 个字符" });
     input.title = title;
   }
   if (typeof request.body?.pinned === "boolean") input.pinned = request.body.pinned;
-  if (Object.keys(input).length === 0) return reply.code(400).send({ error: "title or pinned is required" });
+  if (Object.keys(input).length === 0) return reply.code(400).send({ error: "请提供会话标题或置顶状态" });
   const conversation = database.updateConversation(request.params.id, input, now());
-  if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
   publish("conversation.updated", conversation.id);
   return { conversation };
 });
 
 app.get<{ Params: { id: string } }>("/api/conversations/:id", async (request, reply) => {
   const conversation = database.getConversation(request.params.id);
-  if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
   return {
     conversation,
     runs: database.listRuns(conversation.id),
@@ -831,12 +851,12 @@ app.get<{ Params: { id: string } }>("/api/conversations/:id", async (request, re
 
 app.delete<{ Params: { id: string } }>("/api/conversations/:id", async (request, reply) => {
   const conversation = database.getConversation(request.params.id);
-  if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
   const hasActiveRun = database.listRuns(conversation.id)
     .some((run) => ["queued", "dispatching", "running", "waiting_approval", "recovering"].includes(run.status));
-  if (hasActiveRun) return reply.code(409).send({ error: "End the active task before deleting this conversation" });
+  if (hasActiveRun) return reply.code(409).send({ error: "请先中止当前任务，再删除会话" });
   if (conversation.status === "creating" && !conversation.remoteThreadId) {
-    return reply.code(409).send({ error: "Conversation is still being created" });
+    return reply.code(409).send({ error: "会话仍在创建中，请稍后再试" });
   }
   if (conversation.remoteThreadId) {
     const command = database.createCommand(randomUUID(), conversation.nodeId, {
@@ -858,7 +878,7 @@ app.post<{
   const { nodeId, workspaceId } = body;
   const title = body.title?.trim();
   if (!nodeId || !workspaceId || !title) {
-    return reply.code(400).send({ error: "nodeId, workspaceId and title are required" });
+    return reply.code(400).send({ error: "节点、工作空间和会话标题不能为空" });
   }
   const workspaceValidation = await validateWorkspaceForUse(nodeId, workspaceId);
   if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
@@ -914,19 +934,19 @@ app.post<{
   const prompt = body.prompt?.trim();
   const clientRequestId = body.clientRequestId?.trim() || randomUUID();
   if (!nodeId || !workspaceId || !prompt) {
-    return reply.code(400).send({ error: "nodeId, workspaceId and prompt are required" });
+    return reply.code(400).send({ error: "节点、工作空间和任务内容不能为空" });
   }
   if (clientRequestId.length > 128) {
-    return reply.code(400).send({ error: "clientRequestId must be 128 characters or fewer" });
+    return reply.code(400).send({ error: "客户端请求 ID 不能超过 128 个字符" });
   }
   if (body.effort && !reasoningEfforts.has(body.effort)) {
-    return reply.code(400).send({ error: "Unsupported reasoning effort" });
+    return reply.code(400).send({ error: "所选思考强度不受支持" });
   }
   const existing = database.getConversationByClientRequestId(clientRequestId);
   if (existing) {
     const existingRun = database.listRuns(existing.id)[0] ?? null;
     if (existing.nodeId !== nodeId || existing.workspaceId !== workspaceId || existingRun?.prompt !== prompt) {
-      return reply.code(409).send({ error: "clientRequestId was already used for a different conversation" });
+      return reply.code(409).send({ error: "该客户端请求 ID 已用于另一个会话" });
     }
     return reply.send({
       conversation: existing,
@@ -1022,23 +1042,23 @@ app.post<{
   const body = request.body ?? {};
   const prompt = body.prompt?.trim();
   const clientRequestId = body.clientRequestId?.trim() || randomUUID();
-  if (!prompt) return reply.code(400).send({ error: "prompt is required" });
+  if (!prompt) return reply.code(400).send({ error: "消息内容不能为空" });
   if (body.effort && !reasoningEfforts.has(body.effort)) {
-    return reply.code(400).send({ error: "Unsupported reasoning effort" });
+    return reply.code(400).send({ error: "所选思考强度不受支持" });
   }
   const conversation = database.getConversation(request.params.id);
-  if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
   const existingRun = database.getRunByClientRequestId(clientRequestId);
   if (existingRun) {
     if (existingRun.conversationId !== conversation.id || existingRun.prompt !== prompt) {
-      return reply.code(409).send({ error: "clientRequestId was already used for a different task" });
+      return reply.code(409).send({ error: "该客户端请求 ID 已用于另一个任务" });
     }
     return { run: existingRun, deduplicated: true };
   }
   const preparedAttachments = prepareAttachments(body.attachmentIds, clientRequestId);
   if (preparedAttachments.error) return reply.code(400).send({ error: preparedAttachments.error });
   if (conversation.status !== "ready" || !conversation.remoteThreadId) {
-    return reply.code(409).send({ error: "Conversation is not ready on the node" });
+    return reply.code(409).send({ error: "节点上的会话尚未就绪，请稍后再试" });
   }
   const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
   if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
@@ -1097,13 +1117,13 @@ app.post<{
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, reply) => {
   const sourceRun = database.getRun(request.params.id);
-  if (!sourceRun) return reply.code(404).send({ error: "Run not found" });
+  if (!sourceRun) return reply.code(404).send({ error: "任务不存在或已被删除" });
   if (!sourceRun.status || !["failed", "interrupted"].includes(sourceRun.status)) {
-    return reply.code(409).send({ error: "Only failed or interrupted tasks can be retried" });
+    return reply.code(409).send({ error: "只有失败或已中止的任务可以重新执行" });
   }
   const conversation = database.getConversation(sourceRun.conversationId);
   if (!conversation?.remoteThreadId || conversation.status !== "ready") {
-    return reply.code(409).send({ error: "Conversation is not ready on the node" });
+    return reply.code(409).send({ error: "节点上的会话尚未就绪，请稍后再试" });
   }
   const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
   if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
@@ -1121,7 +1141,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
   const attachmentIds = sourceMessage?.attachmentIds ?? [];
   const attachments = database.listAttachments(attachmentIds);
   if (attachments.length !== attachmentIds.length || attachments.some((attachment) => !attachment.sha256)) {
-    return reply.code(409).send({ error: "The original task attachments are no longer available" });
+    return reply.code(409).send({ error: "原任务的附件已不可用，无法重新执行" });
   }
   const attachmentDescriptors: AttachmentDescriptor[] = attachments.map((attachment) => ({
     id: attachment.id,
@@ -1181,10 +1201,10 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/interrupt", async (request, reply) => {
   const run = database.getRun(request.params.id);
-  if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (!run) return reply.code(404).send({ error: "任务不存在或已被删除" });
   const conversation = database.getConversation(run.conversationId);
   if (!conversation?.remoteThreadId || !run.remoteTurnId) {
-    return reply.code(409).send({ error: "Run has not started remotely" });
+    return reply.code(409).send({ error: "任务尚未在节点上启动，当前无法中止" });
   }
   const createdAt = now();
   const command = database.createCommand(randomUUID(), conversation.nodeId, {
@@ -1200,19 +1220,19 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/interrupt", async (request, 
 app.post<{ Params: { id: string }; Body: { prompt?: string; clientRequestId?: string; attachmentIds?: string[] } }>("/api/runs/:id/steer", async (request, reply) => {
   const prompt = request.body?.prompt?.trim();
   const clientRequestId = request.body?.clientRequestId?.trim() || randomUUID();
-  if (!prompt) return reply.code(400).send({ error: "prompt is required" });
+  if (!prompt) return reply.code(400).send({ error: "追加的任务内容不能为空" });
   const existingCommand = database.getCommand(`steer:${clientRequestId}`);
   if (existingCommand) {
     if (existingCommand.command.type !== "run.steer" || existingCommand.command.runId !== request.params.id || existingCommand.command.prompt !== prompt) {
-      return reply.code(409).send({ error: "clientRequestId was already used for a different instruction" });
+      return reply.code(409).send({ error: "该客户端请求 ID 已用于另一条追加指令" });
     }
     return reply.code(202).send({ dispatched: existingCommand.status !== "failed", deduplicated: true });
   }
   const run = database.getRun(request.params.id);
-  if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (!run) return reply.code(404).send({ error: "任务不存在或已被删除" });
   const conversation = database.getConversation(run.conversationId);
   if (!conversation?.remoteThreadId || !run.remoteTurnId || !["running", "waiting_approval"].includes(run.status)) {
-    return reply.code(409).send({ error: "Run is not active" });
+    return reply.code(409).send({ error: "任务当前不在运行，无法追加指令" });
   }
   const preparedAttachments = prepareAttachments(request.body?.attachmentIds, clientRequestId);
   if (preparedAttachments.error) return reply.code(400).send({ error: preparedAttachments.error });
@@ -1249,9 +1269,9 @@ app.get<{ Querystring: { status?: string; conversationId?: string } }>("/api/app
 
 app.post<{ Params: { id: string }; Body: { response?: JsonValue } }>("/api/approvals/:id/resolve", async (request, reply) => {
   const approval = database.getApproval(request.params.id);
-  if (!approval) return reply.code(404).send({ error: "Approval not found" });
-  if (approval.status !== "pending") return reply.code(409).send({ error: "Approval is no longer pending" });
-  if (!isRecord(request.body?.response)) return reply.code(400).send({ error: "response must be an object" });
+  if (!approval) return reply.code(404).send({ error: "确认请求不存在或已处理" });
+  if (approval.status !== "pending") return reply.code(409).send({ error: "确认请求已被处理，不能重复提交" });
+  if (!isRecord(request.body?.response)) return reply.code(400).send({ error: "确认结果格式无效" });
   const command = database.createCommand(randomUUID(), approval.nodeId, {
     type: "approval.resolve",
     approvalId: approval.id,
@@ -1275,7 +1295,7 @@ app.patch<{ Body: { defaultModel?: string | null; defaultEffort?: ReasoningEffor
     ? current.defaultEffort
     : request.body.defaultEffort;
   if (defaultEffort && !reasoningEfforts.has(defaultEffort as ReasoningEffort)) {
-    return reply.code(400).send({ error: "Unsupported reasoning effort" });
+    return reply.code(400).send({ error: "所选思考强度不受支持" });
   }
   const settings = database.updateGlobalSettings({ defaultModel, defaultEffort: defaultEffort ?? null }, now());
   publish("settings.updated", "global");
@@ -1294,20 +1314,20 @@ app.post("/api/notifications/read-all", async (_request, reply) => {
 });
 
 app.post<{ Params: { id: string } }>("/api/notifications/:id/read", async (request, reply) => {
-  if (!database.markNotificationRead(request.params.id, now())) return reply.code(404).send({ error: "Notification not found" });
+  if (!database.markNotificationRead(request.params.id, now())) return reply.code(404).send({ error: "通知不存在或已被清理" });
   publish("notification.updated", request.params.id);
   return reply.code(204).send();
 });
 
 app.post<{ Params: { id: string } }>("/api/conversations/:id/read", async (request, reply) => {
-  if (!database.getConversation(request.params.id)) return reply.code(404).send({ error: "Conversation not found" });
+  if (!database.getConversation(request.params.id)) return reply.code(404).send({ error: "会话不存在或已被删除" });
   if (database.markConversationNotificationsRead(request.params.id, now()) > 0) publish("notification.updated", request.params.id);
   return reply.code(204).send();
 });
 
 app.post<{ Body: { sessionId?: string; conversationId?: string | null; visible?: boolean } }>("/api/ui/presence", async (request, reply) => {
   const sessionId = request.body?.sessionId?.trim();
-  if (!sessionId || sessionId.length > 128) return reply.code(400).send({ error: "sessionId is required" });
+  if (!sessionId || sessionId.length > 128) return reply.code(400).send({ error: "浏览器会话 ID 无效" });
   const conversationId = typeof request.body.conversationId === "string" ? request.body.conversationId : null;
   uiPresence.set(sessionId, { conversationId, visible: request.body.visible === true, seenAt: Date.now() });
   return reply.code(204).send();
@@ -1319,11 +1339,11 @@ app.post<{
   const size = Number(request.body?.size);
   const messageClientId = request.body?.messageClientId?.trim();
   if (!Number.isSafeInteger(size) || size <= 0 || size > 20 * 1024 * 1024) {
-    return reply.code(400).send({ error: "Attachment size must be between 1 byte and 20MB" });
+    return reply.code(400).send({ error: "附件大小必须在 1 字节到 20MB 之间" });
   }
-  if (!messageClientId || messageClientId.length > 128) return reply.code(400).send({ error: "messageClientId is required" });
+  if (!messageClientId || messageClientId.length > 128) return reply.code(400).send({ error: "附件所属消息 ID 无效" });
   if (database.totalAttachmentBytes() + size > 2 * 1024 * 1024 * 1024) {
-    return reply.code(507).send({ error: "Attachment storage quota exceeded" });
+    return reply.code(507).send({ error: "附件存储空间已满，请清理后重试" });
   }
   const id = randomUUID();
   const storageKey = `${id}.upload`;
@@ -1352,62 +1372,62 @@ app.post<{
 
 app.get<{ Params: { id: string } }>("/api/attachments/:id", async (request, reply) => {
   const attachment = database.getAttachment(request.params.id);
-  if (!attachment) return reply.code(404).send({ error: "Attachment not found" });
+  if (!attachment) return reply.code(404).send({ error: "附件不存在或已被清理" });
   return { attachment };
 });
 
 app.put<{ Params: { id: string; offset: string }; Body: Buffer }>("/api/attachments/:id/chunks/:offset", async (request, reply) => {
   const attachment = database.getAttachment(request.params.id);
-  if (!attachment) return reply.code(404).send({ error: "Attachment not found" });
+  if (!attachment) return reply.code(404).send({ error: "附件不存在或已被清理" });
   const offset = Number(request.params.offset);
   const chunk = request.body;
   if (!Number.isSafeInteger(offset) || offset < 0 || !Buffer.isBuffer(chunk) || chunk.length === 0 || chunk.length > 1024 * 1024) {
-    return reply.code(400).send({ error: "Invalid attachment chunk" });
+    return reply.code(400).send({ error: "附件分片无效" });
   }
-  if (attachment.status !== "uploading") return reply.code(409).send({ error: "Attachment is no longer uploading", receivedSize: attachment.receivedSize });
+  if (attachment.status !== "uploading") return reply.code(409).send({ error: "附件已不处于上传状态", receivedSize: attachment.receivedSize });
   if (offset < attachment.receivedSize && offset + chunk.length <= attachment.receivedSize) {
     return { receivedSize: attachment.receivedSize, deduplicated: true };
   }
   if (offset !== attachment.receivedSize) {
-    return reply.code(409).send({ error: "Unexpected chunk offset", receivedSize: attachment.receivedSize });
+    return reply.code(409).send({ error: "附件分片位置不匹配，请从服务端记录的位置继续上传", receivedSize: attachment.receivedSize });
   }
   const filePath = path.join(config.attachmentDirectory, attachment.storageKey);
   const file = openSync(filePath, "r+");
   try { writeSync(file, chunk, 0, chunk.length, offset); } finally { closeSync(file); }
   const updated = database.updateAttachmentOffset(attachment.id, offset, chunk.length);
-  if (!updated) return reply.code(409).send({ error: "Attachment offset changed; retry this chunk" });
+  if (!updated) return reply.code(409).send({ error: "附件上传位置已变化，请重试当前分片" });
   return { receivedSize: updated.receivedSize, deduplicated: false };
 });
 
 app.post<{ Params: { id: string }; Body: { sha256?: string } }>("/api/attachments/:id/finalize", async (request, reply) => {
   const attachment = database.getAttachment(request.params.id);
-  if (!attachment) return reply.code(404).send({ error: "Attachment not found" });
+  if (!attachment) return reply.code(404).send({ error: "附件不存在或已被清理" });
   if (attachment.status === "ready") return { attachment };
   if (attachment.status !== "uploading" || attachment.receivedSize !== attachment.size) {
-    return reply.code(409).send({ error: "Attachment upload is incomplete", receivedSize: attachment.receivedSize });
+    return reply.code(409).send({ error: "附件尚未上传完成", receivedSize: attachment.receivedSize });
   }
   const temporaryPath = path.join(config.attachmentDirectory, attachment.storageKey);
   const finalKey = `${attachment.id}.bin`;
   const finalPath = path.join(config.attachmentDirectory, finalKey);
   const readablePath = existsSync(temporaryPath) ? temporaryPath : finalPath;
   if (!existsSync(readablePath) || statSync(readablePath).size !== attachment.size) {
-    return reply.code(409).send({ error: "Attachment data is incomplete" });
+    return reply.code(409).send({ error: "附件数据不完整" });
   }
   const digest = createHash("sha256").update(readFileSync(readablePath)).digest("hex");
   if (request.body?.sha256 && request.body.sha256.toLowerCase() !== digest) {
-    return reply.code(422).send({ error: "Attachment checksum mismatch" });
+    return reply.code(422).send({ error: "附件校验失败，请重新上传" });
   }
   if (existsSync(temporaryPath)) renameSync(temporaryPath, finalPath);
-  else if (!existsSync(finalPath)) return reply.code(404).send({ error: "Attachment data is missing" });
+  else if (!existsSync(finalPath)) return reply.code(404).send({ error: "附件文件已丢失" });
   const finalized = database.finalizeAttachment(attachment.id, digest, finalKey);
-  if (!finalized) return reply.code(409).send({ error: "Attachment could not be finalized" });
+  if (!finalized) return reply.code(409).send({ error: "附件状态已变化，无法完成上传" });
   return { attachment: finalized };
 });
 
 app.delete<{ Params: { id: string } }>("/api/attachments/:id", async (request, reply) => {
   const attachment = database.getAttachment(request.params.id);
   if (!attachment) return reply.code(204).send();
-  if (attachment.status === "consumed") return reply.code(409).send({ error: "Attachment is already part of a message" });
+  if (attachment.status === "consumed") return reply.code(409).send({ error: "附件已随消息发送，不能删除" });
   const filePath = path.join(config.attachmentDirectory, attachment.storageKey);
   if (existsSync(filePath)) unlinkSync(filePath);
   database.deleteAttachment(attachment.id);
@@ -1418,11 +1438,11 @@ app.get<{ Params: { id: string }; Querystring: { token?: string } }>("/agent/att
   const attachment = database.getAttachment(request.params.id);
   const downloadToken = bearerToken(request) || request.query.token || "";
   if (!attachment || !downloadToken || !safeTokenEqual(downloadToken, attachment.downloadToken)) {
-    return reply.code(404).send({ error: "Attachment not found" });
+    return reply.code(404).send({ error: "附件不存在或已被清理" });
   }
-  if (!["ready", "consumed"].includes(attachment.status)) return reply.code(409).send({ error: "Attachment is not ready" });
+  if (!["ready", "consumed"].includes(attachment.status)) return reply.code(409).send({ error: "附件尚未准备完成" });
   const filePath = path.join(config.attachmentDirectory, attachment.storageKey);
-  if (!existsSync(filePath)) return reply.code(404).send({ error: "Attachment data is missing" });
+  if (!existsSync(filePath)) return reply.code(404).send({ error: "附件文件已丢失" });
   reply.header("Content-Type", attachment.mediaType);
   reply.header("Content-Length", String(attachment.size));
   return reply.send(createReadStream(filePath));

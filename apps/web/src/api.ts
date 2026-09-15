@@ -24,24 +24,146 @@ export interface AuthSession {
   expiresAt?: string;
 }
 
-async function responseBody<T>(response: Response): Promise<T & { error?: string }> {
+export type ApiErrorKind = "network" | "http" | "invalid-response";
+
+interface ApiErrorOptions {
+  kind: ApiErrorKind;
+  method: string;
+  path: string;
+  status?: number;
+  requestId?: string | null;
+  cause?: unknown;
+}
+
+export class ApiError extends Error {
+  readonly kind: ApiErrorKind;
+  readonly status: number | null;
+  readonly method: string;
+  readonly path: string;
+  readonly requestId: string | null;
+
+  constructor(message: string, options: ApiErrorOptions) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "ApiError";
+    this.kind = options.kind;
+    this.status = options.status ?? null;
+    this.method = options.method;
+    this.path = options.path;
+    this.requestId = options.requestId ?? null;
+  }
+}
+
+type ApiResponseBody<T> = T & { error?: unknown; requestId?: unknown };
+
+function requestMethod(init?: RequestInit): string {
+  return (init?.method ?? "GET").toUpperCase();
+}
+
+function responseRequestId(response: Response, body?: { requestId?: unknown }): string | null {
+  const fromHeader = response.headers.get("X-Request-Id");
+  if (fromHeader) return fromHeader;
+  return typeof body?.requestId === "string" && body.requestId ? body.requestId : null;
+}
+
+async function responseBody<T>(response: Response, method: string, path: string): Promise<ApiResponseBody<T>> {
   if (response.status === 204) return undefined as unknown as T & { error?: string };
   const text = await response.text();
-  if (!text) return undefined as unknown as T & { error?: string };
-  try { return JSON.parse(text) as T & { error?: string }; }
-  catch { return { error: text } as T & { error?: string }; }
+  if (!text) {
+    if (!response.ok) return undefined as unknown as ApiResponseBody<T>;
+    throw new ApiError("控制中心返回了空响应", {
+      kind: "invalid-response",
+      status: response.status,
+      method,
+      path,
+      requestId: responseRequestId(response),
+    });
+  }
+  try {
+    return JSON.parse(text) as ApiResponseBody<T>;
+  } catch (cause) {
+    if (!response.ok) {
+      const contentType = response.headers.get("Content-Type") ?? "";
+      const plainText = contentType.includes("text/plain") && text.length <= 500 ? text.trim() : undefined;
+      return { ...(plainText ? { error: plainText } : {}) } as ApiResponseBody<T>;
+    }
+    throw new ApiError("控制中心返回的响应不是有效 JSON", {
+      kind: "invalid-response",
+      status: response.status,
+      method,
+      path,
+      requestId: responseRequestId(response),
+      cause,
+    });
+  }
+}
+
+function fallbackHttpMessage(status: number): string {
+  if (status === 400) return "请求参数无效";
+  if (status === 401) return "登录状态已失效";
+  if (status === 403) return "当前请求没有访问权限";
+  if (status === 404) return "请求的资源不存在或已被删除";
+  if (status === 409) return "当前状态不允许执行该操作";
+  if (status === 413) return "提交的内容过大";
+  if (status === 422) return "提交的内容无法处理";
+  if (status === 429) return "请求过于频繁，请稍后再试";
+  if (status >= 500) return "控制中心服务异常";
+  return "控制中心拒绝了请求";
+}
+
+function apiErrorMessage(body: { error?: unknown } | undefined, status: number): string {
+  return typeof body?.error === "string" && body.error.trim() ? body.error.trim() : fallbackHttpMessage(status);
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${API_URL}${path}`, { ...init, headers, credentials: "include" });
-  const body = await responseBody<T>(response);
-  if (response.status === 401 && !path.startsWith("/api/auth/")) {
+  const method = requestMethod(init);
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${path}`, { ...init, headers, credentials: "include" });
+  } catch (cause) {
+    throw new ApiError(cause instanceof Error && cause.message ? cause.message : "网络请求失败", {
+      kind: "network",
+      method,
+      path,
+      cause,
+    });
+  }
+  const body = await responseBody<T>(response, method, path);
+  if (response.status === 401 && path !== "/api/auth/login" && path !== "/api/auth/session") {
     window.dispatchEvent(new CustomEvent("controller-center:unauthorized"));
   }
-  if (!response.ok) throw new Error(body?.error ?? `Request failed (${response.status})`);
+  if (!response.ok) throw new ApiError(apiErrorMessage(body, response.status), {
+    kind: "http",
+    status: response.status,
+    method,
+    path,
+    requestId: responseRequestId(response, body),
+  });
   return body as T;
+}
+
+export function formatErrorMessage(reason: unknown, operation: string): string {
+  const prefix = `${operation}失败`;
+  if (!(reason instanceof ApiError)) {
+    const detail = reason instanceof Error ? reason.message : String(reason);
+    return `${prefix}：${detail || "发生未知错误"}`;
+  }
+
+  const request = `${reason.method} ${reason.path}`;
+  const diagnostic = reason.requestId
+    ? `${request} · 请求 ID ${reason.requestId}`
+    : request;
+  if (reason.kind === "network") {
+    return `${prefix}：无法连接控制中心，请检查当前网络、HTTPS 域名或反向代理（${diagnostic}）`;
+  }
+  if (reason.kind === "invalid-response") {
+    return `${prefix}：${reason.message}，请检查反向代理是否返回了错误页面（${diagnostic}）`;
+  }
+  if (reason.status === 401) {
+    return `${prefix}：登录状态已失效，请重新登录（${diagnostic}）`;
+  }
+  return `${prefix}：${reason.message}（HTTP ${reason.status ?? "未知"} · ${diagnostic}）`;
 }
 
 export function getAuthSession(): Promise<AuthSession> {
@@ -290,11 +412,7 @@ export async function createAttachmentUpload(input: {
 
 async function binaryRequest<T>(path: string, body: Blob): Promise<T> {
   const headers = new Headers({ "Content-Type": "application/octet-stream" });
-  const response = await fetch(`${API_URL}${path}`, { method: "PUT", headers, body, credentials: "include" });
-  const result = await responseBody<T>(response);
-  if (response.status === 401) window.dispatchEvent(new CustomEvent("controller-center:unauthorized"));
-  if (!response.ok) throw new Error(result.error ?? `Request failed (${response.status})`);
-  return result;
+  return api<T>(path, { method: "PUT", headers, body });
 }
 
 export async function uploadAttachmentContent(
