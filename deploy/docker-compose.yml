@@ -8,6 +8,7 @@ services:
       CONTROL_HOST: 0.0.0.0
       CONTROL_PORT: 8787
       CONTROL_DATA_DIR: /data
+      AGENT_ARTIFACT_DIR: ${AGENT_ARTIFACT_DIR:-/workspace/artifacts}
       AGENT_SHARED_TOKEN: ${AGENT_SHARED_TOKEN:?set AGENT_SHARED_TOKEN}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       CORS_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}

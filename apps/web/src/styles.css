@@ -971,6 +971,12 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 .workspace-confirm > div { display: flex; justify-content: flex-end; gap: 7px; }
 .enrollment-settings { position: relative; min-width: 0; padding: 31px 36px; overflow-y: auto; }
 .enrollment-settings .settings-copy { margin-bottom: 20px; }
+.agent-package-card { margin-bottom: 10px; padding: 17px 18px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid #bcd4fb; border-radius: 12px; background: #eef5ff; }
+.agent-package-card > div { min-width: 0; display: grid; gap: 5px; }
+.agent-package-card strong { color: #1f3f73; font-size: 12px; }
+.agent-package-card span { color: #526a8d; font-size: 9px; line-height: 1.5; }
+.agent-package-card code { overflow: hidden; color: #647795; font: 8px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.agent-package-card button { flex: 0 0 auto; min-height: 36px; padding: 0 13px; border: 0; border-radius: 8px; white-space: nowrap; }
 .enrollment-create-card { padding: 17px 18px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid #cbdcf4; border-radius: 12px; background: #f7faff; }
 .enrollment-create-card > div { min-width: 0; display: grid; gap: 5px; }
 .enrollment-create-card strong { color: #26364d; font-size: 12px; }
@@ -1332,6 +1338,9 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
   .settings-form > label { grid-template-columns: 1fr; gap: 7px; }
   .workspace-settings { padding: 20px 14px calc(24px + env(safe-area-inset-bottom)); overflow: visible; }
   .enrollment-settings { padding: 20px 14px calc(24px + env(safe-area-inset-bottom)); overflow: visible; }
+  .agent-package-card { align-items: stretch; flex-direction: column; }
+  .agent-package-card code { overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
+  .agent-package-card button { align-self: flex-start; }
   .enrollment-create-card { align-items: stretch; flex-direction: column; }
   .enrollment-create-card button { align-self: flex-start; }
   .enrollment-nodes > header { align-items: flex-start; flex-direction: column; gap: 3px; }

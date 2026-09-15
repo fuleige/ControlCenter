@@ -1,5 +1,6 @@
 import type {
   Approval,
+  AgentPackageInfo,
   AttachmentRecord,
   Conversation,
   ConversationDetail,
@@ -372,6 +373,46 @@ export async function getEnrollmentToken(id: string): Promise<EnrollmentToken> {
 
 export async function revokeEnrollmentToken(id: string): Promise<void> {
   await api<void>(`/api/enrollment-tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function getAgentPackageInfo(): Promise<AgentPackageInfo> {
+  return (await api<{ package: AgentPackageInfo }>("/api/agent-package")).package;
+}
+
+export async function downloadAgentPackage(fileName: string): Promise<void> {
+  const path = "/api/agent-package/download";
+  const method = "GET";
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${path}`, { credentials: "include" });
+  } catch (cause) {
+    throw new ApiError(cause instanceof Error && cause.message ? cause.message : "网络请求失败", {
+      kind: "network",
+      method,
+      path,
+      cause,
+    });
+  }
+  if (!response.ok) {
+    const body = await responseBody<Record<string, never>>(response, method, path);
+    if (response.status === 401) window.dispatchEvent(new CustomEvent("controller-center:unauthorized"));
+    throw new ApiError(apiErrorMessage(body, response.status), {
+      kind: "http",
+      status: response.status,
+      method,
+      path,
+      requestId: responseRequestId(response, body),
+    });
+  }
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }
 
 export async function getTaskCenter(): Promise<{ entries: TaskCenterEntry[]; unreadCount: number; policy: TaskCenterPolicy }> {

@@ -137,6 +137,15 @@ export interface EnrollmentToken {
   nodeId: string | null;
 }
 
+export interface AgentPackageInfo {
+  available: boolean;
+  version: string;
+  fileName: string | null;
+  size: number | null;
+  sha256: string | null;
+  builtAt: string | null;
+}
+
 export interface TaskCenterEntry {
   id: string;
   nodeId: string;

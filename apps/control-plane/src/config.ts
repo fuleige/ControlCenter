@@ -20,6 +20,7 @@ export interface ControlPlaneConfig {
   heartbeatIntervalMs: number;
   offlineAfterMs: number;
   attachmentDirectory: string;
+  agentArtifactDirectory: string;
 }
 
 export function loadConfig(): ControlPlaneConfig {
@@ -43,5 +44,6 @@ export function loadConfig(): ControlPlaneConfig {
     heartbeatIntervalMs: integerEnv("HEARTBEAT_INTERVAL_MS", 15_000),
     offlineAfterMs: integerEnv("OFFLINE_AFTER_MS", 45_000),
     attachmentDirectory: path.join(dataDirectory, "attachments"),
+    agentArtifactDirectory: path.resolve(process.env.AGENT_ARTIFACT_DIR ?? path.join(startupDirectory, "artifacts")),
   };
 }

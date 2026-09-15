@@ -1,6 +1,6 @@
 {
   "name": "controller-center",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -8,7 +8,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/control-plane && npm run build -w @controller-center/agent && npm run build -w @controller-center/web",
+    "build": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/control-plane && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs && npm run build -w @controller-center/web",
+    "package:agent": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "dev:server": "npm run dev -w @controller-center/control-plane",

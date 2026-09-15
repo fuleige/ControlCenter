@@ -23,6 +23,7 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 
 - Web 使用随机管理员 Token 登录，服务端建立 HttpOnly 会话；管理员原始 Token 不进入前端构建、Local Storage 或 URL。
 - Web 可生成 10 分钟有效的节点注册 Token；有效期内可在列表查看、复制和确认注册状态，到期自动删除；Agent 首次注册后使用与固定节点 ID 绑定的独立长期凭证。
+- “设置 → 节点接入”可下载与控制中心同版本的 Linux/macOS Agent 安装包，并展示文件大小与 SHA-256；下载接口沿用管理员登录态，不公开匿名静态地址。
 - Agent 注册、心跳、断线检测和自动重连；迁移期间仍兼容旧共享 Token。
 - Agent 可在启动时显式传入 `--yolo`，以关闭 Codex 审批和沙箱；节点会把当前权限模式上报给中心，Web 在节点名称旁持续显示“全权限”。
 - Agent 统一读取 Linux/macOS CLI 常用的代理环境变量；可通过 `--codex-proxy-only` 让控制中心注册、控制通道和附件下载强制直连，同时只让 Codex 子进程继承系统代理。
@@ -66,6 +67,12 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 ```bash
 npm install
 npm run build
+```
+
+完整构建会同时生成 `artifacts/controller-center-agent-v<版本>.tar.gz`。只需重新构建 Agent 安装包时可执行：
+
+```bash
+npm run package:agent
 ```
 
 终端一，启动控制中心：
@@ -135,13 +142,23 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 
 ### Agent
 
-Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。构建仓库后，将代码与生产依赖复制到 `/opt/controller-center`，参考：
+Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可直接下载当前版本的完整客户端安装包；该包已经包含编译结果和生产依赖，无需在节点上执行 `npm install` 或 TypeScript 编译。
+
+```bash
+cc_agent_archive=controller-center-agent-v0.3.5.tar.gz
+cc_agent_directory=${cc_agent_archive%.tar.gz}
+tar -xzf "$cc_agent_archive"
+sudo mv "$cc_agent_directory" /opt/controller-center-agent
+/opt/controller-center-agent/agent.sh login
+```
+
+也可以在仓库执行 `npm run package:agent` 后，从 `artifacts/` 取得同一压缩包。服务部署参考：
 
 - `deploy/systemd/controller-center-agent.service`
 - `deploy/agent.env.example`
 
 Agent 的运行用户必须对配置的工作区具有适当权限，并且该用户需要完成本地 Codex 登录。`AGENT_DATA_DIR` 不设置时默认使用 `~/.controller-center-agent`，它保存稳定节点身份而不决定默认工作空间；默认工作空间仍由启动目录决定。
-systemd 的 `WorkingDirectory` 决定该节点的默认工作空间；示例中为 `/opt/controller-center`。
+systemd 的 `WorkingDirectory` 决定该节点的默认工作空间；独立包中的示例默认为 `/opt/controller-center-agent`，正式部署时应改成希望交给 Codex 使用的工作目录。
 仓库中的 systemd 示例已在 Agent 启动命令末尾添加 `--yolo --codex-proxy-only`；若节点需要审批和沙箱保护，删除 `--yolo`，若控制中心流量也应使用代理则删除 `--codex-proxy-only`。
 客户端运行与注册支持的完整参数列表见 [Agent 客户端命令与配置](docs/agent-cli.md)。
 
@@ -176,6 +193,7 @@ npm run agent:enroll -- --server https://control.example.com --codex-proxy-only
 | `ADMIN_TOKEN` | 空 | 仅在管理员 Token 文件尚不存在时作为首次引导值；通常留空自动生成 |
 | `ADMIN_TOKEN_FILE` | `<CONTROL_DATA_DIR>/secrets/admin-token` | 本机可查询的管理员原始 Token 文件，权限 `0600` |
 | `ENROLLMENT_DISPLAY_KEY_FILE` | `<CONTROL_DATA_DIR>/secrets/enrollment-display-key` | 注册 Token 临时展示内容的本机加密密钥，权限 `0600` |
+| `AGENT_ARTIFACT_DIR` | `<启动命令所在目录>/artifacts` | 供已登录管理员下载的 Agent 安装包目录；文件名必须与当前 Agent 版本一致 |
 | `PUBLIC_ORIGIN` | 与 `CORS_ORIGIN` 相同 | 浏览器访问的公开 Origin；HTTPS 时启用 Secure 会话 Cookie |
 | `TRUST_PROXY` | `false` | 控制面仅位于可信反向代理之后时设为 `true`，用于正确识别登录限流来源 IP |
 | `CORS_ORIGIN` | `http://localhost:5173` | 允许的 Web Origin，逗号分隔 |
@@ -218,6 +236,8 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 - `GET /api/approvals?status=pending`
 - `POST /api/approvals/:id/resolve`
 - `GET/PATCH /api/settings`
+- `GET /api/agent-package`（当前 Agent 安装包版本、大小和 SHA-256）
+- `GET /api/agent-package/download`（登录后下载当前版本安装包）
 - `GET/POST /api/enrollment-tokens`（管理员创建与查看注册状态）
 - `DELETE /api/enrollment-tokens/:id`（撤销尚未使用的注册 Token）
 - `GET /api/task-center`

@@ -17,6 +17,7 @@ import {
   type ReasoningEffort,
 } from "@controller-center/protocol";
 import { loadConfig } from "./config.js";
+import { findAgentPackage } from "./agent-package.js";
 import { AgentConnections } from "./connections.js";
 import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type MessageListCursor, type WorkspaceRecord } from "./database.js";
 import { UiEventBus } from "./event-bus.js";
@@ -35,6 +36,8 @@ import {
 } from "./auth.js";
 
 const config = loadConfig();
+const controlPlanePackage = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+const agentPackageVersion = controlPlanePackage.version;
 const database = new ControlDatabase(config.databasePath);
 ensureAdminToken(database, config.adminTokenPath, config.adminToken);
 const enrollmentDisplayKey = ensureEnrollmentDisplayKey(config.enrollmentDisplayKeyPath);
@@ -53,7 +56,7 @@ await app.register(cors, {
     ? true
     : config.corsOrigin.split(",").map((value) => value.trim()),
   credentials: true,
-  exposedHeaders: ["X-Request-Id"],
+  exposedHeaders: ["X-Request-Id", "Content-Disposition"],
 });
 await app.register(websocket, { options: { maxPayload: 16 * 1024 * 1024 } });
 
@@ -541,6 +544,39 @@ app.post("/api/auth/logout", async (request, reply) => {
   if (session) database.revokeAdminSession(session.id, now());
   reply.header("Set-Cookie", sessionCookie("", 0));
   return reply.code(204).send();
+});
+
+app.get("/api/agent-package", async (_request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  const descriptor = findAgentPackage(config.agentArtifactDirectory, agentPackageVersion);
+  return {
+    package: descriptor ? {
+      available: true,
+      version: descriptor.version,
+      fileName: descriptor.fileName,
+      size: descriptor.size,
+      sha256: descriptor.sha256,
+      builtAt: descriptor.builtAt,
+    } : {
+      available: false,
+      version: agentPackageVersion,
+      fileName: null,
+      size: null,
+      sha256: null,
+      builtAt: null,
+    },
+  };
+});
+
+app.get("/api/agent-package/download", async (_request, reply) => {
+  const descriptor = findAgentPackage(config.agentArtifactDirectory, agentPackageVersion);
+  if (!descriptor) return reply.code(404).send({ error: `Agent v${agentPackageVersion} 客户端安装包尚未生成` });
+  reply.header("Cache-Control", "private, no-cache");
+  reply.header("Content-Type", "application/gzip");
+  reply.header("Content-Length", String(descriptor.size));
+  reply.header("Content-Disposition", `attachment; filename="${descriptor.fileName}"`);
+  reply.header("X-Content-Type-Options", "nosniff");
+  return reply.send(createReadStream(descriptor.filePath));
 });
 
 app.get("/api/enrollment-tokens", async (_request, reply) => {

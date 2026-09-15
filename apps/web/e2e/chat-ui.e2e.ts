@@ -135,8 +135,8 @@ async function mockControlCenter(page: Page) {
   const presenceReports: Array<{ conversationId?: string | null; visible?: boolean }> = [];
   const quickSearchRequests: string[] = [];
   await page.addInitScript(() => {
-    localStorage.setItem("controller-center:selected-node", "qa-node");
-    localStorage.setItem("controller-center:selected-conversation", "qa-conversation");
+    sessionStorage.setItem("controller-center:selected-node", "qa-node");
+    sessionStorage.setItem("controller-center:selected-conversation", "qa-conversation");
   });
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
@@ -326,7 +326,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
   await globalNavigation.getByRole("button", { name: "设置" }).click();
   await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
-  await expect(page.locator(".settings-version")).toContainText("v0.3.4");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.5");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -415,8 +415,10 @@ test("后台运行会话的延迟刷新不会抢回当前会话", async ({ page 
   };
 
   await page.addInitScript(({ nodeId, conversationId }) => {
-    localStorage.setItem("controller-center:selected-node", nodeId);
-    localStorage.setItem("controller-center:selected-conversation", conversationId);
+    if (!sessionStorage.getItem("controller-center:selected-node")) {
+      sessionStorage.setItem("controller-center:selected-node", nodeId);
+      sessionStorage.setItem("controller-center:selected-conversation", conversationId);
+    }
   }, { nodeId: node.id, conversationId: backgroundConversation.id });
 
   await page.route("**/api/**", async (route) => {
@@ -492,11 +494,124 @@ test("后台运行会话的延迟刷新不会抢回当前会话", async ({ page 
   await expect(page.locator(".conversation-card").filter({ hasText: backgroundConversation.title })).not.toHaveClass(/selected/);
 });
 
+test("在不同节点之间切换时恢复各自最后打开的会话", async ({ page }, testInfo) => {
+  const secondNode = {
+    ...node,
+    id: "build-node",
+    name: "构建节点",
+    reportedName: "build-node",
+    workspaces: node.workspaces.map((workspace) => ({
+      ...workspace,
+      id: "build-workspace",
+      nodeId: "build-node",
+      name: "构建工作区",
+      path: "/workspace/build",
+    })),
+  };
+  const firstConversation = {
+    ...conversation,
+    id: "node-a-conversation",
+    title: "节点 A 上次打开的会话",
+    latestRunStatus: "completed",
+  };
+  const secondConversation = {
+    ...conversation,
+    id: "node-b-conversation",
+    nodeId: secondNode.id,
+    workspaceId: secondNode.workspaces[0]!.id,
+    title: "节点 B 上次打开的会话",
+    latestRunStatus: "completed",
+  };
+  const detailFor = (selected: typeof firstConversation) => ({
+    conversation: selected,
+    runs: [],
+    approvals: [],
+    attachments: [],
+    messagePage: { hasMore: false, before: null },
+    messages: [{
+      id: `${selected.id}-message`,
+      conversationId: selected.id,
+      runId: null,
+      role: "assistant",
+      content: `${selected.title}的内容`,
+      revision: 1,
+      complete: true,
+      attachmentIds: [],
+      createdAt: now,
+      updatedAt: now,
+    }],
+  });
+
+  await page.addInitScript(({ nodeId, conversationId }) => {
+    if (!sessionStorage.getItem("controller-center:selected-node")) {
+      sessionStorage.setItem("controller-center:selected-node", nodeId);
+      sessionStorage.setItem("controller-center:selected-conversation", conversationId);
+    }
+  }, { nodeId: node.id, conversationId: firstConversation.id });
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
+    } else if (url.pathname === "/api/stream") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
+    } else if (url.pathname === "/api/nodes") {
+      await route.fulfill({ json: { data: [node, secondNode] } });
+    } else if (url.pathname === "/api/conversations") {
+      const nodeId = url.searchParams.get("nodeId");
+      const data = nodeId === node.id ? [firstConversation] : nodeId === secondNode.id ? [secondConversation] : [];
+      await route.fulfill({ json: { data, total: data.length, nextCursor: null } });
+    } else if (url.pathname === `/api/conversations/${firstConversation.id}`) {
+      await route.fulfill({ json: detailFor(firstConversation) });
+    } else if (url.pathname === `/api/conversations/${secondConversation.id}`) {
+      await route.fulfill({ json: detailFor(secondConversation) });
+    } else if (url.pathname === "/api/approvals") {
+      await route.fulfill({ json: { data: [] } });
+    } else if (url.pathname === "/api/settings") {
+      await route.fulfill({ json: { settings: { defaultModel: null, defaultEffort: null } } });
+    } else if (url.pathname === "/api/task-center") {
+      await route.fulfill({ json: { data: [], unreadCount: 0 } });
+    } else {
+      await route.fulfill({ status: 204 });
+    }
+  });
+
+  async function switchNode(name: string): Promise<void> {
+    const trigger = testInfo.project.name === "desktop"
+      ? page.locator(".node-footer").getByRole("button", { name: /快速切换/ })
+      : page.locator(".mobile-topbar").getByRole("button", { name: "快速切换" });
+    await trigger.click();
+    const switcher = page.getByRole("dialog", { name: "快速切换" });
+    await switcher.getByRole("textbox", { name: "搜索节点或历史会话" }).fill(name);
+    await switcher.locator("button").filter({ hasText: name }).click();
+  }
+
+  await page.goto("/");
+  await expect(page.locator(".chat-title strong")).toHaveText(firstConversation.title);
+
+  await switchNode(secondNode.name);
+  await expect(page.getByRole("heading", { name: "开始一个新会话" })).toBeVisible();
+  if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "打开历史会话" }).click();
+  await page.locator(".conversation-card").filter({ hasText: secondConversation.title }).click();
+  await expect(page.locator(".chat-title strong")).toHaveText(secondConversation.title);
+
+  await switchNode(node.name);
+  await expect(page.locator(".chat-title strong")).toHaveText(firstConversation.title);
+  await switchNode(secondNode.name);
+  await expect(page.locator(".chat-title strong")).toHaveText(secondConversation.title);
+
+  expect(await page.evaluate((nodeId) => sessionStorage.getItem(`controller-center:selected-conversation-by-node:${encodeURIComponent(nodeId)}`), node.id)).toBe(firstConversation.id);
+  expect(await page.evaluate((nodeId) => sessionStorage.getItem(`controller-center:selected-conversation-by-node:${encodeURIComponent(nodeId)}`), secondNode.id)).toBe(secondConversation.id);
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem("controller-center:selected-node"))).toBe(secondNode.id);
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem("controller-center:selected-conversation"))).toBe(secondConversation.id);
+  await page.reload();
+  await expect(page.locator(".chat-title strong")).toHaveText(secondConversation.title);
+});
+
 test("本地缓存的会话已被删除时自动回到当前节点的新会话", async ({ page }) => {
   const missingConversationId = "deleted-conversation";
   await page.addInitScript(({ nodeId, conversationId }) => {
-    localStorage.setItem("controller-center:selected-node", nodeId);
-    localStorage.setItem("controller-center:selected-conversation", conversationId);
+    sessionStorage.setItem("controller-center:selected-node", nodeId);
+    sessionStorage.setItem("controller-center:selected-conversation", conversationId);
   }, { nodeId: node.id, conversationId: missingConversationId });
 
   await page.route("**/api/**", async (route) => {
@@ -525,15 +640,16 @@ test("本地缓存的会话已被删除时自动回到当前节点的新会话",
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "开始一个新会话" })).toBeVisible();
   await expect(page.locator(".connection-banner")).toHaveCount(0);
-  await expect.poll(() => page.evaluate(() => localStorage.getItem("controller-center:selected-conversation"))).toBeNull();
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem("controller-center:selected-conversation"))).toBeNull();
+  await expect.poll(() => page.evaluate((nodeId) => sessionStorage.getItem(`controller-center:selected-conversation-by-node:${encodeURIComponent(nodeId)}`), node.id)).toBeNull();
   await expect(page.locator(".node-card").filter({ hasText: node.name })).toHaveClass(/selected/);
 });
 
 test("后台刷新显示真实错误上下文并在重试成功后清除", async ({ page }) => {
   let conversationRequests = 0;
   await page.addInitScript((nodeId) => {
-    localStorage.setItem("controller-center:selected-node", nodeId);
-    localStorage.removeItem("controller-center:selected-conversation");
+    sessionStorage.setItem("controller-center:selected-node", nodeId);
+    sessionStorage.removeItem("controller-center:selected-conversation");
   }, node.id);
 
   await page.route("**/api/**", async (route) => {
@@ -594,8 +710,8 @@ test("新会话创建结果不会抢占用户后来选择的会话", async ({ pa
   let conversationCreated = false;
 
   await page.addInitScript((nodeId) => {
-    localStorage.setItem("controller-center:selected-node", nodeId);
-    localStorage.removeItem("controller-center:selected-conversation");
+    sessionStorage.setItem("controller-center:selected-node", nodeId);
+    sessionStorage.removeItem("controller-center:selected-conversation");
   }, node.id);
 
   await page.route("**/api/**", async (route) => {
@@ -723,6 +839,21 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
       await route.fulfill({ json: { settings: { defaultModel: null, defaultEffort: null } } });
     } else if (url.pathname === "/api/task-center") {
       await route.fulfill({ json: { data: [], unreadCount: 0 } });
+    } else if (url.pathname === "/api/agent-package/download") {
+      await route.fulfill({
+        contentType: "application/gzip",
+        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.5.tar.gz\"" },
+        body: "portable-agent-package",
+      });
+    } else if (url.pathname === "/api/agent-package") {
+      await route.fulfill({ json: { package: {
+        available: true,
+        version: "0.3.5",
+        fileName: "controller-center-agent-v0.3.5.tar.gz",
+        size: 580_000,
+        sha256: "cb9bd8bd4ff984ee13b78a4f9b1ff9a72b950ed2a468d69e20fc0abe1bda2aa6",
+        builtAt: now,
+      } } });
     } else if (url.pathname === "/api/enrollment-tokens" && route.request().method() === "POST") {
       created = true;
       await route.fulfill({ status: 201, json: { enrollment: enrollment(), token: registrationToken } });
@@ -736,6 +867,10 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
+  await expect(page.getByText("v0.3.5 · 566 KB · Linux / macOS")).toBeVisible();
+  const downloadStarted = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载客户端" }).click();
+  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.5.tar.gz");
   await page.getByRole("button", { name: "生成注册 Token" }).click();
   await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
   await expect(page.getByText(registrationToken)).toBeVisible();

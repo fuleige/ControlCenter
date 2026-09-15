@@ -1,8 +1,23 @@
 # Agent 客户端命令与配置
 
-本文档对应 Controller Center `v0.3.4`，适用于 Linux 和 macOS 上直接运行的 Node Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
+本文档对应 Controller Center `v0.3.5`，适用于 Linux 和 macOS 上直接运行的 Node Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
 
 `AGENT_DATA_DIR` 不是必填项，省略时使用当前用户的 `~/.controller-center-agent`。它保存节点 ID、注册凭证、可靠队列和附件缓存，必须在注册与后续启动之间保持不变。它不决定 Codex 工作空间：Agent 的启动目录才是默认工作空间。正式使用不建议把状态默认放到当前目录，否则从不同项目启动时可能产生不同节点身份；隔离测试时可以显式指定当前目录下的绝对路径，例如先执行 `export AGENT_DATA_DIR="$PWD/test-data"`。
+
+## 获取和安装
+
+登录 Controller Center Web，进入“设置 → 节点接入”，可下载与控制中心同版本的 Linux/macOS 客户端。安装包已经包含编译结果和生产依赖，目标机器只需安装满足版本要求的 Node.js，不需要再次执行 `npm install` 或编译源码。
+
+```bash
+cc_agent_archive=controller-center-agent-v0.3.5.tar.gz
+cc_agent_directory=${cc_agent_archive%.tar.gz}
+tar -xzf "$cc_agent_archive"
+sudo mv "$cc_agent_directory" /opt/controller-center-agent
+/opt/controller-center-agent/agent.sh login
+/opt/controller-center-agent/agent.sh start
+```
+
+源码仓库执行 `npm run build` 时会自动生成 `artifacts/controller-center-agent-v<版本>.tar.gz`；只构建客户端包可执行 `npm run package:agent`。下载页同时展示 SHA-256，可在节点上用 `sha256sum`（Linux）或 `shasum -a 256`（macOS）核对。
 
 ## 快捷脚本
 
@@ -32,7 +47,7 @@ cd /path/to/workspace
 /opt/controller-center-agent/agent.sh start
 ```
 
-下面的 npm/Node 命令保留作为开发、排障和 systemd 配置参考。
+下面的 npm/Node 命令保留作为源码开发、排障和 systemd 配置参考。
 
 ## 1. 日常运行 Agent
 
@@ -154,9 +169,9 @@ Agent 不会记录、上报或写入数据库中的代理 URL 和认证信息。
 
 ```ini
 [Service]
-WorkingDirectory=/opt/controller-center
+WorkingDirectory=/path/to/default-workspace
 EnvironmentFile=/etc/controller-center/agent.env
-ExecStart=/usr/bin/node /opt/controller-center/apps/agent/dist/index.js --yolo --codex-proxy-only
+ExecStart=/usr/bin/node /opt/controller-center-agent/dist/index.js --yolo --codex-proxy-only
 ```
 
 - 需要 Codex 审批与沙箱：删除 `--yolo`。

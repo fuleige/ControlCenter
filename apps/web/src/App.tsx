@@ -24,8 +24,10 @@ import {
   deleteNodeWorkspace,
   createAttachmentUpload,
   deleteAttachmentUpload,
+  downloadAgentPackage,
   getConversation,
   getAuthSession,
+  getAgentPackageInfo,
   getSettings,
   getTaskCenter,
   interruptRun,
@@ -57,6 +59,7 @@ import {
 } from "./api";
 import type {
   Approval,
+  AgentPackageInfo,
   AttachmentRecord,
   Conversation,
   ConversationDetail,
@@ -83,6 +86,7 @@ interface BackgroundIssue {
 
 const selectedNodeStorageKey = "controller-center:selected-node";
 const selectedConversationStorageKey = "controller-center:selected-conversation";
+const nodeConversationStorageKeyPrefix = "controller-center:selected-conversation-by-node:";
 const draftRequestStorageKey = "controller-center:draft-request";
 const nodesCollapsedStorageKey = "controller-center:nodes-collapsed";
 const historyCollapsedStorageKey = "controller-center:history-collapsed";
@@ -106,8 +110,25 @@ function storeValue(key: string, value: string | null): void {
   }
 }
 
+function sessionStoredValue(key: string): string | null {
+  try { return window.sessionStorage.getItem(key); } catch { return null; }
+}
+
+function sessionStoreValue(key: string, value: string | null): void {
+  try {
+    if (value) window.sessionStorage.setItem(key, value);
+    else window.sessionStorage.removeItem(key);
+  } catch {
+    // Storage can be unavailable in private or embedded browser contexts.
+  }
+}
+
 function storedBoolean(key: string): boolean {
   return storedValue(key) === "true";
+}
+
+function nodeConversationStorageKey(nodeId: string): string {
+  return `${nodeConversationStorageKeyPrefix}${encodeURIComponent(nodeId)}`;
 }
 
 function newDraftRequestId(): string {
@@ -1007,6 +1028,11 @@ function enrollmentCountdown(expiresAt: string, clock: number): string {
   return `${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, "0")}`;
 }
 
+function formatFileSize(size: number): string {
+  if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
 function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; onNodesChanged: () => Promise<void> | void }) {
   const [entries, setEntries] = useState<EnrollmentToken[]>([]);
   const [busy, setBusy] = useState(false);
@@ -1015,6 +1041,10 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [confirmNodeId, setConfirmNodeId] = useState<string | null>(null);
   const [clock, setClock] = useState(Date.now());
+  const [agentPackage, setAgentPackage] = useState<AgentPackageInfo | null>(null);
+  const [packageLoading, setPackageLoading] = useState(true);
+  const [packageDownloading, setPackageDownloading] = useState(false);
+  const [packageError, setPackageError] = useState<string | null>(null);
   const usedIds = useRef(new Set<string>());
   const refreshRevision = useRef(0);
 
@@ -1053,6 +1083,33 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
     }, 1_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    void getAgentPackageInfo().then((result) => {
+      if (!active) return;
+      setAgentPackage(result);
+      setPackageError(null);
+    }).catch((reason) => {
+      if (active) setPackageError(formatErrorMessage(reason, "读取 Agent 安装包"));
+    }).finally(() => {
+      if (active) setPackageLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
+
+  async function downloadPackage(): Promise<void> {
+    if (!agentPackage?.available || !agentPackage.fileName) return;
+    setPackageDownloading(true);
+    setPackageError(null);
+    try {
+      await downloadAgentPackage(agentPackage.fileName);
+    } catch (reason) {
+      setPackageError(formatErrorMessage(reason, "下载 Agent 安装包"));
+    } finally {
+      setPackageDownloading(false);
+    }
+  }
 
   async function create(): Promise<void> {
     setBusy(true);
@@ -1098,11 +1155,22 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
 
   return <section className="enrollment-settings">
     <div className="settings-copy"><h3>节点接入</h3><p>生成一次性注册 Token，让新 Agent 建立自己的长期身份。有效期 10 分钟，倒计时结束后自动删除清理。</p></div>
+    <div className="agent-package-card">
+      <div>
+        <strong>Agent 客户端安装包</strong>
+        {packageLoading
+          ? <span>正在读取安装包信息…</span>
+          : agentPackage?.available
+            ? <><span>v{agentPackage.version} · {agentPackage.size !== null ? formatFileSize(agentPackage.size) : "大小未知"} · Linux / macOS</span><code title={agentPackage.sha256 ?? undefined}>SHA-256 {agentPackage.sha256}</code></>
+            : <span>v{agentPackage?.version ?? __APP_VERSION__} 安装包尚未构建，请在服务端执行 npm run package:agent。</span>}
+      </div>
+      <button type="button" className="primary-button" disabled={packageLoading || packageDownloading || !agentPackage?.available} onClick={() => void downloadPackage()}>{packageDownloading ? "下载中…" : "下载客户端"}</button>
+    </div>
     <div className="enrollment-create-card">
       <div><strong>注册新节点</strong><span>在目标机器准备好控制中心 HTTPS 地址，然后粘贴这里生成的 Token。</span></div>
       <button type="button" className="primary-button" disabled={busy} onClick={() => void create()}>{busy ? "生成中…" : "生成注册 Token"}</button>
     </div>
-    {(error ?? refreshError) && <p className="form-error workspace-settings-error">{error ?? refreshError}</p>}
+    {(error ?? refreshError ?? packageError) && <p className="form-error workspace-settings-error">{error ?? refreshError ?? packageError}</p>}
     {nodes.length > 0 && <div className="enrollment-nodes">
       <header><strong>已登记节点</strong><span>丢失或停用节点时应立即撤销其长期凭证</span></header>
       {nodes.map((node) => <article key={node.id}>
@@ -1969,12 +2037,12 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const [quickError, setQuickError] = useState<string | null>(null);
   const [primaryView, setPrimaryView] = useState<"workspace" | "tasks">("workspace");
   const [overlay, setOverlay] = useState<"settings" | "switcher" | null>(null);
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(() => storedValue(selectedNodeStorageKey));
-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(() => storedValue(selectedConversationStorageKey));
-  const [draftRequestId, setDraftRequestId] = useState(() => storedValue(draftRequestStorageKey) ?? newDraftRequestId());
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(() => sessionStoredValue(selectedNodeStorageKey));
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(() => sessionStoredValue(selectedConversationStorageKey));
+  const [draftRequestId, setDraftRequestId] = useState(() => sessionStoredValue(draftRequestStorageKey) ?? newDraftRequestId());
   const [nodesCollapsed, setNodesCollapsed] = useState(() => storedBoolean(nodesCollapsedStorageKey));
   const [historyCollapsed, setHistoryCollapsed] = useState(() => storedBoolean(historyCollapsedStorageKey));
-  const [mobilePane, setMobilePane] = useState<MobilePane>(() => storedValue(selectedConversationStorageKey) ? "chat" : "nodes");
+  const [mobilePane, setMobilePane] = useState<MobilePane>(() => sessionStoredValue(selectedConversationStorageKey) ? "chat" : "nodes");
   const [streamConnected, setStreamConnected] = useState(false);
   const [backgroundIssues, setBackgroundIssues] = useState<Partial<Record<BackgroundIssueSource, BackgroundIssue>>>({});
   const selectedNodeIdRef = useRef(selectedNodeId);
@@ -2025,6 +2093,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
 
   const commitSelectedConversation = useCallback((conversationId: string | null) => {
     selectedConversationIdRef.current = conversationId;
+    const nodeId = selectedNodeIdRef.current;
+    if (nodeId) sessionStoreValue(nodeConversationStorageKey(nodeId), conversationId);
     conversationDetailRequestRef.current += 1;
     conversationDetailAppliedRef.current = conversationDetailRequestRef.current;
     setSelectedConversationId(conversationId);
@@ -2153,6 +2223,14 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     try {
       const result = await getConversation(requestedConversationId);
       if (selectedConversationIdRef.current === requestedConversationId && requestRevision > conversationDetailAppliedRef.current) {
+        if (result.conversation.nodeId !== selectedNodeIdRef.current) {
+          conversationDetailAppliedRef.current = requestRevision;
+          clearBackgroundIssue("detail");
+          commitSelectedConversation(null);
+          setDetail(null);
+          commitDraftRequestId(newDraftRequestId());
+          return;
+        }
         conversationDetailAppliedRef.current = requestRevision;
         setDetail((current) => mergedConversationDetail(current, result));
         clearBackgroundIssue("detail");
@@ -2297,9 +2375,12 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     }
   }, [nodes, selectedNodeId, commitSelectedNode, commitSelectedConversation, commitDraftRequestId]);
 
-  useEffect(() => storeValue(selectedNodeStorageKey, selectedNodeId), [selectedNodeId]);
-  useEffect(() => storeValue(selectedConversationStorageKey, selectedConversationId), [selectedConversationId]);
-  useEffect(() => storeValue(draftRequestStorageKey, draftRequestId), [draftRequestId]);
+  useEffect(() => sessionStoreValue(selectedNodeStorageKey, selectedNodeId), [selectedNodeId]);
+  useEffect(() => sessionStoreValue(selectedConversationStorageKey, selectedConversationId), [selectedConversationId]);
+  useEffect(() => {
+    if (selectedNodeId) sessionStoreValue(nodeConversationStorageKey(selectedNodeId), selectedConversationId);
+  }, [selectedConversationId, selectedNodeId]);
+  useEffect(() => sessionStoreValue(draftRequestStorageKey, draftRequestId), [draftRequestId]);
   useEffect(() => storeValue(nodesCollapsedStorageKey, String(nodesCollapsed)), [nodesCollapsed]);
   useEffect(() => storeValue(historyCollapsedStorageKey, String(historyCollapsed)), [historyCollapsed]);
 
@@ -2477,8 +2558,9 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     conversationFilterRef.current = "all";
     setConversationSearch("");
     setConversationFilter("all");
+    const rememberedConversationId = sessionStoredValue(nodeConversationStorageKey(node.id));
     commitSelectedNode(node.id);
-    commitSelectedConversation(null);
+    commitSelectedConversation(rememberedConversationId);
     setConversations([]);
     setDetail(null);
     commitDraftRequestId(newDraftRequestId());
