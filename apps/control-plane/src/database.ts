@@ -3,6 +3,8 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AgentErrorPayload,
+  ConversationCompaction,
+  ConversationCompactionPayload,
   ConversationTokenUsage,
   ConversationTokenUsagePayload,
   InteractionRequestedPayload,
@@ -13,6 +15,7 @@ import type {
   RunProgressPayload,
   RunFinishedPayload,
   RunStartedPayload,
+  RunErrorCode,
   WorkspaceSource,
   WorkspaceStatus,
 } from "@controller-center/protocol";
@@ -69,6 +72,7 @@ export interface ConversationRecord {
   pinnedAt: string | null;
   latestRunStatus: RunRecord["status"] | null;
   tokenUsage: ConversationTokenUsage | null;
+  compaction: ConversationCompaction | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -110,6 +114,7 @@ export interface RunRecord {
   progressUpdatedAt: string | null;
   recoveryDeadlineAt: string | null;
   error: string | null;
+  errorCode: RunErrorCode | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -267,6 +272,39 @@ function conversationTokenUsage(value: unknown): ConversationTokenUsage | null {
   }
 }
 
+const compactionStatuses = new Set<ConversationCompaction["status"]>([
+  "queued", "dispatching", "running", "recovering", "completed", "failed",
+]);
+
+function conversationCompaction(value: unknown): ConversationCompaction | null {
+  if (value === null || value === undefined) return null;
+  try {
+    const compaction = parseJson(value) as Partial<ConversationCompaction>;
+    if (!compaction || typeof compaction !== "object"
+      || typeof compaction.id !== "string" || !compaction.id
+      || typeof compaction.status !== "string" || !compactionStatuses.has(compaction.status as ConversationCompaction["status"])
+      || typeof compaction.requestedAt !== "string") return null;
+    return {
+      id: compaction.id,
+      status: compaction.status as ConversationCompaction["status"],
+      beforeContextTokens: Number.isSafeInteger(compaction.beforeContextTokens) && Number(compaction.beforeContextTokens) >= 0
+        ? Number(compaction.beforeContextTokens)
+        : null,
+      afterContextTokens: Number.isSafeInteger(compaction.afterContextTokens) && Number(compaction.afterContextTokens) >= 0
+        ? Number(compaction.afterContextTokens)
+        : null,
+      errorCode: typeof compaction.errorCode === "string" ? compaction.errorCode as RunErrorCode : null,
+      error: typeof compaction.error === "string" ? compaction.error : null,
+      requestedAt: compaction.requestedAt,
+      startedAt: typeof compaction.startedAt === "string" ? compaction.startedAt : null,
+      finishedAt: typeof compaction.finishedAt === "string" ? compaction.finishedAt : null,
+      recoveryDeadlineAt: typeof compaction.recoveryDeadlineAt === "string" ? compaction.recoveryDeadlineAt : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function notificationPreview(value: string | null): string | null {
   if (!value) return null;
   const compact = value
@@ -296,6 +334,7 @@ export class ControlDatabase {
         UPDATE runs SET status = 'recovering', recovery_deadline_at = ?
         WHERE status IN ('dispatching', 'running', 'waiting_approval')
       `).run(recoveryDeadline);
+      this.markCompactionsRecovering(null, recoveryDeadline);
     }
   }
 
@@ -361,6 +400,7 @@ export class ControlDatabase {
         remote_thread_id TEXT,
         status TEXT NOT NULL,
         error TEXT,
+        compaction_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -374,6 +414,7 @@ export class ControlDatabase {
         remote_turn_id TEXT,
         status TEXT NOT NULL,
         error TEXT,
+        error_code TEXT,
         created_at TEXT NOT NULL,
         started_at TEXT,
         finished_at TEXT
@@ -528,11 +569,13 @@ export class ControlDatabase {
     this.ensureColumn("conversations", "client_request_id", "TEXT");
     this.ensureColumn("conversations", "pinned_at", "TEXT");
     this.ensureColumn("conversations", "token_usage_json", "TEXT");
+    this.ensureColumn("conversations", "compaction_json", "TEXT");
     this.ensureColumn("runs", "client_request_id", "TEXT");
     this.ensureColumn("runs", "progress_phase", "TEXT");
     this.ensureColumn("runs", "progress_label", "TEXT");
     this.ensureColumn("runs", "progress_updated_at", "TEXT");
     this.ensureColumn("runs", "recovery_deadline_at", "TEXT");
+    this.ensureColumn("runs", "error_code", "TEXT");
     this.ensureColumn("approvals", "summary", "TEXT NOT NULL DEFAULT '需要你的确认'");
     this.ensureColumn("approvals", "risk", "TEXT");
     this.ensureColumn("enrollment_tokens", "token_ciphertext", "TEXT");
@@ -750,6 +793,7 @@ export class ControlDatabase {
         WHERE conversation_id IN (SELECT id FROM conversations WHERE node_id = ?)
           AND status IN ('dispatching', 'running', 'waiting_approval')
       `).run(recoveryDeadline, node.id);
+      this.markCompactionsRecovering(node.id, recoveryDeadline);
     }
     return restarted;
   }
@@ -772,6 +816,7 @@ export class ControlDatabase {
         WHERE conversation_id IN (SELECT id FROM conversations WHERE node_id = ?)
           AND status IN ('dispatching', 'running', 'waiting_approval')
       `).run(deadline, nodeId);
+      this.markCompactionsRecovering(nodeId, deadline);
       this.sqlite.exec("COMMIT");
     } catch (error) {
       this.sqlite.exec("ROLLBACK");
@@ -934,8 +979,8 @@ export class ControlDatabase {
     this.sqlite.prepare(`
       INSERT INTO conversations (
         id, node_id, workspace_id, title, model, effort, client_request_id,
-        remote_thread_id, status, error, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        remote_thread_id, status, error, compaction_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id,
       record.nodeId,
@@ -947,6 +992,7 @@ export class ControlDatabase {
       record.remoteThreadId,
       record.status,
       record.error,
+      record.compaction ? JSON.stringify(record.compaction) : null,
       record.createdAt,
       record.updatedAt,
     );
@@ -973,6 +1019,7 @@ export class ControlDatabase {
         ? nullableText(row, "latest_run_status") as RunRecord["status"] | null
         : latestRun ? text(latestRun, "status") as RunRecord["status"] : null,
       tokenUsage: conversationTokenUsage(row.token_usage_json),
+      compaction: conversationCompaction(row.compaction_json),
       createdAt: text(row, "created_at"),
       updatedAt: text(row, "updated_at"),
     };
@@ -1123,6 +1170,140 @@ export class ControlDatabase {
     } satisfies ConversationTokenUsage), payload.conversationId, nodeId).changes > 0;
   }
 
+  createConversationCompaction(conversationId: string, compactionId: string, requestedAt: string): ConversationCompaction {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) throw new Error(`Conversation not found: ${conversationId}`);
+    if (conversation.compaction && ["queued", "dispatching", "running", "recovering"].includes(conversation.compaction.status)) {
+      throw new Error("Conversation already has an active compaction");
+    }
+    const compaction: ConversationCompaction = {
+      id: compactionId,
+      status: "queued",
+      beforeContextTokens: conversation.tokenUsage?.contextTokens ?? null,
+      afterContextTokens: null,
+      errorCode: null,
+      error: null,
+      requestedAt,
+      startedAt: null,
+      finishedAt: null,
+      recoveryDeadlineAt: null,
+    };
+    this.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?")
+      .run(JSON.stringify(compaction), conversationId);
+    return compaction;
+  }
+
+  markConversationCompactionDispatching(conversationId: string, compactionId: string): void {
+    const current = this.getConversation(conversationId)?.compaction;
+    if (!current || current.id !== compactionId || current.status !== "queued") return;
+    const next: ConversationCompaction = { ...current, status: "dispatching" };
+    this.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?")
+      .run(JSON.stringify(next), conversationId);
+  }
+
+  updateConversationCompaction(nodeId: string, payload: ConversationCompactionPayload): boolean {
+    const conversation = this.getConversation(payload.conversationId);
+    const current = conversation?.compaction;
+    if (!conversation || conversation.nodeId !== nodeId || conversation.remoteThreadId !== payload.threadId
+      || !current || current.id !== payload.compactionId
+      || ["completed", "failed"].includes(current.status)) return false;
+    const next: ConversationCompaction = {
+      ...current,
+      status: payload.status,
+      beforeContextTokens: payload.beforeContextTokens ?? current.beforeContextTokens,
+      afterContextTokens: payload.afterContextTokens ?? current.afterContextTokens,
+      errorCode: payload.errorCode ?? null,
+      error: payload.error ?? null,
+      startedAt: current.startedAt ?? (payload.status === "running" ? payload.occurredAt : null),
+      finishedAt: payload.status === "running" ? null : payload.occurredAt,
+      recoveryDeadlineAt: null,
+    };
+    return this.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?")
+      .run(JSON.stringify(next), conversation.id).changes > 0;
+  }
+
+  failConversationCompaction(
+    conversationId: string,
+    compactionId: string,
+    error: string,
+    now: string,
+    errorCode: RunErrorCode | null = null,
+  ): boolean {
+    const current = this.getConversation(conversationId)?.compaction;
+    if (!current || current.id !== compactionId || ["completed", "failed"].includes(current.status)) return false;
+    const next: ConversationCompaction = {
+      ...current,
+      status: "failed",
+      errorCode,
+      error,
+      finishedAt: now,
+      recoveryDeadlineAt: null,
+    };
+    return this.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?")
+      .run(JSON.stringify(next), conversationId).changes > 0;
+  }
+
+  hasActiveConversationCompaction(conversationId: string): boolean {
+    const compaction = this.getConversation(conversationId)?.compaction;
+    return Boolean(compaction && ["queued", "dispatching", "running", "recovering"].includes(compaction.status));
+  }
+
+  private markCompactionsRecovering(nodeId: string | null, deadline: string): void {
+    const rows = (nodeId
+      ? this.sqlite.prepare("SELECT id, compaction_json FROM conversations WHERE node_id = ? AND compaction_json IS NOT NULL").all(nodeId)
+      : this.sqlite.prepare("SELECT id, compaction_json FROM conversations WHERE compaction_json IS NOT NULL").all()) as Row[];
+    const update = this.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?");
+    for (const row of rows) {
+      const compaction = conversationCompaction(row.compaction_json);
+      if (!compaction || !["dispatching", "running"].includes(compaction.status)) continue;
+      update.run(JSON.stringify({ ...compaction, status: "recovering", recoveryDeadlineAt: deadline }), text(row, "id"));
+    }
+  }
+
+  reconcileNodeCompactions(nodeId: string, activeCompactionIds: string[], now: string): string[] {
+    const rows = this.sqlite.prepare(
+      "SELECT id, compaction_json FROM conversations WHERE node_id = ? AND compaction_json IS NOT NULL",
+    ).all(nodeId) as Row[];
+    const active = new Set(activeCompactionIds);
+    const changedConversationIds: string[] = [];
+    for (const row of rows) {
+      const compaction = conversationCompaction(row.compaction_json);
+      if (!compaction || compaction.status !== "recovering") continue;
+      if (active.has(compaction.id)) {
+        this.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?")
+          .run(JSON.stringify({ ...compaction, status: "running", recoveryDeadlineAt: null }), text(row, "id"));
+        changedConversationIds.push(text(row, "id"));
+      } else if (this.failConversationCompaction(
+        text(row, "id"),
+        compaction.id,
+        "节点重连后无法确认上下文压缩状态，请重新发起压缩",
+        now,
+        "internal_error",
+      )) {
+        changedConversationIds.push(text(row, "id"));
+      }
+    }
+    return changedConversationIds;
+  }
+
+  failExpiredRecoveringCompactions(now: string): string[] {
+    const rows = this.sqlite.prepare("SELECT id, compaction_json FROM conversations WHERE compaction_json IS NOT NULL").all() as Row[];
+    const failedConversationIds: string[] = [];
+    for (const row of rows) {
+      const compaction = conversationCompaction(row.compaction_json);
+      if (!compaction || compaction.status !== "recovering" || !compaction.recoveryDeadlineAt
+        || compaction.recoveryDeadlineAt >= now) continue;
+      if (this.failConversationCompaction(
+        text(row, "id"),
+        compaction.id,
+        "无法确认远端上下文压缩状态，恢复等待已超时",
+        now,
+        "internal_error",
+      )) failedConversationIds.push(text(row, "id"));
+    }
+    return failedConversationIds;
+  }
+
   updateConversation(id: string, input: { title?: string; pinned?: boolean }, now: string): ConversationRecord | null {
     const current = this.getConversation(id);
     if (!current) return null;
@@ -1158,8 +1339,8 @@ export class ControlDatabase {
       INSERT INTO runs (
         id, conversation_id, prompt, model, effort, client_request_id, remote_turn_id, status,
         progress_phase, progress_label, progress_updated_at, recovery_deadline_at,
-        error, created_at, started_at, finished_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        error, error_code, created_at, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id,
       record.conversationId,
@@ -1174,6 +1355,7 @@ export class ControlDatabase {
       record.progressUpdatedAt,
       record.recoveryDeadlineAt,
       record.error,
+      record.errorCode ?? null,
       record.createdAt,
       record.startedAt,
       record.finishedAt,
@@ -1203,6 +1385,7 @@ export class ControlDatabase {
       progressUpdatedAt: nullableText(row, "progress_updated_at"),
       recoveryDeadlineAt: nullableText(row, "recovery_deadline_at"),
       error: nullableText(row, "error"),
+      errorCode: nullableText(row, "error_code") as RunErrorCode | null,
       createdAt: text(row, "created_at"),
       startedAt: nullableText(row, "started_at"),
       finishedAt: nullableText(row, "finished_at"),
@@ -1233,6 +1416,14 @@ export class ControlDatabase {
       .map((row) => this.runFromRow(row));
   }
 
+  hasActiveRun(conversationId: string): boolean {
+    return Boolean(this.sqlite.prepare(`
+      SELECT 1 FROM runs
+      WHERE conversation_id = ? AND status IN ('queued', 'dispatching', 'running', 'waiting_approval', 'recovering')
+      LIMIT 1
+    `).get(conversationId));
+  }
+
   canDispatchQueuedRun(nodeId: string, workspaceId: string): boolean {
     const node = this.sqlite.prepare("SELECT max_concurrent_runs FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
     const workspace = this.sqlite.prepare("SELECT path FROM workspaces WHERE node_id = ? AND id = ?").get(nodeId, workspaceId) as Row | undefined;
@@ -1259,7 +1450,7 @@ export class ControlDatabase {
     this.sqlite.prepare(`
       UPDATE runs SET remote_turn_id = ?, status = 'running', progress_phase = 'analyzing',
         progress_label = '正在分析任务', progress_updated_at = ?, recovery_deadline_at = NULL,
-        error = NULL, started_at = ? WHERE id = ?
+        error = NULL, error_code = NULL, started_at = ? WHERE id = ?
     `).run(payload.turnId, payload.startedAt, payload.startedAt, payload.runId);
     this.touchConversation(payload.conversationId, payload.startedAt);
   }
@@ -1276,20 +1467,21 @@ export class ControlDatabase {
 
   finishRun(payload: RunFinishedPayload): void {
     this.sqlite.prepare(`
-      UPDATE runs SET status = ?, error = ?, finished_at = ?, recovery_deadline_at = NULL,
+      UPDATE runs SET status = ?, error = ?, error_code = ?, finished_at = ?, recovery_deadline_at = NULL,
         progress_phase = NULL, progress_label = NULL, progress_updated_at = ? WHERE id = ?
         AND status NOT IN ('completed', 'failed', 'interrupted')
-    `).run(payload.status, payload.error ?? null, payload.finishedAt, payload.finishedAt, payload.runId);
+    `).run(payload.status, payload.error ?? null, payload.errorCode ?? null, payload.finishedAt, payload.finishedAt, payload.runId);
     this.sqlite.prepare(
       "UPDATE approvals SET status = 'expired', resolved_at = ? WHERE run_id = ? AND status = 'pending'",
     ).run(payload.finishedAt, payload.runId);
     this.touchConversation(payload.conversationId, payload.finishedAt);
   }
 
-  failRun(id: string, error: string, now: string): void {
+  failRun(id: string, error: string, now: string, errorCode: RunErrorCode | null = null): void {
     this.sqlite.prepare(
-      "UPDATE runs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?",
-    ).run(error, now, id);
+      `UPDATE runs SET status = 'failed', error = ?, error_code = ?, finished_at = ?
+       WHERE id = ? AND status NOT IN ('completed', 'failed', 'interrupted')`,
+    ).run(error, errorCode, now, id);
   }
 
   reconcileNodeRuns(nodeId: string, activeRunIds: string[], now: string): string[] {
@@ -1586,7 +1778,16 @@ export class ControlDatabase {
   }
 
   applyAgentError(error: AgentErrorPayload, now: string): void {
-    if (error.runId) this.failRun(error.runId, error.message, now);
+    if (error.runId) this.failRun(error.runId, error.message, now, error.errorCode ?? null);
+    if (error.compactionId && error.conversationId) {
+      this.failConversationCompaction(
+        error.conversationId,
+        error.compactionId,
+        error.message,
+        now,
+        error.errorCode ?? null,
+      );
+    }
     if (error.conversationId && this.getConversation(error.conversationId)?.status === "creating") {
       this.failConversation(error.conversationId, error.message, now);
     }

@@ -1,6 +1,57 @@
 import { describe, expect, it } from "vitest";
-import { buildTimeline, normalizeMathMarkdown } from "./App";
-import type { ConversationDetail } from "./types";
+import {
+  boundedConversationDetail,
+  buildTimeline,
+  conversationCacheLimit,
+  limitConversationCache,
+  mergedConversationDetail,
+  messageHistoryCacheLimit,
+  normalizeMathMarkdown,
+} from "./App";
+import type { ConversationDetail, Message } from "./types";
+
+function message(index: number): Message {
+  const createdAt = new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString();
+  return {
+    id: `message-${index}`,
+    conversationId: "conversation-1",
+    runId: null,
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `message ${index}`,
+    revision: 1,
+    complete: true,
+    attachmentIds: [],
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+function detailWithMessages(messages: Message[]): ConversationDetail {
+  return {
+    conversation: {
+      id: "conversation-1",
+      nodeId: "node-1",
+      workspaceId: "workspace-1",
+      title: "Test",
+      model: null,
+      effort: null,
+      clientRequestId: null,
+      remoteThreadId: "thread-1",
+      status: "ready",
+      error: null,
+      pinnedAt: null,
+      latestRunStatus: "completed",
+      tokenUsage: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    },
+    runs: [],
+    messages,
+    messagePage: { hasMore: false, before: null },
+    attachments: [],
+    approvals: [],
+  };
+}
 
 describe("buildTimeline", () => {
   it("keeps user prompts and merges streamed agent deltas", () => {
@@ -92,5 +143,43 @@ describe("normalizeMathMarkdown", () => {
     expect(normalized).toContain("$$\\int_0^1 x^2 dx$$");
     expect(normalized).toContain(String.raw`\`\(literal\)\``);
     expect(normalized).toContain(String.raw`\[literal block\]`);
+  });
+});
+
+describe("long conversation memory limits", () => {
+  it("caps the cached conversation list", () => {
+    const template = detailWithMessages([]).conversation;
+    const conversations = Array.from({ length: conversationCacheLimit + 25 }, (_, index) => ({
+      ...template,
+      id: `conversation-${index}`,
+    }));
+
+    const bounded = limitConversationCache(conversations);
+
+    expect(bounded).toHaveLength(conversationCacheLimit);
+    expect(bounded.at(-1)?.id).toBe(`conversation-${conversationCacheLimit - 1}`);
+  });
+
+  it("keeps only the newest messages when a detail response exceeds the hard limit", () => {
+    const detail = detailWithMessages(Array.from({ length: messageHistoryCacheLimit + 20 }, (_, index) => message(index)));
+
+    const bounded = boundedConversationDetail(detail);
+
+    expect(bounded.messages).toHaveLength(messageHistoryCacheLimit);
+    expect(bounded.messages[0]?.id).toBe("message-20");
+    expect(bounded.messages.at(-1)?.id).toBe(`message-${messageHistoryCacheLimit + 19}`);
+  });
+
+  it("keeps the older side of the window while paging backwards", () => {
+    const current = detailWithMessages(Array.from({ length: 300 }, (_, index) => message(index + 300)));
+    const incoming = detailWithMessages(Array.from({ length: 300 }, (_, index) => message(index)));
+    incoming.messagePage = { hasMore: true, before: "older-cursor" };
+
+    const merged = mergedConversationDetail(current, incoming, "older");
+
+    expect(merged.messages).toHaveLength(messageHistoryCacheLimit);
+    expect(merged.messages[0]?.id).toBe("message-0");
+    expect(merged.messages.at(-1)?.id).toBe(`message-${messageHistoryCacheLimit - 1}`);
+    expect(merged.messagePage).toEqual({ hasMore: true, before: "older-cursor" });
   });
 });

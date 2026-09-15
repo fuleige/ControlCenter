@@ -18,6 +18,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
   ApiError,
+  compactConversation,
   deleteConversation,
   createEnrollmentToken,
   createNodeWorkspace,
@@ -62,6 +63,7 @@ import type {
   AgentPackageInfo,
   AttachmentRecord,
   Conversation,
+  ConversationCompaction,
   ConversationDetail,
   ConversationTokenUsage,
   EnrollmentToken,
@@ -97,6 +99,10 @@ const enrollmentRefreshIntervalMs = 10_000;
 const connectedSafetySyncIntervalMs = 60_000;
 const disconnectedFallbackSyncIntervalMs = 10_000;
 const presenceHeartbeatIntervalMs = 25_000;
+const conversationPageSize = 50;
+export const conversationCacheLimit = 300;
+const recentMessagePageSize = 60;
+export const messageHistoryCacheLimit = 500;
 
 function storedValue(key: string): string | null {
   try { return window.localStorage.getItem(key); } catch { return null; }
@@ -177,13 +183,39 @@ function compactTokenCount(value: number | null | undefined): string {
   return `${(value / 1_000_000).toFixed(value < 10_000_000 ? 1 : 0)}m`;
 }
 
-function ConversationUsageBar({ usage, draft }: { usage: ConversationTokenUsage | null; draft: boolean }) {
+function ConversationUsageBar({
+  usage,
+  draft,
+  compaction,
+  disabled,
+  recommended,
+  onRequestCompact,
+}: {
+  usage: ConversationTokenUsage | null;
+  draft: boolean;
+  compaction: ConversationCompaction | null;
+  disabled: boolean;
+  recommended: boolean;
+  onRequestCompact: () => void;
+}) {
   if (draft) return null;
   const contextWindow = usage?.modelContextWindow ?? null;
   const contextPercent = usage && contextWindow
     ? Math.max(0, Math.round(usage.contextTokens / contextWindow * 100))
     : null;
   const exact = (value: number | null | undefined) => value === null || value === undefined ? "尚未获取" : `${value.toLocaleString("zh-CN")} Token`;
+  const active = Boolean(compaction && ["queued", "dispatching", "running", "recovering"].includes(compaction.status));
+  const label = compaction?.status === "queued"
+    ? "等待节点"
+    : compaction?.status === "dispatching"
+      ? "正在启动"
+      : compaction?.status === "running"
+        ? "正在压缩"
+        : compaction?.status === "recovering"
+          ? "正在恢复"
+          : compaction?.status === "failed"
+            ? "重试压缩"
+            : "压缩";
   return (
     <section className={`conversation-usage ${usage ? "" : "pending"}`} aria-label="当前会话 Token 使用情况">
       <span title={exact(usage?.totalTokens)}><small>总计</small><strong>{compactTokenCount(usage?.totalTokens)}</strong></span>
@@ -191,6 +223,15 @@ function ConversationUsageBar({ usage, draft }: { usage: ConversationTokenUsage 
       <span title={usage && contextWindow ? `${usage.contextTokens.toLocaleString("zh-CN")} / ${contextWindow.toLocaleString("zh-CN")} Token` : "尚未获取"}>
         <small>占用</small><strong>{contextPercent === null ? "--" : `${contextPercent}%`}</strong>
       </span>
+      <button
+        type="button"
+        className={`compact-button ${recommended ? "recommended" : ""} ${compaction?.status === "failed" ? "failed" : ""}`}
+        disabled={disabled || active}
+        title={active ? "上下文压缩正在进行" : "概括当前有效上下文以释放空间"}
+        onClick={onRequestCompact}
+      >
+        {active && <i aria-hidden="true" />}{label}
+      </button>
     </section>
   );
 }
@@ -232,18 +273,48 @@ function compareMessages(left: Message, right: Message): number {
   return roleOrder || left.id.localeCompare(right.id);
 }
 
-function mergedConversationDetail(
+export function limitConversationCache(conversations: Conversation[]): Conversation[] {
+  return conversations.slice(0, conversationCacheLimit);
+}
+
+export function boundedConversationDetail(
+  detail: ConversationDetail,
+  keep: "latest" | "oldest" = "latest",
+  limit = messageHistoryCacheLimit,
+): ConversationDetail {
+  const sortedMessages = [...detail.messages].sort(compareMessages);
+  const messages = sortedMessages.length <= limit
+    ? sortedMessages
+    : keep === "latest"
+      ? sortedMessages.slice(-limit)
+      : sortedMessages.slice(0, limit);
+  const referencedAttachments = new Set(messages.flatMap((message) => message.attachmentIds));
+  return {
+    ...detail,
+    messages,
+    attachments: detail.attachments.filter((attachment) => referencedAttachments.has(attachment.id)),
+  };
+}
+
+export function mergedConversationDetail(
   current: ConversationDetail | null,
   incoming: ConversationDetail,
   pageMode: "preserve" | "older" = "preserve",
 ): ConversationDetail {
-  if (!current || current.conversation.id !== incoming.conversation.id) return incoming;
+  if (!current || current.conversation.id !== incoming.conversation.id) {
+    return boundedConversationDetail(incoming, pageMode === "older" ? "oldest" : "latest");
+  }
   const messages = new Map(current.messages.map((message) => [message.id, message]));
   for (const message of incoming.messages) {
     const existing = messages.get(message.id);
     if (!existing || message.revision >= existing.revision) messages.set(message.id, message);
   }
-  const mergedMessages = [...messages.values()].sort(compareMessages);
+  const allMessages = [...messages.values()].sort(compareMessages);
+  const mergedMessages = allMessages.length <= messageHistoryCacheLimit
+    ? allMessages
+    : pageMode === "older"
+      ? allMessages.slice(0, messageHistoryCacheLimit)
+      : allMessages.slice(-messageHistoryCacheLimit);
   const referencedAttachments = new Set(mergedMessages.flatMap((message) => message.attachmentIds));
   const attachments = new Map(current.attachments.map((attachment) => [attachment.id, attachment]));
   for (const attachment of incoming.attachments) attachments.set(attachment.id, attachment);
@@ -569,6 +640,7 @@ function ConversationPanel({
   total,
   loading,
   hasMore,
+  cacheLimited,
   onLoadMore,
 }: {
   node: NodeRecord | null;
@@ -589,6 +661,7 @@ function ConversationPanel({
   total: number;
   loading: boolean;
   hasMore: boolean;
+  cacheLimited: boolean;
   onLoadMore: () => void;
 }) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -702,6 +775,9 @@ function ConversationPanel({
           );
         })}
         {node && hasMore && <button type="button" className="load-more-conversations" disabled={loading} onClick={onLoadMore}>{loading ? "加载中…" : "加载更多会话"}</button>}
+        {node && cacheLimited && (
+          <div className="conversation-cache-hint">当前浏览器最多保留最近 {conversationCacheLimit} 个会话，请按名称搜索更早的会话。</div>
+        )}
         {error && <div className="list-error">{error}</div>}
         {node && loading && conversations.length === 0 && <div className="empty compact">正在读取会话…</div>}
         {node && !loading && total === 0 && !query && filter === "all" && <div className="empty compact">还没有历史会话。发送第一条消息后，会话会自动出现在这里。</div>}
@@ -1525,6 +1601,8 @@ function ChatPanel({
   pendingApprovals,
   onRefresh,
   onLoadEarlier,
+  onReturnLatest,
+  viewingHistoricalMessages,
   onBack,
   draftRequestId,
   isDraft,
@@ -1536,6 +1614,8 @@ function ChatPanel({
   pendingApprovals: Approval[];
   onRefresh: () => void;
   onLoadEarlier: () => Promise<void>;
+  onReturnLatest: () => Promise<void>;
+  viewingHistoricalMessages: boolean;
   onBack: () => void;
   draftRequestId: string;
   isDraft: boolean;
@@ -1552,7 +1632,11 @@ function ChatPanel({
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [returningLatest, setReturningLatest] = useState(false);
   const [loadEarlierError, setLoadEarlierError] = useState<string | null>(null);
+  const [showCompactConfirm, setShowCompactConfirm] = useState(false);
+  const [compactSubmitting, setCompactSubmitting] = useState(false);
+  const [compactionRequestId, setCompactionRequestId] = useState(newDraftRequestId);
   const timelineElement = useRef<HTMLDivElement>(null);
   const promptElement = useRef<HTMLTextAreaElement>(null);
   const fileInputElement = useRef<HTMLInputElement>(null);
@@ -1562,6 +1646,12 @@ function ChatPanel({
   const uploadsRef = useRef<PendingUpload[]>([]);
   const timeline = useMemo(() => buildTimeline(detail), [detail]);
   const activeRun = detail?.runs.findLast((run) => ["queued", "dispatching", "running", "waiting_approval", "recovering"].includes(run.status));
+  const compaction = detail?.conversation.compaction ?? null;
+  const compactionActive = Boolean(compaction && ["queued", "dispatching", "running", "recovering"].includes(compaction.status));
+  const latestContextError = detail?.runs.findLast((run) => run.errorCode === "context_window_exceeded");
+  const compactRecommended = Boolean(latestContextError
+    && (compaction?.status !== "completed"
+      || (latestContextError.finishedAt ?? latestContextError.createdAt) > (compaction.finishedAt ?? compaction.requestedAt)));
   const currentApprovals = detail ? pendingApprovals.filter((approval) => approval.conversationId === detail.conversation.id) : [];
   const modelCatalog = node?.models ?? [];
   const selectedModel = modelCatalog.find((candidate) => candidate.id === model)
@@ -1608,7 +1698,18 @@ function ChatPanel({
       return [];
     });
     setError(null);
+    setShowCompactConfirm(false);
+    setCompactSubmitting(false);
   }, [node?.id, detail?.conversation.id, settings.defaultModel, settings.defaultEffort]);
+
+  useEffect(() => {
+    if (!showCompactConfirm) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !compactSubmitting) setShowCompactConfirm(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [showCompactConfirm, compactSubmitting]);
 
   useEffect(() => {
     storeValue(composerStorageKey, prompt || null);
@@ -1642,6 +1743,7 @@ function ChatPanel({
   }, [detail?.conversation.id]);
 
   useEffect(() => {
+    if (viewingHistoricalMessages) return;
     const initialPosition = !timelinePositioned.current;
     if (!initialPosition && !followStreamingOutput.current) return;
     programmaticTimelineScroll.current = true;
@@ -1673,7 +1775,7 @@ function ChatPanel({
       if (settleTimer) window.clearTimeout(settleTimer);
       programmaticTimelineScroll.current = false;
     };
-  }, [timeline, activeRun?.status, currentApprovals.length]);
+  }, [timeline, activeRun?.status, currentApprovals.length, viewingHistoricalMessages]);
 
   useEffect(() => {
     const element = promptElement.current;
@@ -1711,6 +1813,27 @@ function ChatPanel({
     }
   }
 
+  async function returnToLatestMessages(): Promise<void> {
+    setReturningLatest(true);
+    setLoadEarlierError(null);
+    try {
+      await onReturnLatest();
+      followStreamingOutput.current = true;
+      programmaticTimelineScroll.current = true;
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        const current = timelineElement.current;
+        if (current) current.scrollTop = current.scrollHeight;
+        timelinePositioned.current = true;
+        programmaticTimelineScroll.current = false;
+        setShowScrollToBottom(false);
+      }));
+    } catch (reason) {
+      setLoadEarlierError(formatErrorMessage(reason, "返回最新消息"));
+    } finally {
+      setReturningLatest(false);
+    }
+  }
+
   function updateUpload(localId: string, patch: Partial<PendingUpload>): void {
     setUploads((current) => current.map((upload) => upload.localId === localId ? { ...upload, ...patch } : upload));
   }
@@ -1732,6 +1855,7 @@ function ChatPanel({
   }
 
   function addFiles(files: File[]): void {
+    if (busy || compactionActive) return;
     const available = Math.max(0, 10 - uploads.length);
     const accepted = files.slice(0, available);
     if (files.length > available) setError("单条消息最多添加 10 个附件");
@@ -1830,6 +1954,28 @@ function ChatPanel({
     }
   }
 
+  function requestCompaction(): void {
+    if (!detail || activeRun || compactionActive) return;
+    setCompactionRequestId(newDraftRequestId());
+    setError(null);
+    setShowCompactConfirm(true);
+  }
+
+  async function confirmCompaction(): Promise<void> {
+    if (!detail || compactSubmitting) return;
+    setCompactSubmitting(true);
+    setError(null);
+    try {
+      await compactConversation(detail.conversation.id, compactionRequestId);
+      setShowCompactConfirm(false);
+      onRefresh();
+    } catch (reason) {
+      setError(formatErrorMessage(reason, "压缩上下文"));
+    } finally {
+      setCompactSubmitting(false);
+    }
+  }
+
   if (!node) {
     return (
       <main className="chat-pane empty-state">
@@ -1863,6 +2009,7 @@ function ChatPanel({
     && !workspace.archivedAt
     && (!isDraft || workspace.source !== "history")
     && (isDraft || conversation?.status === "ready")
+    && !compactionActive
     && (!activeRun || Boolean(activeRun.remoteTurnId) && ["running", "waiting_approval"].includes(activeRun.status));
   const activeStateText = activeRun?.status === "waiting_approval"
     ? "等待你的操作"
@@ -1895,7 +2042,7 @@ function ChatPanel({
               <button type="button" disabled={loadingEarlier} onClick={() => void loadEarlierMessages()}>
                 {loadingEarlier ? "正在加载…" : "加载更早消息"}
               </button>
-              {loadEarlierError && <span>{loadEarlierError}</span>}
+              {loadEarlierError && !viewingHistoricalMessages && <span>{loadEarlierError}</span>}
             </div>
           )}
           {isDraft ? (
@@ -1930,11 +2077,22 @@ function ChatPanel({
             <div className="run-error" key={`error-${run.id}`}>{run.error}</div>
           ))}
         </div>
-        {showScrollToBottom && (
+        {viewingHistoricalMessages ? (
+          <button
+            className="return-to-latest"
+            type="button"
+            disabled={returningLatest}
+            title={`历史消息分批加载，当前浏览器最多保留 ${messageHistoryCacheLimit} 条`}
+            onClick={() => void returnToLatestMessages()}
+          >
+            <span aria-hidden="true">↓</span>{returningLatest ? "正在返回最新消息…" : "历史阅读模式 · 返回最新消息"}
+          </button>
+        ) : showScrollToBottom && (
           <button className="scroll-to-bottom" type="button" onClick={scrollToTimelineBottom}>
             <span aria-hidden="true">↓</span>滑动到底部
           </button>
         )}
+        {viewingHistoricalMessages && loadEarlierError && <div className="history-navigation-error" role="alert">{loadEarlierError}</div>}
       </div>
       <div className="run-dock">
         {activeRun && (
@@ -1957,8 +2115,18 @@ function ChatPanel({
         )}
       </div>
       <form className="composer" onSubmit={submit} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
-        {error && <div className="composer-error">{error}</div>}
-        <ConversationUsageBar usage={conversation?.tokenUsage ?? null} draft={isDraft} />
+        {error && !showCompactConfirm && <div className="composer-error">{error}</div>}
+        <ConversationUsageBar
+          usage={conversation?.tokenUsage ?? null}
+          draft={isDraft}
+          compaction={compaction}
+          disabled={busy || Boolean(activeRun) || node.status !== "online" || conversation?.status !== "ready"}
+          recommended={compactRecommended}
+          onRequestCompact={requestCompaction}
+        />
+        {compaction?.status === "failed" && compaction.error && (
+          <div className="compaction-error" role="status">压缩失败：{compaction.error}</div>
+        )}
         {uploads.length > 0 && <div className="upload-list">{uploads.map((upload) => <div className={`upload-item upload-${upload.status}`} key={upload.localId}>
           {upload.previewUrl ? <img src={upload.previewUrl} alt="" /> : <span className="upload-file-icon">DOC</span>}
           <span className="upload-copy"><strong>{upload.file.name || "粘贴的图片"}</strong><small>{upload.status === "ready" ? `${(upload.file.size / 1024).toFixed(0)} KB · 已就绪` : upload.status === "failed" ? upload.error : `上传中 ${Math.round(upload.progress / upload.file.size * 100)}%`}</small></span>
@@ -1969,7 +2137,7 @@ function ChatPanel({
           ref={promptElement}
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
-          placeholder={activeRun ? "向正在执行的任务追加指令…" : "描述你希望 Codex 完成的任务…"}
+          placeholder={compactionActive ? "正在压缩上下文…" : activeRun ? "向正在执行的任务追加指令…" : "描述你希望 Codex 完成的任务…"}
           rows={2}
           disabled={!canCompose}
           onPaste={(event) => {
@@ -1987,7 +2155,7 @@ function ChatPanel({
           <div className="composer-toolbar" aria-label="会话选项">
             <button className="mobile-history-button" type="button" onClick={onBack} aria-label="打开历史会话"><HistoryIcon /><span>历史</span></button>
             <input ref={fileInputElement} className="file-input" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
-            <button className="attach-button" type="button" onClick={() => fileInputElement.current?.click()} disabled={busy || uploads.length >= 10} title="上传文件或图片">＋ 附件</button>
+            <button className="attach-button" type="button" onClick={() => fileInputElement.current?.click()} disabled={busy || compactionActive || uploads.length >= 10} title="上传文件或图片">＋ 附件</button>
             {isDraft && (
               <label className="setting-field workspace-setting">
                 <select aria-label="选择工作空间" title="选择工作空间" value={workspaceId} onChange={(event) => setWorkspaceId(event.target.value)} disabled={busy || node.status !== "online"}>
@@ -2005,7 +2173,7 @@ function ChatPanel({
                 aria-label="选择模型"
                 title="选择模型"
                 value={model}
-                disabled={busy || Boolean(activeRun)}
+                disabled={busy || Boolean(activeRun) || compactionActive}
                 onChange={(event) => {
                   const nextModel = event.target.value;
                   setModel(nextModel);
@@ -2021,7 +2189,7 @@ function ChatPanel({
               </select>
             </label>
             <label className="setting-field effort-setting">
-              <select aria-label="选择思考强度" title="选择思考强度" value={effort} disabled={busy || Boolean(activeRun)} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}>
+              <select aria-label="选择思考强度" title="选择思考强度" value={effort} disabled={busy || Boolean(activeRun) || compactionActive} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}>
                 <option value="">模型默认</option>
                 {conversation?.effort && !effortOptions.some((candidate) => candidate.reasoningEffort === conversation.effort) && (
                   <option value={conversation.effort}>{effortLabels[conversation.effort]}</option>
@@ -2036,6 +2204,25 @@ function ChatPanel({
             {busy ? "…" : uploads.some((upload) => upload.status === "uploading") ? "上传中" : "发送"}
           </button>
         </div>
+        {showCompactConfirm && (
+          <div className="compact-confirm-backdrop" role="presentation">
+            <section className="compact-confirm" role="dialog" aria-modal="true" aria-labelledby="compact-confirm-title">
+              <span className="compact-confirm-icon" aria-hidden="true">↙↗</span>
+              <div>
+                <h2 id="compact-confirm-title">压缩当前会话？</h2>
+                <p>Codex 会概括当前有效上下文以释放空间。聊天记录仍会保留，但后续对话使用的是压缩后的摘要。</p>
+                <p className="compact-confirm-note">压缩会消耗一定 Token，完成后不能直接撤销。</p>
+                {error && <p className="compact-confirm-error" role="alert">{error}</p>}
+                <div className="compact-confirm-actions">
+                  <button type="button" autoFocus disabled={compactSubmitting} onClick={() => setShowCompactConfirm(false)}>取消</button>
+                  <button className="primary-button" type="button" disabled={compactSubmitting} onClick={() => void confirmCompaction()}>
+                    {compactSubmitting ? "正在提交…" : "确认压缩"}
+                  </button>
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
       </form>
     </main>
   );
@@ -2050,6 +2237,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const [conversationSearch, setConversationSearch] = useState("");
   const [conversationFilter, setConversationFilter] = useState<"all" | "active" | "failed">("all");
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const [viewingHistoricalMessages, setViewingHistoricalMessages] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState<Approval[]>([]);
   const [settings, setSettings] = useState<GlobalSettings>({ defaultModel: null, defaultEffort: null });
   const [taskEntries, setTaskEntries] = useState<TaskCenterEntry[]>([]);
@@ -2085,6 +2273,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const taskCenterRequestRef = useRef(0);
   const taskCenterAppliedRef = useRef(0);
   const detailRef = useRef<ConversationDetail | null>(null);
+  const viewingHistoricalMessagesRef = useRef(false);
   const presenceContextRef = useRef({
     selectedConversationId,
     primaryView,
@@ -2114,14 +2303,20 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     setSelectedNodeId(nodeId);
   }, []);
 
+  const commitViewingHistoricalMessages = useCallback((value: boolean) => {
+    viewingHistoricalMessagesRef.current = value;
+    setViewingHistoricalMessages(value);
+  }, []);
+
   const commitSelectedConversation = useCallback((conversationId: string | null) => {
     selectedConversationIdRef.current = conversationId;
     const nodeId = selectedNodeIdRef.current;
     if (nodeId) sessionStoreValue(nodeConversationStorageKey(nodeId), conversationId);
     conversationDetailRequestRef.current += 1;
     conversationDetailAppliedRef.current = conversationDetailRequestRef.current;
+    commitViewingHistoricalMessages(false);
     setSelectedConversationId(conversationId);
-  }, []);
+  }, [commitViewingHistoricalMessages]);
 
   useEffect(() => {
     detailRef.current = detail;
@@ -2201,7 +2396,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         nodeId: requestedNodeId,
         query: requestedQuery,
         ...(requestedFilter === "all" ? {} : { status: requestedFilter }),
-        limit: 50,
+        limit: conversationPageSize,
         ...(requestedCursor ? { cursor: requestedCursor } : {}),
       });
       if (selectedNodeIdRef.current === requestedNodeId
@@ -2212,18 +2407,23 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         if (mode === "append") {
           setConversations((current) => {
             const existing = new Set(current.map((conversation) => conversation.id));
-            return [...current, ...result.data.filter((conversation) => !existing.has(conversation.id))];
+            return limitConversationCache([...current, ...result.data.filter((conversation) => !existing.has(conversation.id))]);
           });
         } else if (mode === "refresh") {
           setConversations((current) => {
             const refreshed = new Set(result.data.map((conversation) => conversation.id));
-            return [...result.data, ...current.filter((conversation) => !refreshed.has(conversation.id))].slice(0, result.total);
+            return limitConversationCache(
+              [...result.data, ...current.filter((conversation) => !refreshed.has(conversation.id))].slice(0, result.total),
+            );
           });
         } else {
-          setConversations(result.data);
+          setConversations(limitConversationCache(result.data));
         }
-        conversationNextCursorRef.current = result.nextCursor;
-        setConversationNextCursor(result.nextCursor);
+        const nextCursor = mode === "refresh" && conversationNextCursorRef.current
+          ? conversationNextCursorRef.current
+          : result.nextCursor;
+        conversationNextCursorRef.current = nextCursor;
+        setConversationNextCursor(nextCursor);
         setConversationTotal(result.total);
         clearBackgroundIssue("conversations");
       }
@@ -2244,7 +2444,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     }
     const requestRevision = ++conversationDetailRequestRef.current;
     try {
-      const result = await getConversation(requestedConversationId);
+      const result = await getConversation(requestedConversationId, { messageLimit: recentMessagePageSize });
       if (selectedConversationIdRef.current === requestedConversationId && requestRevision > conversationDetailAppliedRef.current) {
         if (result.conversation.nodeId !== selectedNodeIdRef.current) {
           conversationDetailAppliedRef.current = requestRevision;
@@ -2255,7 +2455,18 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           return;
         }
         conversationDetailAppliedRef.current = requestRevision;
-        setDetail((current) => mergedConversationDetail(current, result));
+        if (viewingHistoricalMessagesRef.current) {
+          setDetail((current) => current?.conversation.id === result.conversation.id
+            ? {
+                ...result,
+                messages: current.messages,
+                messagePage: current.messagePage,
+                attachments: current.attachments,
+              }
+            : boundedConversationDetail(result, "latest", recentMessagePageSize));
+        } else {
+          setDetail(boundedConversationDetail(result, "latest", recentMessagePageSize));
+        }
         clearBackgroundIssue("detail");
       }
     } catch (error) {
@@ -2282,11 +2493,30 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       ? detailRef.current.messagePage.before
       : null;
     if (!requestedConversationId || !beforeMessage) return;
-    const result = await getConversation(requestedConversationId, { beforeMessage });
+    const result = await getConversation(requestedConversationId, {
+      beforeMessage,
+      messageLimit: recentMessagePageSize,
+    });
     if (selectedConversationIdRef.current !== requestedConversationId) return;
+    commitViewingHistoricalMessages(true);
     setDetail((current) => mergedConversationDetail(current, result, "older"));
     clearBackgroundIssue("detail");
-  }, [clearBackgroundIssue]);
+  }, [clearBackgroundIssue, commitViewingHistoricalMessages]);
+
+  const returnToLatestMessages = useCallback(async () => {
+    const requestedConversationId = selectedConversationIdRef.current;
+    if (!requestedConversationId) return;
+    const requestRevision = ++conversationDetailRequestRef.current;
+    const result = await getConversation(requestedConversationId, { messageLimit: recentMessagePageSize });
+    if (selectedConversationIdRef.current !== requestedConversationId) return;
+    if (result.conversation.nodeId !== selectedNodeIdRef.current) {
+      throw new Error("会话所属节点已变化，请重新选择节点");
+    }
+    conversationDetailAppliedRef.current = Math.max(conversationDetailAppliedRef.current, requestRevision);
+    commitViewingHistoricalMessages(false);
+    setDetail(boundedConversationDetail(result, "latest", recentMessagePageSize));
+    clearBackgroundIssue("detail");
+  }, [clearBackgroundIssue, commitViewingHistoricalMessages]);
 
   const refreshApprovals = useCallback(async () => {
     const requestRevision = ++approvalsRequestRef.current;
@@ -2623,7 +2853,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       || conversation.title.toLocaleLowerCase().includes(conversationSearchRef.current.trim().toLocaleLowerCase());
     const matchesFilter = conversationFilterRef.current === "all" || conversationFilterRef.current === "active";
     if (matchesSearch && matchesFilter) {
-      setConversations((current) => [conversation, ...current.filter((candidate) => candidate.id !== conversation.id)]);
+      setConversations((current) => limitConversationCache([conversation, ...current.filter((candidate) => candidate.id !== conversation.id)]));
       setConversationTotal((current) => current + 1);
     }
     if (selectedConversationIdRef.current !== null || draftRequestIdRef.current !== originatingDraftRequestId) return;
@@ -2642,7 +2872,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
 
   async function changeConversation(conversation: Conversation, input: { title?: string; pinned?: boolean }): Promise<void> {
     const updated = await updateConversation(conversation.id, input);
-    setConversations((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
+    setConversations((current) => limitConversationCache(current.map((candidate) => candidate.id === updated.id ? updated : candidate)));
     setDetail((current) => current?.conversation.id === updated.id ? { ...current, conversation: updated } : current);
     void refreshConversations({ mode: "replace" });
   }
@@ -2703,7 +2933,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           onFilterChange={setConversationFilter}
           total={conversationTotal}
           loading={conversationLoading}
-          hasMore={Boolean(conversationNextCursor)}
+          hasMore={Boolean(conversationNextCursor) && conversations.length < conversationCacheLimit}
+          cacheLimited={conversationTotal > conversations.length && conversations.length >= conversationCacheLimit}
           onLoadMore={() => void refreshConversations({ mode: "append" })}
         />
         <button
@@ -2734,6 +2965,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           pendingApprovals={pendingApprovals}
           onRefresh={refreshAll}
           onLoadEarlier={loadEarlierMessages}
+          onReturnLatest={returnToLatestMessages}
+          viewingHistoricalMessages={viewingHistoricalMessages}
           onBack={() => setMobilePane("conversations")}
           draftRequestId={draftRequestId}
           isDraft={selectedConversationId === null}

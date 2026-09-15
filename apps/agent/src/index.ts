@@ -18,11 +18,14 @@ import {
   type ManagedWorkspaceDescriptor,
   type ModelDescriptor,
   type ReasoningEffort,
+  type RunErrorCode,
   type RunProgressPhase,
   type WorkspaceDescriptor,
 } from "@controller-center/protocol";
 import {
   AppServerClient,
+  AppServerRpcError,
+  classifyAppServerError,
   parseThreadTokenUsage,
   threadStartSecurity,
   turnSandboxPolicy,
@@ -34,7 +37,7 @@ import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.3.6";
+const AGENT_VERSION = "0.3.7";
 
 interface ActiveRun {
   conversationId: string;
@@ -44,6 +47,16 @@ interface ActiveRun {
   threadId: string;
   turnId: string;
   lastProgressPhase?: string;
+  lastError?: { code: RunErrorCode; message: string };
+}
+
+interface ActiveCompaction {
+  compactionId: string;
+  conversationId: string;
+  threadId: string;
+  turnId?: string;
+  beforeContextTokens?: number;
+  lastError?: { code: RunErrorCode; message: string };
 }
 
 interface BufferedAssistantMessage {
@@ -84,11 +97,14 @@ const outboundNetwork = new OutboundNetwork(config.codexProxyOnly);
 const conversationByThread = new Map<string, string>();
 const loadedThreads = new Set<string>();
 const activeRunsByTurn = new Map<string, ActiveRun>();
+const activeCompactionsByThread = new Map<string, ActiveCompaction>();
+const activeCompactionsByTurn = new Map<string, ActiveCompaction>();
 const workspaceLocks = new Map<string, string>();
 const startingRunIds = new Set<string>();
 const pendingApprovals = new Map<string, PendingApproval>();
 const assistantMessages = new Map<string, BufferedAssistantMessage>();
 const tokenUsageSignatureByThread = new Map<string, string>();
+const tokenUsageByThread = new Map<string, ReturnType<typeof parseThreadTokenUsage>>();
 const tokenUsageBackfillQueue = new Map<string, string>();
 const tokenUsageBackfillLoads = new Map<string, Promise<void>>();
 const workspaceRegistry = new Map<string, WorkspaceDescriptor>(config.workspaces.map((workspace) => [workspace.id, workspace]));
@@ -241,17 +257,20 @@ function writeModelCache(models: ModelDescriptor[]): void {
   }, null, 2)}\n`, { mode: 0o600 });
 }
 
-function contextFor(params: unknown): { threadId?: string; turnId?: string; conversationId?: string; run?: ActiveRun } {
+function contextFor(params: unknown): { threadId?: string; turnId?: string; conversationId?: string; run?: ActiveRun; compaction?: ActiveCompaction } {
   const threadId = stringField(params, "threadId") ?? nestedString(params, "thread", "id");
   const turnId = stringField(params, "turnId") ?? nestedString(params, "turn", "id");
   let run = turnId ? activeRunsByTurn.get(turnId) : undefined;
   if (!run && threadId) run = [...activeRunsByTurn.values()].find((candidate) => candidate.threadId === threadId);
-  const conversationId = run?.conversationId ?? (threadId ? conversationByThread.get(threadId) : undefined);
+  let compaction = turnId ? activeCompactionsByTurn.get(turnId) : undefined;
+  if (!compaction && threadId) compaction = activeCompactionsByThread.get(threadId);
+  const conversationId = run?.conversationId ?? compaction?.conversationId ?? (threadId ? conversationByThread.get(threadId) : undefined);
   return {
     ...(threadId ? { threadId } : {}),
     ...(turnId ? { turnId } : {}),
     ...(conversationId ? { conversationId } : {}),
     ...(run ? { run } : {}),
+    ...(compaction ? { compaction } : {}),
   };
 }
 
@@ -344,9 +363,29 @@ function handleNotification(notification: AppServerNotification): void {
   const params = isRecord(notification.params) ? notification.params : null;
   const item = params && isRecord(params.item) ? params.item : null;
 
+  if (notification.method === "turn/started" && context.threadId && context.turnId && context.compaction && !context.compaction.turnId) {
+    context.compaction.turnId = context.turnId;
+    activeCompactionsByTurn.set(context.turnId, context.compaction);
+  }
+
+  if (notification.method === "error") {
+    const classified = classifyAppServerError(notification.params);
+    if (context.run) {
+      if (classified.willRetry) {
+        reportProgress(context.run, "retrying", classified.retryMessage);
+      } else {
+        context.run.lastError = { code: classified.code, message: classified.message };
+      }
+    }
+    if (context.compaction && !classified.willRetry) {
+      context.compaction.lastError = { code: classified.code, message: classified.message };
+    }
+  }
+
   if (notification.method === "thread/tokenUsage/updated" && context.threadId && context.conversationId) {
     const usage = parseThreadTokenUsage(notification.params);
     if (usage) {
+      tokenUsageByThread.set(context.threadId, usage);
       const signature = `${usage.totalTokens}:${usage.contextTokens}:${usage.modelContextWindow ?? "unknown"}`;
       if (tokenUsageSignatureByThread.get(context.threadId) !== signature) {
         tokenUsageSignatureByThread.set(context.threadId, signature);
@@ -366,7 +405,9 @@ function handleNotification(notification: AppServerNotification): void {
     if (notification.method === "turn/plan/updated") reportProgress(context.run, "analyzing", "正在分析任务");
     if (notification.method === "item/started") {
       const itemType = stringField(item, "type");
-      if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch"].includes(itemType ?? "")) {
+      if (itemType === "contextCompaction") {
+        reportProgress(context.run, "compacting", "正在自动压缩上下文");
+      } else if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch"].includes(itemType ?? "")) {
         reportProgress(context.run, "working", "正在处理任务");
       }
     }
@@ -375,6 +416,8 @@ function handleNotification(notification: AppServerNotification): void {
       if (itemType === "agentMessage" && item) {
         reportProgress(context.run, "finalizing", "正在整理回复");
         completeAssistantMessage(context.run, item);
+      } else if (itemType === "contextCompaction") {
+        reportProgress(context.run, "working", "上下文压缩完成，正在继续任务");
       } else if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(itemType ?? "")) {
         reportProgress(context.run, "verifying", "正在验证结果");
       }
@@ -392,7 +435,12 @@ function handleNotification(notification: AppServerNotification): void {
     const statusValue = nestedString(notification.params, "turn", "status");
     const status = statusValue === "interrupted" ? "interrupted" : statusValue === "failed" ? "failed" : "completed";
     const turn = isRecord(notification.params) && isRecord(notification.params.turn) ? notification.params.turn : undefined;
-    const error = turn && isRecord(turn.error) ? String(turn.error.message ?? "Codex run failed") : undefined;
+    const classified = context.run.lastError
+      ?? (status === "failed" && turn && isRecord(turn.error)
+        ? classifyAppServerError({ error: turn.error, willRetry: false })
+        : status === "failed"
+          ? { code: "unknown" as const, message: "Codex 任务执行失败，未返回具体原因" }
+          : undefined);
     emitDurable({
       type: "run.finished",
       conversationId: context.run.conversationId,
@@ -400,13 +448,40 @@ function handleNotification(notification: AppServerNotification): void {
       threadId: context.run.threadId,
       turnId: context.run.turnId,
       status,
-      ...(error ? { error } : {}),
+      ...(classified ? { errorCode: classified.code, error: classified.message } : {}),
       finishedAt: timestamp(),
     });
     activeRunsByTurn.delete(context.run.turnId);
     if (workspaceLocks.get(context.run.workspacePath) === context.run.runId) {
       workspaceLocks.delete(context.run.workspacePath);
     }
+  }
+
+  if (notification.method === "turn/completed" && context.compaction) {
+    const statusValue = nestedString(notification.params, "turn", "status");
+    const turn = isRecord(notification.params) && isRecord(notification.params.turn) ? notification.params.turn : undefined;
+    const classified = context.compaction.lastError
+      ?? (statusValue === "failed" && turn && isRecord(turn.error)
+        ? classifyAppServerError({ error: turn.error, willRetry: false })
+        : statusValue === "interrupted"
+          ? { code: "unknown" as const, message: "上下文压缩已中止" }
+          : statusValue !== "completed"
+            ? { code: "unknown" as const, message: "上下文压缩失败，Codex 未返回具体原因" }
+            : undefined);
+    const usage = context.threadId ? tokenUsageByThread.get(context.threadId) : null;
+    emitDurable({
+      type: "conversation.compaction",
+      compactionId: context.compaction.compactionId,
+      conversationId: context.compaction.conversationId,
+      threadId: context.compaction.threadId,
+      status: statusValue === "completed" ? "completed" : "failed",
+      ...(context.compaction.beforeContextTokens !== undefined ? { beforeContextTokens: context.compaction.beforeContextTokens } : {}),
+      ...(usage ? { afterContextTokens: usage.contextTokens } : {}),
+      ...(classified ? { errorCode: classified.code, error: classified.message } : {}),
+      occurredAt: timestamp(),
+    });
+    if (context.compaction.turnId) activeCompactionsByTurn.delete(context.compaction.turnId);
+    activeCompactionsByThread.delete(context.compaction.threadId);
   }
 
   if (notification.method === "serverRequest/resolved") {
@@ -538,6 +613,7 @@ appServer.on("clientError", (error: Error) => console.error("[agent] app-server 
 appServer.on("exit", (error: Error) => {
   loadedThreads.clear();
   tokenUsageSignatureByThread.clear();
+  tokenUsageByThread.clear();
   for (const run of activeRunsByTurn.values()) {
     flushRunMessages(run.runId);
     emitDurable({
@@ -547,11 +623,27 @@ appServer.on("exit", (error: Error) => {
       threadId: run.threadId,
       turnId: run.turnId,
       status: "failed",
+      errorCode: "internal_error",
       error: error.message,
       finishedAt: timestamp(),
     });
   }
+  for (const compaction of activeCompactionsByThread.values()) {
+    emitDurable({
+      type: "conversation.compaction",
+      compactionId: compaction.compactionId,
+      conversationId: compaction.conversationId,
+      threadId: compaction.threadId,
+      status: "failed",
+      ...(compaction.beforeContextTokens !== undefined ? { beforeContextTokens: compaction.beforeContextTokens } : {}),
+      errorCode: "internal_error",
+      error: "Codex App Server 已退出，上下文压缩未完成",
+      occurredAt: timestamp(),
+    });
+  }
   activeRunsByTurn.clear();
+  activeCompactionsByThread.clear();
+  activeCompactionsByTurn.clear();
   startingRunIds.clear();
   workspaceLocks.clear();
   pendingApprovals.clear();
@@ -572,6 +664,59 @@ async function ensureThreadLoaded(threadId: string): Promise<void> {
   if (loadedThreads.has(threadId)) return;
   await appServer.request("thread/resume", { threadId });
   loadedThreads.add(threadId);
+}
+
+function categorizedError(message: string, errorCode: RunErrorCode): Error {
+  return Object.assign(new Error(message), { errorCode });
+}
+
+function errorCodeFrom(error: unknown): RunErrorCode {
+  if (!isRecord(error) || typeof error.errorCode !== "string") return "unknown";
+  return error.errorCode as RunErrorCode;
+}
+
+async function compactConversation(command: Extract<ControlCommand, { type: "conversation.compact" }>): Promise<void> {
+  if ([...activeRunsByTurn.values()].some((run) => run.threadId === command.threadId)) {
+    throw categorizedError("当前会话仍有任务在运行，请等待任务完成或先中止任务", "active_turn_busy");
+  }
+  if (activeCompactionsByThread.has(command.threadId)) {
+    throw categorizedError("当前会话已经在压缩上下文，请勿重复操作", "active_turn_busy");
+  }
+  conversationByThread.set(command.threadId, command.conversationId);
+  await ensureThreadLoaded(command.threadId);
+  const usage = tokenUsageByThread.get(command.threadId);
+  const compaction: ActiveCompaction = {
+    compactionId: command.compactionId,
+    conversationId: command.conversationId,
+    threadId: command.threadId,
+    ...(usage ? { beforeContextTokens: usage.contextTokens } : {}),
+  };
+  activeCompactionsByThread.set(command.threadId, compaction);
+  emitDurable({
+    type: "conversation.compaction",
+    compactionId: command.compactionId,
+    conversationId: command.conversationId,
+    threadId: command.threadId,
+    status: "running",
+    ...(usage ? { beforeContextTokens: usage.contextTokens } : {}),
+    occurredAt: timestamp(),
+  });
+  try {
+    await appServer.request("thread/compact/start", { threadId: command.threadId });
+  } catch (error) {
+    activeCompactionsByThread.delete(command.threadId);
+    if (compaction.turnId) activeCompactionsByTurn.delete(compaction.turnId);
+    if (error instanceof AppServerRpcError && error.code === -32601) {
+      throw categorizedError("当前节点的 Codex 版本不支持手动压缩，请升级 Codex 后重试", "invalid_request");
+    }
+    if (error instanceof AppServerRpcError) {
+      const classified = classifyAppServerError(isRecord(error.data)
+        ? error.data
+        : { error: { message: error.message }, willRetry: false });
+      throw categorizedError(classified.message, classified.code);
+    }
+    throw error;
+  }
 }
 
 async function backfillTokenUsage(): Promise<void> {
@@ -695,6 +840,9 @@ async function startTurnForConversation(input: {
   workspace?: WorkspaceDescriptor;
   reservationHeld?: boolean;
 }): Promise<void> {
+  if (activeCompactionsByThread.has(input.threadId)) {
+    throw categorizedError("当前会话正在压缩上下文，请等待压缩完成后再发送消息", "active_turn_busy");
+  }
   const workspace = input.workspace ?? workspaceFor(input.workspaceId);
   const reservationHeld = input.reservationHeld === true;
   if (!reservationHeld) {
@@ -815,10 +963,17 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
       break;
     }
     case "conversation.delete":
+      if (activeCompactionsByThread.has(command.threadId)) {
+        throw categorizedError("当前会话正在压缩上下文，暂时不能删除", "active_turn_busy");
+      }
       await appServer.request("thread/delete", { threadId: command.threadId });
       conversationByThread.delete(command.threadId);
       loadedThreads.delete(command.threadId);
       tokenUsageSignatureByThread.delete(command.threadId);
+      tokenUsageByThread.delete(command.threadId);
+      break;
+    case "conversation.compact":
+      await compactConversation(command);
       break;
     case "run.start": {
       await startTurnForConversation({
@@ -835,6 +990,9 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
       break;
     }
     case "run.steer": {
+      if (activeCompactionsByThread.has(command.threadId)) {
+        throw categorizedError("当前会话正在压缩上下文，暂时不能追加指令", "active_turn_busy");
+      }
       const attachmentInputs = await prepareAttachmentInputs(command.attachments);
       await appServer.request("turn/steer", {
         threadId: command.threadId,
@@ -875,11 +1033,14 @@ async function handleCommand(commandId: string, command: ControlCommand): Promis
         ? { conversationId: existing.command.conversationId }
         : existing.command.type === "run.start"
           ? { conversationId: existing.command.conversationId, runId: existing.command.runId }
+          : existing.command.type === "conversation.compact"
+            ? { conversationId: existing.command.conversationId, compactionId: existing.command.compactionId }
           : {};
       emitDurable({
         type: "agent.error",
         commandId,
         ...fatalContext,
+        errorCode: "unknown",
         message: error,
         occurredAt: timestamp(),
       });
@@ -904,11 +1065,15 @@ async function handleCommand(commandId: string, command: ControlCommand): Promis
       ? { conversationId: command.conversationId }
       : command.type === "run.start"
         ? { conversationId: command.conversationId, runId: command.runId }
+        : command.type === "conversation.compact"
+          ? { conversationId: command.conversationId, compactionId: command.compactionId }
         : {};
+    const errorCode = errorCodeFrom(error);
     emitDurable({
       type: "agent.error",
       commandId,
       ...fatalContext,
+      errorCode,
       message,
       occurredAt: timestamp(),
     });
@@ -963,6 +1128,11 @@ function connect(): void {
             turnId: run.turnId,
             workspaceId: run.workspaceId,
           })),
+          activeCompactions: [...activeCompactionsByThread.values()].map((compaction) => ({
+            compactionId: compaction.compactionId,
+            conversationId: compaction.conversationId,
+            threadId: compaction.threadId,
+          })),
           reportedAt: timestamp(),
         });
         scheduleTokenUsageBackfill(message.tokenUsageBackfill);
@@ -1009,7 +1179,16 @@ function connect(): void {
     if (shuttingDown) return;
     const baseDelay = Math.min(30_000, 1_000 * 2 ** reconnectAttempt++);
     const delay = baseDelay + Math.floor(Math.random() * 500);
-    console.warn(`[agent] control connection closed (${code} ${reason.toString()}); reconnecting in ${delay}ms`);
+    const diagnostic = code === 4400
+      ? `Agent 使用 control-protocol/v${CONTROL_PROTOCOL_VERSION}，请升级并重启 Control Plane 后再连接`
+      : code === 4401
+        ? "节点凭据无效或已撤销，请在 Web 重新生成注册 Token 并执行 agent.sh login"
+        : code === 4403
+          ? "节点身份与注册凭据不匹配，请确认 login 和 start 使用相同的 AGENT_DATA_DIR"
+          : null;
+    console.warn(
+      `[agent] control connection closed (${code} ${reason.toString()})${diagnostic ? `；${diagnostic}` : ""}; reconnecting in ${delay}ms`,
+    );
     reconnectTimer = setTimeout(connect, delay);
   });
 

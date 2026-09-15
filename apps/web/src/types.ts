@@ -59,8 +59,37 @@ export interface Conversation {
   pinnedAt: string | null;
   latestRunStatus: Run["status"] | null;
   tokenUsage: ConversationTokenUsage | null;
+  compaction?: ConversationCompaction | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type RunErrorCode =
+  | "context_window_exceeded"
+  | "session_budget_exceeded"
+  | "usage_limit_exceeded"
+  | "rate_limit_exceeded"
+  | "authentication_failed"
+  | "service_unavailable"
+  | "stream_interrupted"
+  | "sandbox_failed"
+  | "policy_blocked"
+  | "invalid_request"
+  | "active_turn_busy"
+  | "internal_error"
+  | "unknown";
+
+export interface ConversationCompaction {
+  id: string;
+  status: "queued" | "dispatching" | "running" | "recovering" | "completed" | "failed";
+  beforeContextTokens: number | null;
+  afterContextTokens: number | null;
+  errorCode: RunErrorCode | null;
+  error: string | null;
+  requestedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  recoveryDeadlineAt: string | null;
 }
 
 export interface ConversationTokenUsage {
@@ -79,11 +108,12 @@ export interface Run {
   clientRequestId: string | null;
   remoteTurnId: string | null;
   status: "queued" | "dispatching" | "running" | "waiting_approval" | "recovering" | "completed" | "failed" | "interrupted";
-  progressPhase: "analyzing" | "working" | "verifying" | "waiting_user" | "finalizing" | null;
+  progressPhase: "analyzing" | "working" | "verifying" | "waiting_user" | "finalizing" | "compacting" | "retrying" | null;
   progressLabel: string | null;
   progressUpdatedAt: string | null;
   recoveryDeadlineAt: string | null;
   error: string | null;
+  errorCode?: RunErrorCode | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;

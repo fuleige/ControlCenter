@@ -48,9 +48,9 @@ Browser ⇄ Control Plane ⇄ Node Agent ⇄ Codex App Server
 - 注册 CLI 是独立进程，必须独立解析同名参数。代理地址、用户名和密码不进入日志、协议或数据库。
 - Control Plane 对重复序列去重。
 
-当前实现已具备该基础；协议 v4 使用产品级消息和进度事件，并增加工作空间同步与在线验证。
+当前实现已具备该基础；协议 v5 使用产品级消息、进度和会话压缩事件，并增加工作空间同步与在线验证。
 
-## 3. 协议 v4
+## 3. 协议 v5
 
 ### 3.1 Agent 上报消息
 
@@ -61,6 +61,7 @@ Browser ⇄ Control Plane ⇄ Node Agent ⇄ Codex App Server
 - `run.progress`
 - `message.snapshot`
 - `conversation.tokenUsage`
+- `conversation.compaction`
 - `run.finished`
 - `interaction.requested`
 - `interaction.resolved`
@@ -76,7 +77,7 @@ interface RunProgressPayload {
   type: "run.progress";
   runId: string;
   conversationId: string;
-  phase: "analyzing" | "working" | "verifying" | "waiting_user" | "finalizing";
+  phase: "analyzing" | "working" | "verifying" | "waiting_user" | "finalizing" | "compacting" | "retrying";
   label: string;
   occurredAt: string;
 }
@@ -137,6 +138,14 @@ interface ConversationTokenUsagePayload {
 - Agent 对相同 Thread 的相同统计值去重后再进入耐久 Outbox，Control Plane 只接受会话所属节点和远端 Thread ID 均匹配且时间不早于已有记录的数据。
 - Token 更新只刷新当前打开会话的详情，不改变会话排序，也不触发全量会话列表刷新。
 - 首次升级到支持该字段的版本时，Control Plane 在 Agent 握手响应中只下发 `token_usage_json` 为空的旧会话；Agent 顺序执行本地 `thread/resume` 并立即取消订阅以触发一次统计回填。回填成功后该会话不再进入后续握手任务，新会话始终使用实时通知。
+
+### 3.6 `conversation.compaction`
+
+- Web 使用稳定 `clientRequestId` 发起压缩，Control Plane 先持久化会话级压缩状态和 `conversation.compact` 命令，再向 Agent 投递。
+- Agent 调用 Codex App Server 的 `thread/compact/start`；进度通过 `turn/*` 与 `contextCompaction` item 生命周期确认，不根据 RPC 的空响应提前判定完成。
+- 压缩状态为 `queued / dispatching / running / recovering / completed / failed`，与普通 Run 分离。活动压缩期间禁止开始新 Run、追加指令和删除会话。
+- 节点短暂断线时进入 `recovering`；Agent 重连上报活动压缩 ID 后恢复为 `running`。无法确认或超过 120 秒时明确失败，不自动重复压缩。
+- 会话消息不会因压缩被删除；压缩前后上下文 Token 仅作为状态快照，权威 Token 指标仍来自 `thread/tokenUsage/updated`。
 
 ## 4. Run 状态机
 
@@ -214,7 +223,9 @@ UI 事件日志只记录资源 ID、会话归属和变更类型，不保存对�
 
 浏览器按事件 `type` 和 `conversationId` 精准刷新节点、会话、审批、通知或设置；同一会话的流式消息事件最多每 500ms 合并刷新一次，会话列表最多每 1.5 秒刷新一次。SSE 正常时每 60 秒做一次权威全量同步，SSE 断开时切换为每 10 秒轮询，页面回到前台时立即同步。
 
-长对话首次只读取最近 60 条消息，通过不透明游标按需向前分页，每页最多 100 条；流式刷新合并最新页，不丢弃用户已经加载的较早消息。消息 DOM 同时使用动态高度虚拟列表，只渲染视口附近的消息并保留少量 overscan。自动定位必须禁用容器级全局平滑滚动，避免动态测量期间滚动位置与高度修正互相追赶；用户主动上滑后关闭流式跟随，显式点击“滑动到底部”再恢复。
+长对话首次只读取最近 60 条消息，通过不透明游标按需向前分页，每页最多 100 条。实时模式用最新页替换浏览器消息窗口，不跨刷新累计；用户主动加载更早消息后进入历史阅读模式，消息最多保留 500 条，继续向前翻页时丢弃窗口较新的部分，并用固定入口返回最新 60 条。历史阅读期间后台刷新只更新会话元数据、运行状态和审批，不把新消息混入当前阅读位置。消息 DOM 同时使用动态高度虚拟列表，只渲染视口附近的消息并保留少量 overscan。自动定位必须禁用容器级全局平滑滚动，避免动态测量期间滚动位置与高度修正互相追赶；用户主动上滑后关闭流式跟随，显式点击“滑动到底部”再恢复。
+
+会话侧栏每页读取 50 条、浏览器最多缓存 300 条。达到缓存上限后停止继续翻页，更早记录必须使用服务端会话名称搜索定位；节点切换、筛选或搜索条件变化会重新建立该条件下的缓存窗口。
 
 Agent 的 `model/list` 结果按 Codex 版本缓存在本机 24 小时。缓存过期时刷新一次；刷新失败继续使用旧缓存，不因进程反复重启持续请求模型目录。
 
@@ -236,6 +247,16 @@ Agent 的 `model/list` 结果按 Codex 版本缓存在本机 24 小时。缓存�
 
 Control Plane 为所有 HTTP 响应设置 `X-Request-Id`，跨域部署时显式暴露该响应头。未捕获的服务端异常记录完整结构化日志，浏览器只接收统一的中文错误和请求 ID；认证令牌、消息正文、命令输出与附件内容不得写入错误信息。
 
+### 6.2 Codex App Server 错误归类
+
+Agent 将 App Server `error` 通知中的 `codexErrorInfo` 映射为稳定的 `errorCode`，包括上下文超限、会话预算、使用额度、限流、登录失效、服务不可用、响应流中断、沙箱失败、安全策略阻止、无效请求、活动 Turn 冲突、内部错误和未知错误。
+
+- `willRetry=true` 只更新简洁进度为“正在自动重试”，不提前把 Run 或压缩标记失败。
+- 最终失败把业务化中文原因和 `errorCode` 一起写入 Run 或会话压缩状态，并保留截断、单行化的上游消息供排查。
+- Web 直接展示该业务原因；只有浏览器到 Control Plane 的 Fetch 失败才描述为网络或反向代理问题。
+- 上下文超限会突出压缩入口，但不会自动发起压缩；登录、额度、安全策略和无效请求等错误不做危险的自动重放。
+- 终态不可被迟到的 `agent.error` 覆盖，重复 Durable Message 和 Command Ack 必须幂等。
+
 ## 7. 数据模型与事务
 
 ### 7.1 新增表
@@ -243,6 +264,7 @@ Control Plane 为所有 HTTP 响应设置 `X-Request-Id`，跨域部署时显式
 - `messages(id, conversation_id, run_id, role, content, revision, complete, created_at, updated_at)`
 - `notifications(id, run_id, conversation_id, node_id, kind, status, read_at, created_at)`
 - `settings(scope, scope_id, key, value_json, updated_at)`
+- `conversations.compaction_json` 保存最近一次会话级压缩状态；`runs.error_code` 保存稳定错误分类。
 - `attachments(id, conversation_id, message_client_id, name, media_type, size, sha256, status, storage_key, expires_at, created_at)`
 - `ui_events(revision, type, resource_id, occurred_at)`
 
@@ -350,5 +372,6 @@ SQLite 使用 WAL、`busy_timeout` 和周期 checkpoint。正式长期运行需�
 10. 数据库从当前 schema 到新 schema 的迁移及回滚备份测试。
 11. 至少 160 条混合高度消息的虚拟渲染、首次定位、回到底部及流式跟随测试。
 12. 工作空间添加/复验/迁移/停用/删除、默认目录不可变、Agent 更换启动目录及同路径别名串行测试。
+13. 会话列表 300 条和历史消息 500 条的浏览器硬上限、历史阅读期间流式刷新隔离及返回最新窗口测试。
 
 在这些故障注入测试通过前，不把“自动恢复”标记为已完成。

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appServerArguments, parseThreadTokenUsage, threadStartSecurity, turnSandboxPolicy } from "./app-server-client.js";
+import { appServerArguments, classifyAppServerError, parseThreadTokenUsage, threadStartSecurity, turnSandboxPolicy } from "./app-server-client.js";
 
 describe("Codex App Server launch arguments", () => {
   it("uses the normal sandboxed mode by default", () => {
@@ -44,5 +44,45 @@ describe("Codex App Server token usage", () => {
   it("rejects malformed token usage notifications without crashing the Agent", () => {
     expect(parseThreadTokenUsage({ tokenUsage: { total: {}, last: {}, modelContextWindow: 400_000 } })).toBeNull();
     expect(parseThreadTokenUsage({ tokenUsage: { total: { totalTokens: 1 }, last: { totalTokens: -1 }, modelContextWindow: 400_000 } })).toBeNull();
+  });
+});
+
+describe("Codex App Server errors", () => {
+  it("classifies context exhaustion and keeps the upstream detail", () => {
+    expect(classifyAppServerError({
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: {
+        message: "maximum context length reached",
+        codexErrorInfo: "contextWindowExceeded",
+      },
+    })).toMatchObject({
+      code: "context_window_exceeded",
+      willRetry: false,
+      message: expect.stringContaining("请先压缩上下文"),
+      rawMessage: "maximum context length reached",
+    });
+  });
+
+  it("recognizes retryable stream and HTTP errors", () => {
+    expect(classifyAppServerError({
+      willRetry: true,
+      error: {
+        message: "stream disconnected",
+        codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } },
+      },
+    })).toMatchObject({
+      code: "stream_interrupted",
+      willRetry: true,
+      httpStatusCode: 502,
+      retryMessage: expect.stringContaining("自动重试"),
+    });
+    expect(classifyAppServerError({
+      error: {
+        message: "unauthorized",
+        codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 401 } },
+      },
+    }).code).toBe("authentication_failed");
   });
 });

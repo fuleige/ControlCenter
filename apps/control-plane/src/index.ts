@@ -262,9 +262,20 @@ function dispatch(command: CommandRecord): boolean {
       return false;
     }
   }
+  if (command.command.type === "conversation.compact") {
+    const conversation = database.getConversation(command.command.conversationId);
+    if (!conversation?.compaction || conversation.compaction.id !== command.command.compactionId
+      || ["completed", "failed"].includes(conversation.compaction.status)) {
+      database.updateCommand(command.id, "failed", "Compaction is no longer dispatchable", now());
+      return false;
+    }
+  }
   const sent = connections.sendCommand(command.nodeId, commandEnvelope(command));
   if (sent && (command.command.type === "run.start" || command.command.type === "conversation.start")) {
     database.markRunDispatching(command.command.runId);
+  }
+  if (sent && command.command.type === "conversation.compact") {
+    database.markConversationCompactionDispatching(command.command.conversationId, command.command.compactionId);
   }
   return sent;
 }
@@ -466,6 +477,12 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
         publish("usage.updated", payload.conversationId, payload.conversationId);
       }
       break;
+    case "conversation.compaction":
+      if (database.updateConversationCompaction(nodeId, payload)) {
+        publish("conversation.compaction", payload.compactionId, payload.conversationId);
+      }
+      shouldDispatchPending = payload.status !== "running";
+      break;
     case "run.finished":
       database.finishRun(payload);
       if (payload.status === "completed") notifyRun(payload.runId, "completed", "任务已完成", payload.finishedAt);
@@ -489,12 +506,22 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
         notifyRun(failedRunId, "failed", "节点重启后无法确认原任务状态", payload.reportedAt);
         publish("run.updated", failedRunId, database.getRun(failedRunId)?.conversationId);
       }
+      for (const conversationId of database.reconcileNodeCompactions(
+        nodeId,
+        (payload.activeCompactions ?? []).map((compaction) => compaction.compactionId),
+        payload.reportedAt,
+      )) {
+        publish("conversation.compaction", database.getConversation(conversationId)?.compaction?.id, conversationId);
+      }
       shouldDispatchPending = true;
       break;
     case "agent.error":
       database.applyAgentError(payload, receivedAt);
       if (payload.runId) notifyRun(payload.runId, "failed", payload.message, receivedAt);
       publish("agent.error", payload.runId ?? payload.conversationId, payload.conversationId);
+      if (payload.compactionId && payload.conversationId) {
+        publish("conversation.compaction", payload.compactionId, payload.conversationId);
+      }
       shouldDispatchPending = true;
       break;
     }
@@ -716,8 +743,13 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
       if (message.type === "agent.heartbeat") {
         database.updateHeartbeat(nodeId, message.activeRuns, now());
       } else if (message.type === "agent.commandAck") {
-        database.updateCommand(message.commandId, message.status, message.error ?? null, now());
-        publish("command.updated", message.commandId);
+        const command = database.getCommand(message.commandId);
+        if (!command || command.nodeId !== nodeId) {
+          app.log.warn({ nodeId, commandId: message.commandId }, "Ignored command acknowledgement from the wrong node");
+        } else {
+          database.updateCommand(message.commandId, message.status, message.error ?? null, now());
+          publish("command.updated", message.commandId);
+        }
       } else if (message.type === "agent.workspaceValidation") {
         if (!connections.resolveWorkspaceValidation(nodeId, message)) {
           app.log.warn({ nodeId, requestId: message.requestId }, "Received an unknown workspace validation response");
@@ -954,12 +986,72 @@ app.get<{
   };
 });
 
+app.post<{
+  Params: { id: string };
+  Body: { clientRequestId?: string };
+}>("/api/conversations/:id/compact", async (request, reply) => {
+  const conversation = database.getConversation(request.params.id);
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
+  const clientRequestId = request.body?.clientRequestId?.trim() || randomUUID();
+  if (clientRequestId.length > 128) {
+    return reply.code(400).send({ error: "客户端请求 ID 不能超过 128 个字符" });
+  }
+  const commandId = `compact:${clientRequestId}`;
+  const existing = database.getCommand(commandId);
+  if (existing) {
+    if (existing.command.type !== "conversation.compact" || existing.command.conversationId !== conversation.id) {
+      return reply.code(409).send({ error: "该客户端请求 ID 已用于另一个操作" });
+    }
+    const compaction = database.getConversation(conversation.id)?.compaction;
+    if (!compaction || compaction.id !== existing.command.compactionId) {
+      return reply.code(409).send({ error: "该压缩请求已经失效，请重新发起" });
+    }
+    return reply.code(200).send({
+      compaction,
+      dispatched: ["accepted", "completed"].includes(existing.status) || compaction.status !== "queued",
+      deduplicated: true,
+    });
+  }
+  if (conversation.status !== "ready" || !conversation.remoteThreadId) {
+    return reply.code(409).send({ error: "节点上的会话尚未就绪，暂时不能压缩上下文" });
+  }
+  if (database.hasActiveRun(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话仍有任务在运行，请等待完成或先中止任务" });
+  }
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话已经在压缩上下文，请勿重复操作" });
+  }
+  const node = database.listNodes().find((candidate) => candidate.id === conversation.nodeId);
+  if (!node || node.status !== "online" || !connections.has(conversation.nodeId)) {
+    return reply.code(409).send({ error: "节点当前离线，暂时不能压缩上下文" });
+  }
+  const requestedAt = now();
+  const compactionId = randomUUID();
+  const command = database.transaction(() => {
+    database.createConversationCompaction(conversation.id, compactionId, requestedAt);
+    return database.createCommand(commandId, conversation.nodeId, {
+      type: "conversation.compact",
+      compactionId,
+      conversationId: conversation.id,
+      threadId: conversation.remoteThreadId!,
+    }, requestedAt);
+  });
+  const dispatched = dispatch(command);
+  publish("conversation.compaction", compactionId, conversation.id);
+  return reply.code(202).send({
+    compaction: database.getConversation(conversation.id)?.compaction,
+    dispatched,
+    deduplicated: false,
+  });
+});
+
 app.delete<{ Params: { id: string } }>("/api/conversations/:id", async (request, reply) => {
   const conversation = database.getConversation(request.params.id);
   if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
-  const hasActiveRun = database.listRuns(conversation.id)
-    .some((run) => ["queued", "dispatching", "running", "waiting_approval", "recovering"].includes(run.status));
-  if (hasActiveRun) return reply.code(409).send({ error: "请先中止当前任务，再删除会话" });
+  if (database.hasActiveRun(conversation.id)) return reply.code(409).send({ error: "请先中止当前任务，再删除会话" });
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "会话正在压缩上下文，请等待压缩完成后再删除" });
+  }
   if (conversation.status === "creating" && !conversation.remoteThreadId) {
     return reply.code(409).send({ error: "会话仍在创建中，请稍后再试" });
   }
@@ -1013,6 +1105,7 @@ app.post<{
       pinnedAt: null,
       latestRunStatus: null,
       tokenUsage: null,
+      compaction: null,
       createdAt,
       updatedAt: createdAt,
     });
@@ -1084,6 +1177,7 @@ app.post<{
     pinnedAt: null,
     latestRunStatus: "queued",
     tokenUsage: null,
+    compaction: null,
     createdAt,
     updatedAt: createdAt,
   } as const;
@@ -1101,6 +1195,7 @@ app.post<{
     progressUpdatedAt: createdAt,
     recoveryDeadlineAt: null,
     error: null,
+    errorCode: null,
     createdAt,
     startedAt: null,
     finishedAt: null,
@@ -1167,8 +1262,14 @@ app.post<{
   if (conversation.status !== "ready" || !conversation.remoteThreadId) {
     return reply.code(409).send({ error: "节点上的会话尚未就绪，请稍后再试" });
   }
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再发送消息" });
+  }
   const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
   if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再发送消息" });
+  }
   const createdAt = now();
   const runId = randomUUID();
   const model = body.model?.trim() || conversation.model;
@@ -1187,6 +1288,7 @@ app.post<{
     progressUpdatedAt: createdAt,
     recoveryDeadlineAt: null,
     error: null,
+    errorCode: null,
     createdAt,
     startedAt: null,
     finishedAt: null,
@@ -1232,8 +1334,14 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
   if (!conversation?.remoteThreadId || conversation.status !== "ready") {
     return reply.code(409).send({ error: "节点上的会话尚未就绪，请稍后再试" });
   }
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再重新执行任务" });
+  }
   const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
   if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再重新执行任务" });
+  }
   const clientRequestId = `retry:${sourceRun.id}`;
   const existingRetry = database.getRunByClientRequestId(clientRequestId);
   if (existingRetry) {
@@ -1274,6 +1382,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
     progressUpdatedAt: createdAt,
     recoveryDeadlineAt: null,
     error: null,
+    errorCode: null,
     createdAt,
     startedAt: null,
     finishedAt: null,
@@ -1598,6 +1707,9 @@ const staleTimer = setInterval(() => {
   for (const runId of database.failExpiredRecoveringRuns(currentTime)) {
     notifyRun(runId, "failed", "无法确认远端任务状态", currentTime);
     publish("run.updated", runId, database.getRun(runId)?.conversationId);
+  }
+  for (const conversationId of database.failExpiredRecoveringCompactions(currentTime)) {
+    publish("conversation.compaction", database.getConversation(conversationId)?.compaction?.id, conversationId);
   }
   for (const [sessionId, presence] of uiPresence) {
     if (presence.seenAt < Date.now() - 60_000) uiPresence.delete(sessionId);

@@ -3,6 +3,7 @@ import type {
   AgentPackageInfo,
   AttachmentRecord,
   Conversation,
+  ConversationCompaction,
   ConversationDetail,
   GlobalSettings,
   EnrollmentToken,
@@ -320,6 +321,16 @@ export async function startRun(
     method: "POST",
     body: JSON.stringify({ prompt, ...options }),
   })).run;
+}
+
+export async function compactConversation(
+  conversationId: string,
+  clientRequestId: string,
+): Promise<ConversationCompaction> {
+  return (await api<{ compaction: ConversationCompaction }>(`/api/conversations/${encodeURIComponent(conversationId)}/compact`, {
+    method: "POST",
+    body: JSON.stringify({ clientRequestId }),
+  })).compaction;
 }
 
 export async function steerRun(

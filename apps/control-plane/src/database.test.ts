@@ -73,6 +73,7 @@ describe("ControlDatabase", () => {
       pinnedAt: null,
       latestRunStatus: null,
       tokenUsage: null,
+      compaction: null,
       createdAt: at,
       updatedAt: at,
     });
@@ -90,6 +91,7 @@ describe("ControlDatabase", () => {
       pinnedAt: null,
       latestRunStatus: null,
       tokenUsage: null,
+      compaction: null,
       createdAt: "2026-09-09T10:00:01.000Z",
       updatedAt: "2026-09-09T10:00:01.000Z",
     });
@@ -143,6 +145,7 @@ describe("ControlDatabase", () => {
       progressUpdatedAt: null,
       recoveryDeadlineAt: null,
       error: null,
+      errorCode: null,
       createdAt: at,
       startedAt: null,
       finishedAt: null,
@@ -355,6 +358,7 @@ describe("ControlDatabase", () => {
       pinnedAt: null,
       latestRunStatus: null,
       tokenUsage: null,
+      compaction: null,
       createdAt: firstAt,
       updatedAt: firstAt,
     });
@@ -372,6 +376,7 @@ describe("ControlDatabase", () => {
       pinnedAt: null,
       latestRunStatus: null,
       tokenUsage: null,
+      compaction: null,
       createdAt: firstAt,
       updatedAt: firstAt,
     });
@@ -386,6 +391,103 @@ describe("ControlDatabase", () => {
     expect(database.deleteUnusedWorkspace(descriptor.id, "managed-b")).toBe(true);
     expect(database.getWorkspace(descriptor.id, "managed-b")).toBeNull();
     expect(database.deleteUnusedWorkspace(descriptor.id, "default-a")).toBe(false);
+    database.close();
+  });
+
+  it("persists context compaction progress, recovery, completion, and categorized failures", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "control-plane-compaction-test-"));
+    directories.push(directory);
+    const database = new ControlDatabase(path.join(directory, "test.db"), { recoverRuntimeState: false });
+    const requestedAt = "2026-09-15T08:00:00.000Z";
+    database.upsertNode({
+      id: "node-compact",
+      name: "Compact host",
+      platform: "linux",
+      arch: "x64",
+      agentVersion: "0.3.7",
+      codexVersion: "codex-cli 0.154.0",
+      permissionMode: "workspace-write",
+      maxConcurrentRuns: 1,
+      workspaces: [{ id: "default", name: "Default", path: "/repo", source: "default", isDefault: true }],
+      models: [],
+    }, "boot-1", requestedAt);
+    database.createConversation({
+      id: "conversation-compact",
+      nodeId: "node-compact",
+      workspaceId: "default",
+      title: "Long conversation",
+      model: null,
+      effort: null,
+      clientRequestId: null,
+      remoteThreadId: "thread-compact",
+      status: "ready",
+      error: null,
+      pinnedAt: null,
+      latestRunStatus: null,
+      tokenUsage: null,
+      compaction: null,
+      createdAt: requestedAt,
+      updatedAt: requestedAt,
+    });
+    database.updateConversationTokenUsage("node-compact", {
+      type: "conversation.tokenUsage",
+      conversationId: "conversation-compact",
+      threadId: "thread-compact",
+      totalTokens: 180_000,
+      contextTokens: 80_000,
+      modelContextWindow: 100_000,
+      updatedAt: requestedAt,
+    });
+
+    expect(database.createConversationCompaction("conversation-compact", "compact-1", requestedAt)).toMatchObject({
+      status: "queued",
+      beforeContextTokens: 80_000,
+    });
+    database.markConversationCompactionDispatching("conversation-compact", "compact-1");
+    expect(database.getConversation("conversation-compact")?.compaction?.status).toBe("dispatching");
+    expect(database.updateConversationCompaction("node-compact", {
+      type: "conversation.compaction",
+      compactionId: "compact-1",
+      conversationId: "conversation-compact",
+      threadId: "thread-compact",
+      status: "running",
+      beforeContextTokens: 80_000,
+      occurredAt: "2026-09-15T08:00:01.000Z",
+    })).toBe(true);
+    database.markNodeOffline("node-compact", "2026-09-15T08:00:02.000Z");
+    expect(database.getConversation("conversation-compact")?.compaction?.status).toBe("recovering");
+    expect(database.reconcileNodeCompactions("node-compact", ["compact-1"], "2026-09-15T08:00:03.000Z")).toEqual(["conversation-compact"]);
+    expect(database.updateConversationCompaction("node-compact", {
+      type: "conversation.compaction",
+      compactionId: "compact-1",
+      conversationId: "conversation-compact",
+      threadId: "thread-compact",
+      status: "completed",
+      beforeContextTokens: 80_000,
+      afterContextTokens: 24_000,
+      occurredAt: "2026-09-15T08:00:04.000Z",
+    })).toBe(true);
+    expect(database.getConversation("conversation-compact")?.compaction).toMatchObject({
+      status: "completed",
+      beforeContextTokens: 80_000,
+      afterContextTokens: 24_000,
+      error: null,
+    });
+
+    database.createConversationCompaction("conversation-compact", "compact-2", "2026-09-15T08:01:00.000Z");
+    database.applyAgentError({
+      type: "agent.error",
+      conversationId: "conversation-compact",
+      compactionId: "compact-2",
+      errorCode: "authentication_failed",
+      message: "节点上的 Codex 登录已失效，请在节点重新登录",
+      occurredAt: "2026-09-15T08:01:01.000Z",
+    }, "2026-09-15T08:01:01.000Z");
+    expect(database.getConversation("conversation-compact")?.compaction).toMatchObject({
+      status: "failed",
+      errorCode: "authentication_failed",
+      error: expect.stringContaining("登录已失效"),
+    });
     database.close();
   });
 

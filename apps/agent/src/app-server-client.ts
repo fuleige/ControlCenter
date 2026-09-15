@@ -1,7 +1,129 @@
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
-import { isRecord } from "@controller-center/protocol";
+import { isRecord, type RunErrorCode } from "@controller-center/protocol";
+
+export interface ClassifiedAppServerError {
+  code: RunErrorCode;
+  message: string;
+  retryMessage: string;
+  rawMessage: string;
+  willRetry: boolean;
+  httpStatusCode: number | null;
+}
+
+export class AppServerRpcError extends Error {
+  readonly code: number | null;
+  readonly data: unknown;
+
+  constructor(message: string, code: number | null, data: unknown) {
+    super(message);
+    this.name = "AppServerRpcError";
+    this.code = code;
+    this.data = data;
+  }
+}
+
+function oneLineMessage(value: unknown, fallback = "Codex 执行失败"): string {
+  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (!text) return fallback;
+  return text.length > 260 ? `${text.slice(0, 260)}…` : text;
+}
+
+function errorInfoName(value: unknown): { name: string; httpStatusCode: number | null } {
+  if (typeof value === "string") return { name: value, httpStatusCode: null };
+  if (!isRecord(value)) return { name: "other", httpStatusCode: null };
+  const [name, details] = Object.entries(value)[0] ?? ["other", null];
+  const status = isRecord(details) && typeof details.httpStatusCode === "number"
+    ? details.httpStatusCode
+    : null;
+  return { name, httpStatusCode: status };
+}
+
+function normalizedErrorName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9]/g, "").toLocaleLowerCase();
+}
+
+function withRawMessage(summary: string, raw: string): string {
+  if (!raw || normalizedErrorName(raw) === normalizedErrorName(summary)) return summary;
+  return `${summary}：${raw}`;
+}
+
+/** Convert App Server error notifications into stable product-facing categories. */
+export function classifyAppServerError(input: unknown): ClassifiedAppServerError {
+  const envelope = isRecord(input) ? input : {};
+  const error = isRecord(envelope.error) ? envelope.error : envelope;
+  const rawMessage = oneLineMessage(error.message);
+  const info = errorInfoName(error.codexErrorInfo);
+  const name = normalizedErrorName(info.name);
+  const willRetry = envelope.willRetry === true;
+  let code: RunErrorCode = "unknown";
+  let summary = "Codex 执行失败";
+  let retryMessage = "Codex 暂时出错，正在自动重试";
+
+  if (name === "contextwindowexceeded") {
+    code = "context_window_exceeded";
+    summary = "当前上下文已超出模型限制，请先压缩上下文后再继续";
+    retryMessage = "上下文空间不足，Codex 正在尝试恢复";
+  } else if (name === "sessionbudgetexceeded") {
+    code = "session_budget_exceeded";
+    summary = "当前会话已达到执行预算限制";
+    retryMessage = "会话预算暂时受限，Codex 正在重试";
+  } else if (name === "usagelimitexceeded") {
+    code = "usage_limit_exceeded";
+    summary = "Codex 使用额度已耗尽，请等待额度恢复后重试";
+    retryMessage = "Codex 使用额度暂时受限，正在重试";
+  } else if (name === "ratelimitexceeded") {
+    code = "rate_limit_exceeded";
+    summary = "Codex 请求频率受限，请稍后重试";
+    retryMessage = "Codex 请求频率受限，正在自动重试";
+  } else if (name === "unauthorized") {
+    code = "authentication_failed";
+    summary = "节点上的 Codex 登录已失效，请在节点重新登录";
+    retryMessage = "Codex 登录状态异常，正在尝试恢复";
+  } else if (name === "serveroverloaded" || name === "httpconnectionfailed") {
+    code = info.httpStatusCode === 401 || info.httpStatusCode === 403
+      ? "authentication_failed"
+      : "service_unavailable";
+    summary = code === "authentication_failed"
+      ? "节点上的 Codex 登录或访问权限已失效"
+      : "暂时无法连接 Codex 服务，请稍后重试";
+    retryMessage = "Codex 服务暂时不可用，正在自动重试";
+  } else if (["responsestreamconnectionfailed", "responsestreamdisconnected", "responsetoomanyfailedattempts"].includes(name)) {
+    code = "stream_interrupted";
+    summary = "Codex 响应流连接中断，请稍后重试";
+    retryMessage = "Codex 响应连接中断，正在自动重试";
+  } else if (name === "sandboxerror") {
+    code = "sandbox_failed";
+    summary = "Codex 沙箱执行失败，请检查节点权限和工作空间";
+    retryMessage = "Codex 沙箱暂时异常，正在自动重试";
+  } else if (["cyberpolicy", "misalignmentpolicyviolation"].includes(name)) {
+    code = "policy_blocked";
+    summary = "该请求被 Codex 安全策略阻止";
+    retryMessage = "Codex 正在重新检查请求";
+  } else if (["badrequest", "threadrollbackfailed"].includes(name)) {
+    code = "invalid_request";
+    summary = "Codex 无法处理当前请求";
+    retryMessage = "Codex 正在重新尝试当前请求";
+  } else if (name === "activeturnnotsteerable") {
+    code = "active_turn_busy";
+    summary = "当前会话正在压缩或执行其他专用操作，暂时不能追加指令";
+    retryMessage = "当前会话暂时忙碌，Codex 正在等待继续";
+  } else if (name === "internalservererror") {
+    code = "internal_error";
+    summary = "Codex 内部服务异常，请稍后重试";
+    retryMessage = "Codex 内部服务异常，正在自动重试";
+  }
+
+  return {
+    code,
+    message: withRawMessage(summary, rawMessage),
+    retryMessage,
+    rawMessage,
+    willRetry,
+    httpStatusCode: info.httpStatusCode,
+  };
+}
 
 export interface ThreadTokenUsageSummary {
   totalTokens: number;
@@ -138,7 +260,7 @@ export class AppServerClient extends EventEmitter {
       clientInfo: {
         name: "controller_center_agent",
         title: "Controller Center Agent",
-        version: "0.3.6",
+        version: "0.3.7",
       },
     });
     this.notify("initialized", {});
@@ -170,7 +292,11 @@ export class AppServerClient extends EventEmitter {
     clearTimeout(pending.timeout);
     this.pending.delete(message.id);
     if (isRecord(message.error)) {
-      pending.reject(new Error(String(message.error.message ?? "Unknown app-server error")));
+      pending.reject(new AppServerRpcError(
+        String(message.error.message ?? "Unknown app-server error"),
+        typeof message.error.code === "number" ? message.error.code : null,
+        message.error.data,
+      ));
     } else {
       pending.resolve(message.result);
     }

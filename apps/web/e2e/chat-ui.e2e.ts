@@ -137,9 +137,19 @@ const longConversationHistory = Array.from({ length: 160 }, (_, index) => {
   };
 });
 
-async function mockControlCenter(page: Page) {
+async function mockControlCenter(page: Page, options: { idleConversation?: boolean; paginatedHistory?: boolean } = {}) {
   const presenceReports: Array<{ conversationId?: string | null; visible?: boolean }> = [];
   const quickSearchRequests: string[] = [];
+  const compactRequests: Array<{ clientRequestId?: string }> = [];
+  let compactionState: Record<string, unknown> | null = null;
+  const conversationResponse = () => ({
+    ...conversation,
+    latestRunStatus: options.idleConversation ? "completed" : conversation.latestRunStatus,
+    compaction: compactionState,
+  });
+  const runResponse = options.idleConversation
+    ? { ...run, status: "completed", remoteTurnId: null, progressPhase: null, progressLabel: null, finishedAt: now }
+    : run;
   await page.addInitScript(() => {
     sessionStorage.setItem("controller-center:selected-node", "qa-node");
     sessionStorage.setItem("controller-center:selected-conversation", "qa-conversation");
@@ -156,12 +166,27 @@ async function mockControlCenter(page: Page) {
       await route.fulfill({ json: { data: node.workspaces } });
     } else if (url.pathname === "/api/conversations") {
       if (!url.searchParams.has("nodeId")) quickSearchRequests.push(url.search);
-      await route.fulfill({ json: { data: [conversation] } });
+      await route.fulfill({ json: { data: [conversationResponse()] } });
+    } else if (url.pathname === `/api/conversations/${conversation.id}/compact`) {
+      compactRequests.push(route.request().postDataJSON() as { clientRequestId?: string });
+      compactionState = {
+        id: "qa-compaction",
+        status: "running",
+        beforeContextTokens: conversation.tokenUsage.contextTokens,
+        afterContextTokens: null,
+        errorCode: null,
+        error: null,
+        requestedAt: now,
+        startedAt: now,
+        finishedAt: null,
+        recoveryDeadlineAt: null,
+      };
+      await route.fulfill({ status: 202, json: { compaction: compactionState, dispatched: true, deduplicated: false } });
     } else if (url.pathname === `/api/conversations/${conversation.id}`) {
       await route.fulfill({
         json: {
-          conversation,
-          runs: [run],
+          conversation: conversationResponse(),
+          runs: [runResponse],
           approvals: [],
           attachments: [],
           messages: [...longConversationHistory, {
@@ -187,6 +212,11 @@ async function mockControlCenter(page: Page) {
             createdAt: "2026-09-10T00:00:01.000Z",
             updatedAt: "2026-09-10T00:00:02.000Z",
           }],
+          messagePage: options.paginatedHistory
+            ? url.searchParams.has("beforeMessage")
+              ? { hasMore: false, before: null }
+              : { hasMore: true, before: "older-message-cursor" }
+            : { hasMore: false, before: null },
         },
       });
     } else if (url.pathname === "/api/approvals") {
@@ -218,8 +248,31 @@ async function mockControlCenter(page: Page) {
       await route.fulfill({ status: 204 });
     }
   });
-  return { presenceReports, quickSearchRequests };
+  return { presenceReports, quickSearchRequests, compactRequests };
 }
+
+test("手动压缩上下文需要确认并在执行期间锁定输入", async ({ page }) => {
+  const { compactRequests } = await mockControlCenter(page, { idleConversation: true });
+  await page.goto("/");
+
+  const compactButton = page.getByRole("button", { name: "压缩", exact: true });
+  await expect(compactButton).toBeEnabled();
+  await compactButton.click();
+  const dialog = page.getByRole("dialog", { name: "压缩当前会话？" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("聊天记录仍会保留");
+  await expect(dialog).toContainText("会消耗一定 Token");
+  await dialog.getByRole("button", { name: "取消" }).click();
+  await expect(dialog).toBeHidden();
+
+  await compactButton.click();
+  await dialog.getByRole("button", { name: "确认压缩" }).click();
+  await expect.poll(() => compactRequests.length).toBe(1);
+  expect(compactRequests[0]?.clientRequestId).toBeTruthy();
+  await expect(page.getByRole("button", { name: "正在压缩" })).toBeDisabled();
+  await expect(page.locator(".composer textarea")).toBeDisabled();
+  await expect(page.locator(".composer textarea")).toHaveAttribute("placeholder", "正在压缩上下文…");
+});
 
 test("长对话可以滚动并正确渲染代码、公式和移动布局", async ({ page, context }, testInfo) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "http://127.0.0.1:5173" });
@@ -231,6 +284,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await expect(page.locator(".composer .conversation-usage")).toContainText("总计457k");
   await expect(page.locator(".composer .conversation-usage")).toContainText("窗口400k");
   await expect(page.locator(".composer .conversation-usage")).toContainText("占用31%");
+  await expect(page.getByRole("button", { name: "压缩", exact: true })).toBeDisabled();
   await expect(page.locator(".chat-header")).toHaveCount(0);
   await expect(page.locator(".markdown-content").last()).toBeVisible();
   await expect.poll(() => page.locator(".virtual-timeline-row").count()).toBeLessThan(30);
@@ -358,7 +412,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
     await expect(mobileToolbar.locator("button").nth(3)).toContainText("设置");
     await expect(mobileToolbar.locator(".node-count")).toHaveCount(0);
   }
-  await expect(page.locator(".settings-version")).toContainText("v0.3.6");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.7");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -431,6 +485,26 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
     await expect(page.getByRole("button", { name: "新建会话" })).toBeVisible();
     await page.screenshot({ path: "/tmp/controller-center-desktop-collapsed.png", fullPage: true });
   }
+});
+
+test("历史消息使用有界阅读模式并可返回最新消息", async ({ page }) => {
+  await mockControlCenter(page, { idleConversation: true, paginatedHistory: true });
+  await page.goto("/");
+
+  const timeline = page.locator(".timeline");
+  await expect(page.locator(".markdown-content").last()).toBeVisible();
+  await timeline.evaluate((element) => { element.scrollTop = 0; });
+  const loadEarlier = page.getByRole("button", { name: "加载更早消息" });
+  await expect(loadEarlier).toBeVisible();
+  await loadEarlier.click();
+
+  const returnLatest = page.getByRole("button", { name: "历史阅读模式 · 返回最新消息" });
+  await expect(returnLatest).toBeVisible();
+  await expect(returnLatest).toHaveAttribute("title", /最多保留 500 条/);
+  await returnLatest.click();
+
+  await expect(returnLatest).toBeHidden();
+  await expect.poll(() => timeline.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(2);
 });
 
 test("后台运行会话的延迟刷新不会抢回当前会话", async ({ page }, testInfo) => {
@@ -874,14 +948,14 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
     } else if (url.pathname === "/api/agent-package/download") {
       await route.fulfill({
         contentType: "application/gzip",
-        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.6.tar.gz\"" },
+        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.7.tar.gz\"" },
         body: "portable-agent-package",
       });
     } else if (url.pathname === "/api/agent-package") {
       await route.fulfill({ json: { package: {
         available: true,
-        version: "0.3.6",
-        fileName: "controller-center-agent-v0.3.6.tar.gz",
+        version: "0.3.7",
+        fileName: "controller-center-agent-v0.3.7.tar.gz",
         size: 580_000,
         sha256: "cb9bd8bd4ff984ee13b78a4f9b1ff9a72b950ed2a468d69e20fc0abe1bda2aa6",
         builtAt: now,
@@ -899,10 +973,10 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
-  await expect(page.getByText("v0.3.6 · 566 KB · Linux / macOS")).toBeVisible();
+  await expect(page.getByText("v0.3.7 · 566 KB · Linux / macOS")).toBeVisible();
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载客户端" }).click();
-  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.6.tar.gz");
+  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.7.tar.gz");
   await page.getByRole("button", { name: "生成注册 Token" }).click();
   await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
   await expect(page.getByText(registrationToken)).toBeVisible();

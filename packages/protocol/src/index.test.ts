@@ -58,4 +58,38 @@ describe("wire protocol", () => {
       suggestedName: "example",
     })).type).toBe("agent.workspaceValidation");
   });
+
+  it("parses context compaction commands and durable state", () => {
+    const control = parseControlMessage(JSON.stringify({
+      type: "control.command",
+      commandId: "command-compact",
+      createdAt: "2026-09-15T00:00:00.000Z",
+      command: {
+        type: "conversation.compact",
+        compactionId: "compact-1",
+        conversationId: "conversation-1",
+        threadId: "thread-1",
+      },
+    }));
+    expect(control.type).toBe("control.command");
+    if (control.type === "control.command") expect(control.command.type).toBe("conversation.compact");
+
+    const durable = parseAgentMessage(JSON.stringify({
+      type: "agent.message",
+      bootId: "boot-1",
+      sequence: 7,
+      payload: {
+        type: "conversation.compaction",
+        compactionId: "compact-1",
+        conversationId: "conversation-1",
+        threadId: "thread-1",
+        status: "completed",
+        beforeContextTokens: 90_000,
+        afterContextTokens: 24_000,
+        occurredAt: "2026-09-15T00:00:05.000Z",
+      },
+    }));
+    expect(durable.type).toBe("agent.message");
+    if (durable.type === "agent.message") expect(durable.payload.type).toBe("conversation.compaction");
+  });
 });

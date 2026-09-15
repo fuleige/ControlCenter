@@ -1,4 +1,4 @@
-export const CONTROL_PROTOCOL_VERSION = 4 as const;
+export const CONTROL_PROTOCOL_VERSION = 5 as const;
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -22,6 +22,42 @@ export interface ManagedWorkspaceDescriptor {
 }
 
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export type RunErrorCode =
+  | "context_window_exceeded"
+  | "session_budget_exceeded"
+  | "usage_limit_exceeded"
+  | "rate_limit_exceeded"
+  | "authentication_failed"
+  | "service_unavailable"
+  | "stream_interrupted"
+  | "sandbox_failed"
+  | "policy_blocked"
+  | "invalid_request"
+  | "active_turn_busy"
+  | "internal_error"
+  | "unknown";
+
+export type ConversationCompactionStatus =
+  | "queued"
+  | "dispatching"
+  | "running"
+  | "recovering"
+  | "completed"
+  | "failed";
+
+export interface ConversationCompaction {
+  id: string;
+  status: ConversationCompactionStatus;
+  beforeContextTokens: number | null;
+  afterContextTokens: number | null;
+  errorCode: RunErrorCode | null;
+  error: string | null;
+  requestedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  recoveryDeadlineAt: string | null;
+}
 
 export interface ModelReasoningEffort {
   reasoningEffort: ReasoningEffort;
@@ -103,11 +139,12 @@ export interface RunFinishedPayload {
   threadId: string;
   turnId: string;
   status: "completed" | "failed" | "interrupted";
+  errorCode?: RunErrorCode;
   error?: string;
   finishedAt: string;
 }
 
-export type RunProgressPhase = "analyzing" | "working" | "verifying" | "waiting_user" | "finalizing";
+export type RunProgressPhase = "analyzing" | "working" | "compacting" | "retrying" | "verifying" | "waiting_user" | "finalizing";
 
 export interface RunProgressPayload {
   type: "run.progress";
@@ -147,6 +184,19 @@ export interface ConversationTokenUsagePayload extends ConversationTokenUsage {
   turnId?: string;
 }
 
+export interface ConversationCompactionPayload {
+  type: "conversation.compaction";
+  compactionId: string;
+  conversationId: string;
+  threadId: string;
+  status: "running" | "completed" | "failed";
+  beforeContextTokens?: number;
+  afterContextTokens?: number;
+  errorCode?: RunErrorCode;
+  error?: string;
+  occurredAt: string;
+}
+
 export interface InteractionRequestedPayload {
   type: "interaction.requested";
   approvalId: string;
@@ -178,6 +228,11 @@ export interface AgentStateReportPayload {
     turnId: string;
     workspaceId: string;
   }>;
+  activeCompactions: Array<{
+    compactionId: string;
+    conversationId: string;
+    threadId: string;
+  }>;
   reportedAt: string;
 }
 
@@ -186,6 +241,8 @@ export interface AgentErrorPayload {
   commandId?: string;
   conversationId?: string;
   runId?: string;
+  compactionId?: string;
+  errorCode?: RunErrorCode;
   message: string;
   occurredAt: string;
 }
@@ -196,6 +253,7 @@ export type DurableAgentPayload =
   | RunProgressPayload
   | MessageSnapshotPayload
   | ConversationTokenUsagePayload
+  | ConversationCompactionPayload
   | RunFinishedPayload
   | InteractionRequestedPayload
   | InteractionResolvedPayload
@@ -281,6 +339,13 @@ export interface InterruptRunCommand {
   turnId: string;
 }
 
+export interface CompactConversationCommand {
+  type: "conversation.compact";
+  compactionId: string;
+  conversationId: string;
+  threadId: string;
+}
+
 export interface ResolveApprovalCommand {
   type: "approval.resolve";
   approvalId: string;
@@ -294,6 +359,7 @@ export type ControlCommand =
   | StartRunCommand
   | SteerRunCommand
   | InterruptRunCommand
+  | CompactConversationCommand
   | ResolveApprovalCommand;
 
 export interface ControlCommandMessage {

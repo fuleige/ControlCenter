@@ -17,7 +17,9 @@
 Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agent -- stdio --> Codex App Server
 ```
 
-控制中心与 Agent 使用自有 `control-protocol/v4`。Codex JSON-RPC 的版本差异只在 Agent 内处理。
+控制中心与 Agent 使用自有 `control-protocol/v5`。Codex JSON-RPC 的版本差异只在 Agent 内处理。
+
+升级到包含新协议的版本时，必须先完成并重启 Control Plane，再启动同版本 Agent；`4400 Protocol mismatch` 表示双方仍运行不同协议版本，不需要重新注册节点。
 
 ## 已实现能力
 
@@ -41,14 +43,16 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - 主内容区任务中心只保留全局节点菜单，隐藏依赖当前节点的历史会话栏；仅在用户未查看对应会话时生成未读完成、失败或等待操作通知，并展示会话名与对应任务最新回复摘要。
 - 任务中心支持会话名称/节点名称搜索、节点与状态筛选、全部标为已读，以及失败任务幂等重新执行。
 - 全局快速切换支持按节点名称或会话名称搜索所有节点和跨节点历史会话；空关键词不加载历史会话，有关键词时最多返回 10 条会话结果。桌面端可使用 `Ctrl/Cmd + K`，移动端底部工具栏按“节点、消息、搜索、设置”排列，节点入口直接显示在线数/总数。
-- 会话列表使用服务端名称搜索与游标分页，每页 50 条；不会下载或检索消息正文、代码和附件内容。
+- 会话列表使用服务端名称搜索与游标分页，每页 50 条，浏览器最多缓存 300 条；更早会话继续通过名称搜索访问，不会下载或检索消息正文、代码和附件内容。
 - 任务中心最多展示 200 条，摘要最多 120 个字符；已读通知保留 30 天、未读通知保留 90 天，通知清理不影响会话历史。
 - 全局默认模型和思考强度设置，节点不支持偏好模型时回退本机默认；设置页展示构建版本号。
 - 文件上传、拖拽和粘贴图片；分片续传、SHA-256 校验和 Agent 本地缓存。
 - Agent 本地 SQLite inbox/outbox、命令去重、消息补发和重连状态协调。
 - 浏览器 SSE 使用持久游标重放并按资源精准刷新；正常连接时每 60 秒权威同步，断线时每 10 秒兜底轮询，页面恢复可见时立即同步。
 - 回复流式刷新时同步渲染 Markdown 和 KaTeX，兼容 `$...$`、`$$...$$`、`\(...\)` 与 `\[...\]`。
-- 长对话默认读取最近 60 条消息，可按游标加载更早消息；同时使用动态高度虚拟列表，并保持刷新恢复、流式跟随和回到底部行为一致。
+- 长对话默认读取最近 60 条消息，可按游标加载更早消息；历史阅读窗口最多保留 500 条，并提供“返回最新消息”，同时使用动态高度虚拟列表，避免长时间挂机或连续翻页导致前端内存无限增长。
+- 已就绪且没有运行中任务的会话可在输入框附近手动压缩上下文；操作需要二次确认，压缩状态可跨刷新和短暂断线恢复，聊天记录不会被删除。
+- Codex App Server 错误会归类为上下文超限、额度/限流、登录失效、服务或响应流中断、沙箱、安全策略、无效请求等稳定业务类型，同时保留简短上游诊断信息。
 - 控制中心 SQLite WAL 持久化与审计数据。
 - 手机端分层导航、底部输入区、安全区适配和全宽审批卡片。
 
@@ -145,7 +149,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可直接下载当前版本的完整客户端安装包；该包已经包含编译结果和生产依赖，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.6.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.7.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
