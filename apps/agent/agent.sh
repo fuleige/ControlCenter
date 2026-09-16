@@ -134,7 +134,13 @@ run_login() {
     shift
   done
   if [[ "$has_server" == false ]]; then
-    forwarded=(--server "$default_server" "${forwarded[@]}")
+    # macOS still ships Bash 3.2, where expanding an empty array under
+    # `set -u` raises "unbound variable" even when the array was initialized.
+    if [[ "${forwarded[0]+set}" == set ]]; then
+      forwarded=(--server "$default_server" "${forwarded[@]}")
+    else
+      forwarded=(--server "$default_server")
+    fi
   fi
   if [[ "$use_direct" == false && "$explicit_direct" == true ]]; then
     echo "错误：--all-proxy 与 --codex-proxy-only 不能同时使用。" >&2
@@ -191,13 +197,21 @@ run_start() {
     exit 1
   fi
   if [[ "$safe" == false && "$explicit_yolo" == false ]]; then
-    forwarded=(--yolo "${forwarded[@]}")
+    if [[ "${forwarded[0]+set}" == set ]]; then
+      forwarded=(--yolo "${forwarded[@]}")
+    else
+      forwarded=(--yolo)
+    fi
   fi
   if [[ "$use_direct" == true && "$explicit_direct" == false ]]; then
     forwarded+=(--codex-proxy-only)
   fi
 
-  exec node "$agent_file" "${forwarded[@]}"
+  if [[ "${forwarded[0]+set}" == set ]]; then
+    exec node "$agent_file" "${forwarded[@]}"
+  else
+    exec node "$agent_file"
+  fi
 }
 
 show_status() {
