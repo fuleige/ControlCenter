@@ -151,7 +151,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     nodeName: process.env.AGENT_NAME?.trim() || os.hostname(),
     dataDirectory,
     codexBinary: process.env.CODEX_BIN ?? "codex",
-    maxConcurrentRuns: integerEnv("MAX_CONCURRENT_RUNS", 2),
+    maxConcurrentRuns: integerEnv("MAX_CONCURRENT_RUNS", 5),
     networkAccess: process.env.AGENT_NETWORK_ACCESS === "true",
     yolo: argv.includes("--yolo"),
     codexProxyOnly: codexProxyOnlyFromArgv(argv),

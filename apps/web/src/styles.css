@@ -411,6 +411,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   font-size: 10px;
   white-space: nowrap;
 }
+.status-spinner {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin .75s linear infinite;
+}
 .status-running, .status-ready { border-color: #c7eadb; background: var(--success-soft); color: #087a4d; }
 .status-draft { border-color: #cddfff; background: var(--blue-soft); color: #2455a6; }
 .status-waiting_approval { border-color: #f5dda8; background: var(--warning-soft); color: var(--warning); }
@@ -552,6 +561,24 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
   font-size: 10px;
 }
 .workspace-setting { width: 210px; }
+.workspace-readonly {
+  min-width: 210px;
+  height: 32px;
+  padding: 0 7px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #475467;
+}
+.workspace-readonly-icon { flex: 0 0 auto; color: var(--accent); font-size: 13px; line-height: 1; }
+.workspace-readonly-copy { min-width: 0; flex: 1; }
+.workspace-readonly-copy strong, .workspace-readonly-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-readonly-copy strong { color: #344054; font-size: 9px; line-height: 1.15; }
+.workspace-readonly-copy small { margin-top: 2px; color: #7b8798; font-size: 8px; line-height: 1.1; }
 .model-setting { width: 142px; }
 .effort-setting { width: 122px; }
 .stop-button { padding: 6px 10px; border-color: #f3bbb5; background: var(--danger-soft); color: var(--danger); font-size: 11px; }
@@ -940,6 +967,11 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 .compact-confirm .compact-confirm-error { margin-top: 8px; color: var(--danger); }
 .compact-confirm-actions { margin-top: 17px; display: flex; justify-content: flex-end; gap: 8px; }
 .compact-confirm-actions button { min-height: 34px; padding: 0 13px; }
+.workspace-concurrency-confirm { border-color: #efd6a3; }
+.workspace-concurrency-confirm .compact-confirm-icon { background: #fff4dc; color: #a15c07; font-size: 17px; }
+.workspace-concurrency-confirm code { padding: 1px 4px; border-radius: 4px; background: #f4f6f9; color: #475467; font-size: 10px; overflow-wrap: anywhere; }
+.workspace-concurrency-confirm .primary-button { border-color: #b86e0d; background: #b86e0d; box-shadow: 0 4px 12px rgb(184 110 13 / 18%); }
+.workspace-concurrency-confirm .primary-button:hover:not(:disabled) { border-color: #975807; background: #975807; }
 
 .empty { display: grid; justify-items: center; gap: 5px; padding: 32px; color: var(--muted); font-size: 12px; text-align: center; }
 .empty strong { color: #475467; }

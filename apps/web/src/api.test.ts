@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, formatErrorMessage, listNodes } from "./api";
+import { ApiError, formatErrorMessage, isWorkspaceConcurrencyConflict, listNodes } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -53,6 +53,26 @@ describe("API errors", () => {
       expect(formatErrorMessage(reason, "刷新节点状态"))
         .toContain("无法连接控制中心，请检查当前网络、HTTPS 域名或反向代理（GET /api/nodes）");
     }
+  });
+
+  it("preserves workspace concurrency conflict codes for confirmation flows", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      error: "工作空间已有正在运行或排队的任务",
+      code: "workspace_busy",
+    }), {
+      status: 409,
+      headers: { "Content-Type": "application/json" },
+    })));
+
+    let captured: unknown;
+    try {
+      await listNodes();
+    } catch (reason) {
+      captured = reason;
+    }
+
+    expect(captured).toMatchObject({ status: 409, code: "workspace_busy" });
+    expect(isWorkspaceConcurrencyConflict(captured)).toBe(true);
   });
 
   it("does not expose an HTML proxy error page as a business error", async () => {

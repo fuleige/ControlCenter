@@ -32,6 +32,7 @@ import {
   getSettings,
   getTaskCenter,
   interruptRun,
+  isWorkspaceConcurrencyConflict,
   listConversations,
   listEnrollmentTokens,
   listNodes,
@@ -326,8 +327,50 @@ export function mergedConversationDetail(
   };
 }
 
+const animatedStatuses = new Set(["creating", "queued", "dispatching", "running", "recovering"]);
+
 function StatusBadge({ status }: { status: string }) {
-  return <span className={`status status-${status}`}>{statusText[status] ?? status}</span>;
+  return (
+    <span className={`status status-${status}`}>
+      {animatedStatuses.has(status) && <i className="status-spinner" aria-hidden="true" />}
+      {statusText[status] ?? status}
+    </span>
+  );
+}
+
+function WorkspaceConcurrencyDialog({
+  workspace,
+  detail,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  workspace?: Pick<Workspace, "name" | "path"> | null;
+  detail?: string;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="compact-confirm-backdrop" role="presentation">
+      <section className="compact-confirm workspace-concurrency-confirm" role="dialog" aria-modal="true" aria-labelledby="workspace-concurrency-title">
+        <span className="compact-confirm-icon" aria-hidden="true">!</span>
+        <div>
+          <h2 id="workspace-concurrency-title">当前工作区已有任务</h2>
+          <p>{workspace
+            ? <>“{workspace.name}”中已有任务正在运行或排队。继续后，多个任务可能同时修改 <code>{workspace.path}</code> 下的文件。</>
+            : detail ?? "当前工作区已有任务正在运行或排队，继续后多个任务可能同时修改同一批文件。"}</p>
+          <p className="compact-confirm-note">并发修改可能导致文件覆盖、补丁冲突或测试结果互相影响，请确认这些风险可以接受。</p>
+          <div className="compact-confirm-actions">
+            <button type="button" autoFocus disabled={busy} onClick={onCancel}>取消</button>
+            <button className="primary-button" type="button" disabled={busy} onClick={onConfirm}>
+              {busy ? "正在启动…" : "仍然继续"}
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function PencilIcon() {
@@ -1507,13 +1550,14 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
   onBack: () => void;
   onOpen: (entry: TaskCenterEntry) => void;
   onMarkAllRead: () => Promise<void>;
-  onRetry: (entry: TaskCenterEntry) => Promise<void>;
+  onRetry: (entry: TaskCenterEntry, allowWorkspaceConcurrency: boolean) => Promise<void>;
 }) {
   const [filter, setFilter] = useState<"all" | "active" | "attention" | "completed">("all");
   const [nodeId, setNodeId] = useState("all");
   const [query, setQuery] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [workspaceConflict, setWorkspaceConflict] = useState<{ entry: TaskCenterEntry; detail: string } | null>(null);
   const activeCount = entries.filter((entry) => ["queued", "dispatching", "running", "recovering"].includes(entry.status)).length;
   const attentionCount = entries.filter((entry) => entry.unread && ["failed", "waiting_approval", "waiting_user"].includes(entry.status)).length;
   const keyword = query.trim().toLocaleLowerCase();
@@ -1530,6 +1574,24 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
     try { await action(); }
     catch (reason) { setError(formatErrorMessage(reason, operation)); }
     finally { setBusyAction(null); }
+  }
+
+  async function requestRetry(entry: TaskCenterEntry, allowWorkspaceConcurrency = false): Promise<void> {
+    const key = `retry:${entry.id}`;
+    setBusyAction(key);
+    setError(null);
+    try {
+      await onRetry(entry, allowWorkspaceConcurrency);
+      setWorkspaceConflict(null);
+    } catch (reason) {
+      if (!allowWorkspaceConcurrency && isWorkspaceConcurrencyConflict(reason)) {
+        setWorkspaceConflict({ entry, detail: reason.message });
+      } else {
+        setError(formatErrorMessage(reason, "重新执行任务"));
+      }
+    } finally {
+      setBusyAction(null);
+    }
   }
 
   return <main className="task-center-page" aria-label="全局任务中心">
@@ -1572,7 +1634,7 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
             type="button"
             className="task-retry"
             disabled={busyAction !== null}
-            onClick={() => void runAction(`retry:${entry.id}`, "重新执行任务", () => onRetry(entry))}
+            onClick={() => void requestRetry(entry)}
           >{busyAction === `retry:${entry.id}` ? "正在重试…" : "重新执行"}</button>}
         </div>)}
         {visible.length === 0 && <div className="empty"><strong>这里暂时没有任务</strong><span>运行中的任务和需要你关注的结果会显示在这里。</span></div>}
@@ -1582,6 +1644,12 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
         </footer>
       </section>
     </div>
+    {workspaceConflict && <WorkspaceConcurrencyDialog
+      detail={workspaceConflict.detail}
+      busy={busyAction === `retry:${workspaceConflict.entry.id}`}
+      onCancel={() => setWorkspaceConflict(null)}
+      onConfirm={() => void requestRetry(workspaceConflict.entry, true)}
+    />}
   </main>;
 }
 
@@ -1635,6 +1703,7 @@ function ChatPanel({
   const [returningLatest, setReturningLatest] = useState(false);
   const [loadEarlierError, setLoadEarlierError] = useState<string | null>(null);
   const [showCompactConfirm, setShowCompactConfirm] = useState(false);
+  const [showWorkspaceConcurrencyConfirm, setShowWorkspaceConcurrencyConfirm] = useState(false);
   const [compactSubmitting, setCompactSubmitting] = useState(false);
   const [compactionRequestId, setCompactionRequestId] = useState(newDraftRequestId);
   const timelineElement = useRef<HTMLDivElement>(null);
@@ -1699,6 +1768,7 @@ function ChatPanel({
     });
     setError(null);
     setShowCompactConfirm(false);
+    setShowWorkspaceConcurrencyConfirm(false);
     setCompactSubmitting(false);
   }, [node?.id, detail?.conversation.id, settings.defaultModel, settings.defaultEffort]);
 
@@ -1892,8 +1962,7 @@ function ChatPanel({
     });
   }
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  async function sendMessage(allowWorkspaceConcurrency = false): Promise<void> {
     if (!node || !workspaceId || !prompt.trim() || activeRun && !activeRun.remoteTurnId || uploads.some((upload) => upload.status !== "ready")) return;
     setBusy(true);
     setError(null);
@@ -1908,6 +1977,7 @@ function ChatPanel({
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
           ...(attachmentIds.length ? { attachmentIds } : {}),
+          ...(allowWorkspaceConcurrency ? { allowWorkspaceConcurrency: true } : {}),
         });
         setPrompt("");
         clearUploads();
@@ -1926,18 +1996,30 @@ function ChatPanel({
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
           ...(attachmentIds.length ? { attachmentIds } : {}),
+          ...(allowWorkspaceConcurrency ? { allowWorkspaceConcurrency: true } : {}),
         });
         setPrompt("");
         clearUploads();
         setMessageRequestId(newDraftRequestId());
       }
+      setShowWorkspaceConcurrencyConfirm(false);
       onRefresh();
     } catch (reason) {
-      const operation = !detail ? "创建会话" : activeRun?.remoteTurnId ? "追加任务指令" : "发送消息";
-      setError(formatErrorMessage(reason, operation));
+      if (!allowWorkspaceConcurrency && isWorkspaceConcurrencyConflict(reason)) {
+        setShowWorkspaceConcurrencyConfirm(true);
+      } else {
+        setShowWorkspaceConcurrencyConfirm(false);
+        const operation = !detail ? "创建会话" : activeRun?.remoteTurnId ? "追加任务指令" : "发送消息";
+        setError(formatErrorMessage(reason, operation));
+      }
     } finally {
       setBusy(false);
     }
+  }
+
+  function submit(event: FormEvent): void {
+    event.preventDefault();
+    void sendMessage();
   }
 
   async function interruptActiveRun(): Promise<void> {
@@ -2002,7 +2084,8 @@ function ChatPanel({
   }
 
   const conversation = detail?.conversation ?? null;
-  const workspace = node.workspaces.find((item) => item.id === workspaceId);
+  const effectiveWorkspaceId = isDraft ? workspaceId : conversation?.workspaceId ?? workspaceId;
+  const workspace = node.workspaces.find((item) => item.id === effectiveWorkspaceId);
   const canCompose = node.status === "online"
     && Boolean(workspaceId)
     && workspace?.status === "valid"
@@ -2156,7 +2239,7 @@ function ChatPanel({
             <button className="mobile-history-button" type="button" onClick={onBack} aria-label="打开历史会话"><HistoryIcon /><span>历史</span></button>
             <input ref={fileInputElement} className="file-input" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
             <button className="attach-button" type="button" onClick={() => fileInputElement.current?.click()} disabled={busy || compactionActive || uploads.length >= 10} title="上传文件或图片">＋ 附件</button>
-            {isDraft && (
+            {isDraft ? (
               <label className="setting-field workspace-setting">
                 <select aria-label="选择工作空间" title="选择工作空间" value={workspaceId} onChange={(event) => setWorkspaceId(event.target.value)} disabled={busy || node.status !== "online"}>
                   {node.workspaces.filter((candidate) => !candidate.archivedAt && candidate.source !== "history").map((candidate) => (
@@ -2167,6 +2250,19 @@ function ChatPanel({
                   {node.workspaces.every((candidate) => Boolean(candidate.archivedAt) || candidate.source === "history") && <option value="">没有有效工作空间</option>}
                 </select>
               </label>
+            ) : (
+              <div
+                className="workspace-setting workspace-readonly"
+                role="group"
+                aria-label={`当前工作空间：${workspace?.name ?? "未知工作空间"}，${workspace?.path ?? effectiveWorkspaceId}。会话创建后不可更改`}
+                title={`${workspace?.name ?? "未知工作空间"} · ${workspace?.path ?? effectiveWorkspaceId}\n会话创建后不可更改`}
+              >
+                <span className="workspace-readonly-icon" aria-hidden="true">⌂</span>
+                <span className="workspace-readonly-copy">
+                  <strong>{workspace?.name ?? "未知工作空间"}</strong>
+                  <small>{workspace?.path ?? effectiveWorkspaceId}</small>
+                </span>
+              </div>
             )}
             <label className="setting-field model-setting">
               <select
@@ -2222,6 +2318,14 @@ function ChatPanel({
               </div>
             </section>
           </div>
+        )}
+        {showWorkspaceConcurrencyConfirm && (
+          <WorkspaceConcurrencyDialog
+            workspace={workspace}
+            busy={busy}
+            onCancel={() => setShowWorkspaceConcurrencyConfirm(false)}
+            onConfirm={() => void sendMessage(true)}
+          />
         )}
       </form>
     </main>
@@ -2952,9 +3056,9 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
             onBack={() => setPrimaryView("workspace")}
             onOpen={openTask}
             onMarkAllRead={async () => { await markAllNotificationsRead(); await refreshTasks(); }}
-            onRetry={async (entry) => {
+            onRetry={async (entry, allowWorkspaceConcurrency) => {
               if (!entry.runId) return;
-              await retryRun(entry.runId);
+              await retryRun(entry.runId, allowWorkspaceConcurrency);
               refreshAll();
             }}
           />

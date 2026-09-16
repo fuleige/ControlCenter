@@ -33,6 +33,7 @@ interface ApiErrorOptions {
   method: string;
   path: string;
   status?: number;
+  code?: string | null;
   requestId?: string | null;
   cause?: unknown;
 }
@@ -40,6 +41,7 @@ interface ApiErrorOptions {
 export class ApiError extends Error {
   readonly kind: ApiErrorKind;
   readonly status: number | null;
+  readonly code: string | null;
   readonly method: string;
   readonly path: string;
   readonly requestId: string | null;
@@ -49,13 +51,14 @@ export class ApiError extends Error {
     this.name = "ApiError";
     this.kind = options.kind;
     this.status = options.status ?? null;
+    this.code = options.code ?? null;
     this.method = options.method;
     this.path = options.path;
     this.requestId = options.requestId ?? null;
   }
 }
 
-type ApiResponseBody<T> = T & { error?: unknown; requestId?: unknown };
+type ApiResponseBody<T> = T & { error?: unknown; code?: unknown; requestId?: unknown };
 
 function requestMethod(init?: RequestInit): string {
   return (init?.method ?? "GET").toUpperCase();
@@ -138,11 +141,16 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) throw new ApiError(apiErrorMessage(body, response.status), {
     kind: "http",
     status: response.status,
+    code: typeof body?.code === "string" ? body.code : null,
     method,
     path,
     requestId: responseRequestId(response, body),
   });
   return body as T;
+}
+
+export function isWorkspaceConcurrencyConflict(reason: unknown): reason is ApiError {
+  return reason instanceof ApiError && reason.status === 409 && reason.code === "workspace_busy";
 }
 
 export function formatErrorMessage(reason: unknown, operation: string): string {
@@ -291,6 +299,7 @@ export async function startConversation(input: {
   model?: string;
   effort?: ReasoningEffort;
   attachmentIds?: string[];
+  allowWorkspaceConcurrency?: boolean;
 }): Promise<{ conversation: Conversation; run: Run; deduplicated: boolean }> {
   return api<{ conversation: Conversation; run: Run; deduplicated: boolean }>("/api/conversations/start", {
     method: "POST",
@@ -315,7 +324,13 @@ export async function updateConversation(
 export async function startRun(
   conversationId: string,
   prompt: string,
-  options: { model?: string; effort?: ReasoningEffort; clientRequestId: string; attachmentIds?: string[] },
+  options: {
+    model?: string;
+    effort?: ReasoningEffort;
+    clientRequestId: string;
+    attachmentIds?: string[];
+    allowWorkspaceConcurrency?: boolean;
+  },
 ): Promise<Run> {
   return (await api<{ run: Run }>(`/api/conversations/${conversationId}/runs`, {
     method: "POST",
@@ -443,8 +458,11 @@ export async function markAllNotificationsRead(): Promise<void> {
   await api<void>("/api/notifications/read-all", { method: "POST" });
 }
 
-export async function retryRun(runId: string): Promise<Run> {
-  return (await api<{ run: Run }>(`/api/runs/${runId}/retry`, { method: "POST" })).run;
+export async function retryRun(runId: string, allowWorkspaceConcurrency = false): Promise<Run> {
+  return (await api<{ run: Run }>(`/api/runs/${runId}/retry`, {
+    method: "POST",
+    body: JSON.stringify({ allowWorkspaceConcurrency }),
+  })).run;
 }
 
 export async function updatePresence(sessionId: string, conversationId: string | null, visible: boolean): Promise<void> {

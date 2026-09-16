@@ -1424,22 +1424,35 @@ export class ControlDatabase {
     `).get(conversationId));
   }
 
-  canDispatchQueuedRun(nodeId: string, workspaceId: string): boolean {
-    const node = this.sqlite.prepare("SELECT max_concurrent_runs FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
+  hasActiveRunInWorkspace(nodeId: string, workspaceId: string): boolean {
     const workspace = this.sqlite.prepare("SELECT path FROM workspaces WHERE node_id = ? AND id = ?").get(nodeId, workspaceId) as Row | undefined;
-    if (!node || !workspace) return false;
-    const active = this.sqlite.prepare(`
-      SELECT
-        COUNT(*) AS node_count,
-        SUM(CASE WHEN w.path = ? THEN 1 ELSE 0 END) AS workspace_count
+    if (!workspace) return false;
+    return Boolean(this.sqlite.prepare(`
+      SELECT 1
       FROM runs r
       JOIN conversations c ON c.id = r.conversation_id
       JOIN workspaces w ON w.node_id = c.node_id AND w.id = c.workspace_id
       WHERE c.node_id = ?
+        AND w.path = ?
+        AND r.status IN ('queued', 'dispatching', 'running', 'waiting_approval', 'recovering')
+      LIMIT 1
+    `).get(nodeId, text(workspace, "path")));
+  }
+
+  canDispatchQueuedRun(nodeId: string, conversationId: string): boolean {
+    const node = this.sqlite.prepare("SELECT max_concurrent_runs FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
+    if (!node) return false;
+    const active = this.sqlite.prepare(`
+      SELECT
+        COUNT(*) AS node_count,
+        SUM(CASE WHEN c.id = ? THEN 1 ELSE 0 END) AS conversation_count
+      FROM runs r
+      JOIN conversations c ON c.id = r.conversation_id
+      WHERE c.node_id = ?
         AND r.status IN ('dispatching', 'running', 'waiting_approval', 'recovering')
-    `).get(text(workspace, "path"), nodeId) as Row;
+    `).get(conversationId, nodeId) as Row;
     return Number(active.node_count) < Number(node.max_concurrent_runs)
-      && Number(active.workspace_count ?? 0) === 0;
+      && Number(active.conversation_count ?? 0) === 0;
   }
 
   markRunDispatching(id: string): void {

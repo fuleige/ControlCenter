@@ -299,10 +299,13 @@ Agent 将 App Server `error` 通知中的 `codexErrorInfo` 映射为稳定的 `e
 
 ## 9. 并发与排队
 
-- 每个 Agent 遵守 `maxConcurrentRuns`。
-- 同一规范路径默认只允许一个可能修改文件的活动 Run，避免不同工作空间 ID 或历史别名并发修改同一批文件。
-- 不同工作区或明确只读任务可以并发。
-- 同一工作区已有活动 Run 或节点达到并发上限时，新 Run 仍可靠落库并保持 queued，不向用户返回冲突失败。
+- 每个 Agent 遵守 `maxConcurrentRuns`，默认最多同时执行 5 个顶层任务；该限制按节点统计，不区分工作空间。
+- Control Plane 不设置跨节点的全局并发总量；多个 Agent 各自独立执行并遵守自己的节点上限。
+- 提交任务时若同一规范路径已有运行中或排队中的 Run，Control Plane 返回 `workspace_busy` 冲突，由客户端向用户说明并发修改风险。
+- 用户确认后，客户端以 `allowWorkspaceConcurrency` 显式重试；同一工作空间的不同会话可以并发执行。
+- 同一会话仍按 turn 串行调度；追加指令使用 steer，不会为同一个 Codex thread 并行启动两个 turn。
+- 未确认的工作空间冲突不会创建会话、Run 或 Command，避免取消后留下幽灵任务。
+- 节点达到总并发上限时，新 Run 仍可靠落库并保持 queued，待任一活动 Run 结束后按节点内 FIFO 自动投递。
 - 活动 Run 结束、失败或重连协调完成后，Control Plane 自动投递下一条可执行命令。
 - 调度采用同一节点内 FIFO；未来若需要优先级，再扩展而不改变 v1 行为。
 
@@ -366,7 +369,7 @@ SQLite 使用 WAL、`busy_timeout` 和周期 checkpoint。正式长期运行需�
 4. Control Plane 运行中重启测试。
 5. Agent 在 run.started 前后分别重启的测试。
 6. 网络断开 30 秒、5 分钟后的恢复测试。
-7. 多节点、多工作区并发与同工作区排队测试。
+7. 多节点、多工作区并发、同工作区风险确认与节点总并发排队测试。
 8. 附件断点续传、哈希错误、过期清理测试。
 9. 320px、390px、820px 和桌面视口的完整流程测试。
 10. 数据库从当前 schema 到新 schema 的迁移及回滚备份测试。

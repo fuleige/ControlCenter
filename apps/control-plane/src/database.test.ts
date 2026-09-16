@@ -160,8 +160,10 @@ describe("ControlDatabase", () => {
       startedAt: at,
     });
     expect(database.getRun("run-1")?.status).toBe("running");
-    expect(database.canDispatchQueuedRun("node-1", "repo")).toBe(false);
-    expect(database.canDispatchQueuedRun("node-1", "repo-2")).toBe(true);
+    expect(database.hasActiveRunInWorkspace("node-1", "repo")).toBe(true);
+    expect(database.hasActiveRunInWorkspace("node-1", "repo-2")).toBe(false);
+    expect(database.canDispatchQueuedRun("node-1", "conversation-1")).toBe(false);
+    expect(database.canDispatchQueuedRun("node-1", "conversation-2")).toBe(true);
     database.updateConversation("conversation-1", { pinned: true }, at);
     const firstConversationPage = database.listConversationPage({ nodeId: "node-1", limit: 1 });
     expect(firstConversationPage.total).toBe(2);
@@ -290,7 +292,8 @@ describe("ControlDatabase", () => {
       status: "completed",
       finishedAt: at,
     });
-    expect(database.canDispatchQueuedRun("node-1", "repo")).toBe(true);
+    expect(database.hasActiveRunInWorkspace("node-1", "repo")).toBe(false);
+    expect(database.canDispatchQueuedRun("node-1", "conversation-1")).toBe(true);
     expect(database.deleteConversation("conversation-1")).toBe(true);
     expect(database.getConversation("conversation-1")).toBeNull();
     database.close();

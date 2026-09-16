@@ -25,9 +25,11 @@ describe("Agent workspace configuration", () => {
     process.env.AGENT_DATA_DIR = dataDirectory;
     process.env.INIT_CWD = initialDirectory;
     process.env.AGENT_WORKSPACES = JSON.stringify([{ id: "project-a", name: "Project A", path: initialDirectory }]);
+    delete process.env.MAX_CONCURRENT_RUNS;
     const configured = loadConfig(["--yolo", "--codex-proxy-only"]);
     expect(configured.yolo).toBe(true);
     expect(configured.codexProxyOnly).toBe(true);
+    expect(configured.maxConcurrentRuns).toBe(5);
     expect(configured.workspaces[0]).toMatchObject({
       id: "project-a",
       path: initialDirectory,

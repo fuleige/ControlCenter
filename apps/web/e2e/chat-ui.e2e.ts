@@ -297,6 +297,10 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   expect(formulaBox.height).toBeGreaterThan(20);
   await expect(page.locator(".code-block").first()).toBeVisible();
   await expect(page.getByRole("button", { name: "中止本轮" })).toBeVisible();
+  await expect(page.locator(".run-float .status-running .status-spinner")).toBeVisible();
+  const currentWorkspace = page.getByRole("group", { name: /当前工作空间：Controller Center/ });
+  await expect(currentWorkspace).toContainText("Controller Center");
+  await expect(currentWorkspace).toContainText("/workspace/controller-center");
   await expect(page.locator(".composer-toolbar .model-setting > span, .composer-toolbar .effort-setting > span")).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "选择模型" })).toBeVisible();
   await expect(page.getByRole("combobox", { name: "选择思考强度" })).toBeVisible();
@@ -412,7 +416,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
     await expect(mobileToolbar.locator("button").nth(3)).toContainText("设置");
     await expect(mobileToolbar.locator(".node-count")).toHaveCount(0);
   }
-  await expect(page.locator(".settings-version")).toContainText("v0.3.7");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.8");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -800,6 +804,84 @@ test("后台刷新显示真实错误上下文并在重试成功后清除", async
   await expect.poll(() => conversationRequests).toBeGreaterThanOrEqual(2);
 });
 
+test("同工作区已有任务时确认后才并发启动", async ({ page }, testInfo) => {
+  const createdConversation = {
+    ...conversation,
+    id: "workspace-concurrent-conversation",
+    title: "同工作区并发任务",
+  };
+  const createdRun = { ...run, id: "workspace-concurrent-run", conversationId: createdConversation.id };
+  const submissions: Array<Record<string, unknown>> = [];
+  let conversationCreated = false;
+
+  await page.addInitScript((nodeId) => {
+    sessionStorage.setItem("controller-center:selected-node", nodeId);
+    sessionStorage.removeItem("controller-center:selected-conversation");
+  }, node.id);
+
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/auth/session") {
+      await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
+    } else if (url.pathname === "/api/stream") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
+    } else if (url.pathname === "/api/nodes") {
+      await route.fulfill({ json: { data: [node] } });
+    } else if (url.pathname === "/api/conversations" && url.searchParams.has("nodeId")) {
+      await route.fulfill({ json: { data: conversationCreated ? [createdConversation] : [] } });
+    } else if (url.pathname === "/api/conversations/start") {
+      const submission = route.request().postDataJSON() as Record<string, unknown>;
+      submissions.push(submission);
+      if (submission.allowWorkspaceConcurrency !== true) {
+        await route.fulfill({ status: 409, json: { code: "workspace_busy", error: "工作空间已有正在运行或排队的任务" } });
+      } else {
+        conversationCreated = true;
+        await route.fulfill({ json: { conversation: createdConversation, run: createdRun, deduplicated: false } });
+      }
+    } else if (url.pathname === `/api/conversations/${createdConversation.id}`) {
+      await route.fulfill({ json: {
+        conversation: createdConversation,
+        runs: [createdRun],
+        messages: [],
+        attachments: [],
+        approvals: [],
+        messagePage: { hasMore: false, before: null },
+      } });
+    } else if (url.pathname === "/api/approvals") {
+      await route.fulfill({ json: { data: [] } });
+    } else if (url.pathname === "/api/settings") {
+      await route.fulfill({ json: { settings: { defaultModel: null, defaultEffort: null } } });
+    } else if (url.pathname === "/api/task-center") {
+      await route.fulfill({ json: { data: [], unreadCount: 0 } });
+    } else {
+      await route.fulfill({ status: 204 });
+    }
+  });
+
+  await page.goto("/");
+  if (testInfo.project.name !== "desktop") {
+    await page.locator(".node-card").filter({ hasText: node.name }).click();
+  }
+  const composer = page.locator(".composer textarea");
+  await composer.fill("允许同工作区并发执行这个任务");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "当前工作区已有任务" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("Controller Center");
+  await expect(dialog).toContainText("/workspace/controller-center");
+  await expect(dialog).toContainText("文件覆盖、补丁冲突或测试结果互相影响");
+  await expect(composer).toHaveValue("允许同工作区并发执行这个任务");
+  expect(submissions).toHaveLength(1);
+  expect(submissions[0]?.allowWorkspaceConcurrency).toBeUndefined();
+
+  await dialog.getByRole("button", { name: "仍然继续" }).click();
+  await expect.poll(() => submissions.length).toBe(2);
+  expect(submissions[1]?.allowWorkspaceConcurrency).toBe(true);
+  expect(submissions[1]?.clientRequestId).toBe(submissions[0]?.clientRequestId);
+  await expect(dialog).toBeHidden();
+});
+
 test("新会话创建结果不会抢占用户后来选择的会话", async ({ page }, testInfo) => {
   const existingConversation = {
     ...conversation,
@@ -948,14 +1030,14 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
     } else if (url.pathname === "/api/agent-package/download") {
       await route.fulfill({
         contentType: "application/gzip",
-        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.7.tar.gz\"" },
+        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.8.tar.gz\"" },
         body: "portable-agent-package",
       });
     } else if (url.pathname === "/api/agent-package") {
       await route.fulfill({ json: { package: {
         available: true,
-        version: "0.3.7",
-        fileName: "controller-center-agent-v0.3.7.tar.gz",
+        version: "0.3.8",
+        fileName: "controller-center-agent-v0.3.8.tar.gz",
         size: 580_000,
         sha256: "cb9bd8bd4ff984ee13b78a4f9b1ff9a72b950ed2a468d69e20fc0abe1bda2aa6",
         builtAt: now,
@@ -973,10 +1055,10 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
-  await expect(page.getByText("v0.3.7 · 566 KB · Linux / macOS")).toBeVisible();
+  await expect(page.getByText("v0.3.8 · 566 KB · Linux / macOS")).toBeVisible();
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载客户端" }).click();
-  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.7.tar.gz");
+  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.8.tar.gz");
   await page.getByRole("button", { name: "生成注册 Token" }).click();
   await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
   await expect(page.getByText(registrationToken)).toBeVisible();

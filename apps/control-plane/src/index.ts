@@ -258,7 +258,7 @@ function dispatch(command: CommandRecord): boolean {
       database.updateCommand(command.id, "failed", "Run is no longer dispatchable", now());
       return false;
     }
-    if (run.status === "queued" && !database.canDispatchQueuedRun(command.nodeId, command.command.workspaceId)) {
+    if (run.status === "queued" && !database.canDispatchQueuedRun(command.nodeId, command.command.conversationId)) {
       return false;
     }
   }
@@ -1125,6 +1125,7 @@ app.post<{
     effort?: ReasoningEffort;
     clientRequestId?: string;
     attachmentIds?: string[];
+    allowWorkspaceConcurrency?: boolean;
   };
 }>("/api/conversations/start", async (request, reply) => {
   const body = request.body ?? {};
@@ -1157,6 +1158,12 @@ app.post<{
   if (preparedAttachments.error) return reply.code(400).send({ error: preparedAttachments.error });
   const workspaceValidation = await validateWorkspaceForUse(nodeId, workspaceId);
   if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
+  if (body.allowWorkspaceConcurrency !== true && database.hasActiveRunInWorkspace(nodeId, workspaceId)) {
+    return reply.code(409).send({
+      code: "workspace_busy",
+      error: `工作空间“${workspaceValidation.workspace.name}”已有正在运行或排队的任务`,
+    });
+  }
   const createdAt = now();
   const conversationId = randomUUID();
   const runId = randomUUID();
@@ -1239,7 +1246,14 @@ app.post<{
 
 app.post<{
   Params: { id: string };
-  Body: { prompt?: string; model?: string; effort?: ReasoningEffort; clientRequestId?: string; attachmentIds?: string[] };
+  Body: {
+    prompt?: string;
+    model?: string;
+    effort?: ReasoningEffort;
+    clientRequestId?: string;
+    attachmentIds?: string[];
+    allowWorkspaceConcurrency?: boolean;
+  };
 }>("/api/conversations/:id/runs", async (request, reply) => {
   const body = request.body ?? {};
   const prompt = body.prompt?.trim();
@@ -1265,8 +1279,18 @@ app.post<{
   if (database.hasActiveConversationCompaction(conversation.id)) {
     return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再发送消息" });
   }
+  if (database.hasActiveRun(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话已有活动任务，请向当前任务追加指令或等待任务完成" });
+  }
   const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
   if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
+  if (body.allowWorkspaceConcurrency !== true
+    && database.hasActiveRunInWorkspace(conversation.nodeId, conversation.workspaceId)) {
+    return reply.code(409).send({
+      code: "workspace_busy",
+      error: `工作空间“${workspaceValidation.workspace.name}”已有正在运行或排队的任务`,
+    });
+  }
   if (database.hasActiveConversationCompaction(conversation.id)) {
     return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再发送消息" });
   }
@@ -1324,7 +1348,8 @@ app.post<{
   return reply.code(201).send({ run: database.getRun(runId), dispatched });
 });
 
-app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, reply) => {
+app.post<{ Params: { id: string }; Body: { allowWorkspaceConcurrency?: boolean } }>("/api/runs/:id/retry", async (request, reply) => {
+  const body = request.body ?? {};
   const sourceRun = database.getRun(request.params.id);
   if (!sourceRun) return reply.code(404).send({ error: "任务不存在或已被删除" });
   if (!sourceRun.status || !["failed", "interrupted"].includes(sourceRun.status)) {
@@ -1334,14 +1359,6 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
   if (!conversation?.remoteThreadId || conversation.status !== "ready") {
     return reply.code(409).send({ error: "节点上的会话尚未就绪，请稍后再试" });
   }
-  if (database.hasActiveConversationCompaction(conversation.id)) {
-    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再重新执行任务" });
-  }
-  const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
-  if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
-  if (database.hasActiveConversationCompaction(conversation.id)) {
-    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再重新执行任务" });
-  }
   const clientRequestId = `retry:${sourceRun.id}`;
   const existingRetry = database.getRunByClientRequestId(clientRequestId);
   if (existingRetry) {
@@ -1350,6 +1367,24 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, repl
       dispatched: existingRetry.status === "dispatching",
       deduplicated: true,
     });
+  }
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再重新执行任务" });
+  }
+  if (database.hasActiveRun(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话已有活动任务，请等待任务完成后再重新执行" });
+  }
+  const workspaceValidation = await validateWorkspaceForUse(conversation.nodeId, conversation.workspaceId);
+  if ("error" in workspaceValidation) return reply.code(workspaceValidation.statusCode).send({ error: workspaceValidation.error });
+  if (body.allowWorkspaceConcurrency !== true
+    && database.hasActiveRunInWorkspace(conversation.nodeId, conversation.workspaceId)) {
+    return reply.code(409).send({
+      code: "workspace_busy",
+      error: `工作空间“${workspaceValidation.workspace.name}”已有正在运行或排队的任务`,
+    });
+  }
+  if (database.hasActiveConversationCompaction(conversation.id)) {
+    return reply.code(409).send({ error: "当前会话正在压缩上下文，请等待完成后再重新执行任务" });
   }
   const sourceMessage = database.listMessages(conversation.id)
     .find((message) => message.role === "user" && message.runId === sourceRun.id);

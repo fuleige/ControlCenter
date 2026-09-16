@@ -37,7 +37,7 @@ import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.3.7";
+const AGENT_VERSION = "0.3.8";
 
 interface ActiveRun {
   conversationId: string;
@@ -99,7 +99,6 @@ const loadedThreads = new Set<string>();
 const activeRunsByTurn = new Map<string, ActiveRun>();
 const activeCompactionsByThread = new Map<string, ActiveCompaction>();
 const activeCompactionsByTurn = new Map<string, ActiveCompaction>();
-const workspaceLocks = new Map<string, string>();
 const startingRunIds = new Set<string>();
 const pendingApprovals = new Map<string, PendingApproval>();
 const assistantMessages = new Map<string, BufferedAssistantMessage>();
@@ -452,9 +451,6 @@ function handleNotification(notification: AppServerNotification): void {
       finishedAt: timestamp(),
     });
     activeRunsByTurn.delete(context.run.turnId);
-    if (workspaceLocks.get(context.run.workspacePath) === context.run.runId) {
-      workspaceLocks.delete(context.run.workspacePath);
-    }
   }
 
   if (notification.method === "turn/completed" && context.compaction) {
@@ -645,7 +641,6 @@ appServer.on("exit", (error: Error) => {
   activeCompactionsByThread.clear();
   activeCompactionsByTurn.clear();
   startingRunIds.clear();
-  workspaceLocks.clear();
   pendingApprovals.clear();
 });
 
@@ -847,11 +842,9 @@ async function startTurnForConversation(input: {
   const reservationHeld = input.reservationHeld === true;
   if (!reservationHeld) {
     if (activeRunsByTurn.size + startingRunIds.size >= config.maxConcurrentRuns) throw new Error("Node concurrency limit reached");
-    if (workspaceLocks.has(workspace.path)) throw new Error(`Workspace is busy: ${workspace.name}`);
-    workspaceLocks.set(workspace.path, input.runId);
     startingRunIds.add(input.runId);
-  } else if (workspaceLocks.get(workspace.path) !== input.runId || !startingRunIds.has(input.runId)) {
-    throw new Error("Workspace reservation was lost before the task started");
+  } else if (!startingRunIds.has(input.runId)) {
+    throw new Error("Run reservation was lost before the task started");
   }
   try {
     conversationByThread.set(input.threadId, input.conversationId);
@@ -887,9 +880,6 @@ async function startTurnForConversation(input: {
       startedAt: timestamp(),
     });
     reportProgress(active, "analyzing", "正在分析任务");
-  } catch (error) {
-    if (workspaceLocks.get(workspace.path) === input.runId) workspaceLocks.delete(workspace.path);
-    throw error;
   } finally {
     if (!reservationHeld) startingRunIds.delete(input.runId);
   }
@@ -921,8 +911,6 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
     case "conversation.start": {
       if (activeRunsByTurn.size + startingRunIds.size >= config.maxConcurrentRuns) throw new Error("Node concurrency limit reached");
       const workspace = workspaceFor(command.workspaceId);
-      if (workspaceLocks.has(workspace.path)) throw new Error(`Workspace is busy: ${workspace.name}`);
-      workspaceLocks.set(workspace.path, command.runId);
       startingRunIds.add(command.runId);
       try {
         const result = await startThread(workspace.path, command.model);
@@ -954,9 +942,6 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
           ...(command.effort ? { effort: command.effort } : {}),
           ...(command.attachments ? { attachments: command.attachments } : {}),
         });
-      } catch (error) {
-        if (workspaceLocks.get(workspace.path) === command.runId) workspaceLocks.delete(workspace.path);
-        throw error;
       } finally {
         startingRunIds.delete(command.runId);
       }

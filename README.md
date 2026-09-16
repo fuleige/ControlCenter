@@ -34,7 +34,7 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - 每个会话固定绑定一个工作空间；Agent 更换启动目录后，新目录成为默认，仍被会话使用的旧默认目录作为历史工作空间保留。
 - 节点默认使用主机名，也可以在 Web 中设置持久化显示名称。
 - 节点、工作区、Conversation/Thread 和 Run/Turn 管理；历史会话支持搜索、重命名、置顶、筛选和删除。
-- 多节点、多对话；不同工作区在节点并发额度内并行，同一工作区的多个任务接受后按顺序排队。
+- 多节点、多对话；单个节点默认最多并行 5 个顶层任务。工作区已有任务时由用户确认是否仍要并发，确认后不再强制排队。
 - 新会话在首次发送时原子创建，使用持久化幂等号避免双击、刷新和重试产生重复会话。
 - Agent 通过 `model/list` 发布本机可用模型及思考强度，结果按 Codex 版本在本机缓存 24 小时，Web 可按会话选择。
 - 只持久化用户消息、Codex 回复和简洁进度；命令输出、Diff、推理增量和原始事件不会发送到中心。
@@ -149,7 +149,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可直接下载当前版本的完整客户端安装包；该包已经包含编译结果和生产依赖，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.7.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.8.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -211,7 +211,7 @@ Agent：
 | `AGENT_NAME` | 当前主机名 | 首次注册时报告的节点名称；可在 Web 中设置显示名称 |
 | `AGENT_DATA_DIR` | `~/.controller-center-agent` | 本地身份与可靠队列 |
 | `AGENT_WORKSPACES` | 空数组 | 可选的附加工作空间 JSON 数组；不能覆盖由进程当前目录决定的默认工作空间 |
-| `MAX_CONCURRENT_RUNS` | `2` | 节点最大活动任务数 |
+| `MAX_CONCURRENT_RUNS` | `5` | 单个节点的最大活动任务总数；超过后排队 |
 | `AGENT_NETWORK_ACCESS` | `false` | Codex workspace sandbox 默认网络权限 |
 | `CODEX_BIN` | `codex` | Codex CLI 路径 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 系统 HTTP(S) 代理；支持大写和小写变量 |
