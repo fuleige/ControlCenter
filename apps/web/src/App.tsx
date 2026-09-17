@@ -3,6 +3,7 @@ import {
   isValidElement,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -104,6 +105,11 @@ const conversationPageSize = 50;
 export const conversationCacheLimit = 300;
 const recentMessagePageSize = 60;
 export const messageHistoryCacheLimit = 500;
+const timelineBottomThreshold = 96;
+
+function isTimelineAwayFromBottom(element: HTMLElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight >= timelineBottomThreshold;
+}
 
 function storedValue(key: string): string | null {
   try { return window.localStorage.getItem(key); } catch { return null; }
@@ -1847,12 +1853,22 @@ function ChatPanel({
     };
   }, [timeline, activeRun?.status, currentApprovals.length, viewingHistoricalMessages]);
 
-  useEffect(() => {
-    const element = promptElement.current;
-    if (!element) return;
-    element.style.height = "auto";
-    element.style.height = `${Math.min(element.scrollHeight, 180)}px`;
-  }, [prompt]);
+  useLayoutEffect(() => {
+    const input = promptElement.current;
+    if (!input) return;
+    const timeline = timelineElement.current;
+    const keepTimelineAtBottom = Boolean(timeline
+      && !viewingHistoricalMessages
+      && !isTimelineAwayFromBottom(timeline));
+
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+    if (!timeline || !keepTimelineAtBottom) return;
+
+    timeline.scrollTop = timeline.scrollHeight;
+    followStreamingOutput.current = true;
+    setShowScrollToBottom(false);
+  }, [prompt, viewingHistoricalMessages]);
 
   function scrollToTimelineBottom(): void {
     const element = timelineElement.current;
@@ -2115,7 +2131,7 @@ function ChatPanel({
           onScroll={(event) => {
             if (programmaticTimelineScroll.current) return;
             const element = event.currentTarget;
-            const awayFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight >= 96;
+            const awayFromBottom = isTimelineAwayFromBottom(element);
             followStreamingOutput.current = !awayFromBottom;
             setShowScrollToBottom(awayFromBottom);
           }}

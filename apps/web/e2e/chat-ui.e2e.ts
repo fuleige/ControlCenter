@@ -275,9 +275,9 @@ test("手动压缩上下文需要确认并在执行期间锁定输入", async ({
 });
 
 test("长对话可以滚动并正确渲染代码、公式和移动布局", async ({ page, context }, testInfo) => {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "http://127.0.0.1:5173" });
   const { presenceReports, quickSearchRequests } = await mockControlCenter(page);
   await page.goto("/");
+  await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(page.url()).origin });
 
   const timeline = page.locator(".timeline");
   await expect(page.locator(".node-permission-badge")).toHaveText("全权限");
@@ -347,9 +347,13 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   expect(pageWidth.document).toBeLessThanOrEqual(pageWidth.viewport);
 
   const composerInput = page.locator(".composer textarea");
+  await timeline.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  await expect.poll(() => timeline.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(2);
   const initialInputHeight = await composerInput.evaluate((element) => element.getBoundingClientRect().height);
   await composerInput.fill("追加说明\n".repeat(8));
   await expect.poll(() => composerInput.evaluate((element) => element.getBoundingClientRect().height)).toBeGreaterThan(initialInputHeight);
+  await expect.poll(() => timeline.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(2);
+  await expect(page.getByRole("button", { name: "滑动到底部" })).toBeHidden();
   const composerBottom = await page.locator(".composer").evaluate((element) => element.getBoundingClientRect().bottom);
   expect(composerBottom).toBeLessThanOrEqual(await page.evaluate(() => window.innerHeight));
   if (testInfo.project.name !== "desktop") {
@@ -388,6 +392,11 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
 
   await timeline.evaluate((element) => { element.scrollTop = 120; });
   await expect(page.getByRole("button", { name: "滑动到底部" })).toBeVisible();
+  const readingScrollTop = await timeline.evaluate((element) => element.scrollTop);
+  await composerInput.fill("阅读历史消息时继续编辑\n".repeat(8));
+  await expect(page.getByRole("button", { name: "滑动到底部" })).toBeVisible();
+  await expect.poll(async () => Math.abs(await timeline.evaluate((element) => element.scrollTop) - readingScrollTop)).toBeLessThanOrEqual(2);
+  await composerInput.fill("");
 
   await page.screenshot({ path: `/tmp/controller-center-${testInfo.project.name}.png`, fullPage: true });
 
@@ -416,7 +425,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
     await expect(mobileToolbar.locator("button").nth(3)).toContainText("设置");
     await expect(mobileToolbar.locator(".node-count")).toHaveCount(0);
   }
-  await expect(page.locator(".settings-version")).toContainText("v0.3.8");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.9");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -1030,14 +1039,14 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
     } else if (url.pathname === "/api/agent-package/download") {
       await route.fulfill({
         contentType: "application/gzip",
-        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.8.tar.gz\"" },
+        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.9.tar.gz\"" },
         body: "portable-agent-package",
       });
     } else if (url.pathname === "/api/agent-package") {
       await route.fulfill({ json: { package: {
         available: true,
-        version: "0.3.8",
-        fileName: "controller-center-agent-v0.3.8.tar.gz",
+        version: "0.3.9",
+        fileName: "controller-center-agent-v0.3.9.tar.gz",
         size: 580_000,
         sha256: "cb9bd8bd4ff984ee13b78a4f9b1ff9a72b950ed2a468d69e20fc0abe1bda2aa6",
         builtAt: now,
@@ -1055,10 +1064,10 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
-  await expect(page.getByText("v0.3.8 · 566 KB · Linux / macOS")).toBeVisible();
+  await expect(page.getByText("v0.3.9 · 566 KB · Linux / macOS")).toBeVisible();
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载客户端" }).click();
-  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.8.tar.gz");
+  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.9.tar.gz");
   await page.getByRole("button", { name: "生成注册 Token" }).click();
   await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
   await expect(page.getByText(registrationToken)).toBeVisible();

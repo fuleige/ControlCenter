@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { defineConfig } from "vite";
+import { defineConfig, type ProxyOptions } from "vite";
 import react from "@vitejs/plugin-react";
 
 // The displayed version is fixed when Vite starts; restart the dev server after a version bump.
@@ -8,6 +8,26 @@ const allowedHosts = (process.env.WEB_ALLOWED_HOSTS ?? "c.llmdev.cn")
   .split(",")
   .map((host) => host.trim())
   .filter(Boolean);
+const controlPlaneUrl = process.env.CONTROL_PROXY_URL?.trim() || "http://127.0.0.1:8787";
+const controlPlaneWebSocketUrl = controlPlaneUrl.replace(/^http/, "ws");
+const controlProxyOrigin = process.env.CONTROL_PROXY_ORIGIN?.trim();
+
+function controlProxy(target: string, websocket = false): ProxyOptions {
+  return {
+    target,
+    changeOrigin: true,
+    ...(websocket ? { ws: true } : {}),
+    configure(proxy) {
+      if (!controlProxyOrigin) return;
+      proxy.on("proxyReq", (proxyRequest, request) => {
+        if (request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
+      });
+      proxy.on("proxyReqWs", (proxyRequest, request) => {
+        if (request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
+      });
+    },
+  };
+}
 
 export default defineConfig({
   plugins: [react()],
@@ -29,27 +49,16 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    port: 5174,
+    strictPort: true,
     allowedHosts,
     proxy: {
-      "/api": {
-        target: "http://127.0.0.1:8787",
-        changeOrigin: true,
-      },
-      "/agent/connect": {
-        target: "ws://127.0.0.1:8787",
-        ws: true,
-      },
-      "/agent/enroll": {
-        target: "http://127.0.0.1:8787",
-        changeOrigin: true,
-      },
-      "/agent/attachments": {
-        target: "http://127.0.0.1:8787",
-        changeOrigin: true,
-      },
-      "/healthz": "http://127.0.0.1:8787",
-      "/readyz": "http://127.0.0.1:8787",
+      "/api": controlProxy(controlPlaneUrl),
+      "/agent/connect": controlProxy(controlPlaneWebSocketUrl, true),
+      "/agent/enroll": controlProxy(controlPlaneUrl),
+      "/agent/attachments": controlProxy(controlPlaneUrl),
+      "/healthz": controlProxy(controlPlaneUrl),
+      "/readyz": controlProxy(controlPlaneUrl),
     },
   },
 });

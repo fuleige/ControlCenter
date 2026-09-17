@@ -260,7 +260,7 @@ export class AppServerClient extends EventEmitter {
       clientInfo: {
         name: "controller_center_agent",
         title: "Controller Center Agent",
-        version: "0.3.8",
+        version: "0.3.9",
       },
     });
     this.notify("initialized", {});

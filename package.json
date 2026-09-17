@@ -1,6 +1,6 @@
 {
   "name": "controller-center",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -15,6 +15,7 @@
     "dev:server": "npm run dev -w @controller-center/control-plane",
     "dev:agent": "npm run dev -w @controller-center/agent",
     "dev:web": "npm run dev -w @controller-center/web",
+    "deploy:web:production": "bash scripts/deploy-web-production.sh",
     "admin": "npm run admin -w @controller-center/control-plane --",
     "agent:enroll": "npm run enroll -w @controller-center/agent --"
   },

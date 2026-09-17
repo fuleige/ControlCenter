@@ -37,7 +37,7 @@ import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 
-const AGENT_VERSION = "0.3.8";
+const AGENT_VERSION = "0.3.9";
 
 interface ActiveRun {
   conversationId: string;
