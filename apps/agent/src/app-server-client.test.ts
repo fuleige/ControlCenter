@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { appServerArguments, classifyAppServerError, parseThreadTokenUsage, threadStartSecurity, turnSandboxPolicy } from "./app-server-client.js";
+import {
+  appServerArguments,
+  appServerSpawnOptions,
+  classifyAppServerError,
+  parseThreadTokenUsage,
+  threadStartSecurity,
+  turnSandboxPolicy,
+} from "./app-server-client.js";
 
 describe("Codex App Server launch arguments", () => {
   it("uses the normal sandboxed mode by default", () => {
@@ -8,6 +15,13 @@ describe("Codex App Server launch arguments", () => {
 
   it("places the global yolo flag before the app-server subcommand", () => {
     expect(appServerArguments(true)).toEqual(["--yolo", "app-server", "--stdio"]);
+  });
+
+  it("starts Codex from a persistent Agent directory", () => {
+    expect(appServerSpawnOptions("/var/lib/controller-center-agent")).toMatchObject({
+      cwd: "/var/lib/controller-center-agent",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
   });
 });
 

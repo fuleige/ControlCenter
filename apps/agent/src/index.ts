@@ -39,7 +39,7 @@ import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbou
 import { AgentStateStore } from "./state-store.js";
 import { readWorkspaceFile } from "./workspace-files.js";
 
-const AGENT_VERSION = "0.3.12";
+const AGENT_VERSION = "0.3.13";
 
 interface ActiveRun {
   conversationId: string;
@@ -94,7 +94,7 @@ interface ModelListResult {
 const config = loadConfig();
 const bootId = randomUUID();
 const state = new AgentStateStore(config.dataDirectory);
-const appServer = new AppServerClient(config.codexBinary, config.yolo);
+const appServer = new AppServerClient(config.codexBinary, config.yolo, config.dataDirectory);
 const outboundNetwork = new OutboundNetwork(config.codexProxyOnly);
 const conversationByThread = new Map<string, string>();
 const loadedThreads = new Set<string>();

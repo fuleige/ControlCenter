@@ -3,6 +3,7 @@ import {
   isValidElement,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -15,6 +16,9 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import rehypeSlug from "rehype-slug";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
@@ -502,9 +506,22 @@ async function copyToClipboard(value: string): Promise<void> {
   if (!copied) throw new Error("浏览器不允许复制");
 }
 
-function CopyableCodeBlock({ children, node: _node, ...props }: ComponentPropsWithoutRef<"pre"> & { node?: unknown }) {
+export function previewLineNumberText(source: string): string {
+  const content = source.replace(/(?:\r\n|\n|\r)$/u, "");
+  const lineCount = content ? content.split(/\r\n|\n|\r/u).length : 1;
+  if (lineCount > 100_000) return "";
+  return Array.from({ length: lineCount }, (_, index) => String(index + 1)).join("\n");
+}
+
+function CopyableCodeBlock({
+  children,
+  node: _node,
+  showLineNumbers = false,
+  ...props
+}: ComponentPropsWithoutRef<"pre"> & { node?: unknown; showLineNumbers?: boolean }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const code = reactNodeText(children).replace(/\n$/, "");
+  const lineNumbers = showLineNumbers ? previewLineNumberText(code) : "";
   const codeElement = Children.toArray(children).find((child) => isValidElement(child));
   const className = isValidElement<{ className?: string }>(codeElement) ? codeElement.props.className ?? "" : "";
   const language = /(?:^|\s)language-([^\s]+)/.exec(className)?.[1] ?? "代码";
@@ -531,9 +548,200 @@ function CopyableCodeBlock({ children, node: _node, ...props }: ComponentPropsWi
           {copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败" : "复制"}
         </button>
       </div>
-      <pre {...props}>{children}</pre>
+      <div className={`code-block-scroll ${lineNumbers ? "with-line-numbers" : ""}`}>
+        {lineNumbers && <pre className="code-line-numbers" aria-hidden="true">{lineNumbers}</pre>}
+        <pre {...props} className={[props.className, "code-block-content"].filter(Boolean).join(" ")}>{children}</pre>
+      </div>
     </div>
   );
+}
+
+const markdownIdPrefix = "cc-md-";
+const markdownSanitizeSchema = {
+  ...defaultSchema,
+  clobberPrefix: markdownIdPrefix,
+  tagNames: [...new Set([...(defaultSchema.tagNames ?? []), "details", "summary"])],
+  attributes: {
+    ...defaultSchema.attributes,
+    details: [...(defaultSchema.attributes?.details ?? []), "open"],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    href: [...new Set([...(defaultSchema.protocols?.href ?? []), "file", "ftp", "http", "https", "mailto", "ssh", "tel", "ws", "wss"])],
+    src: [...new Set([...(defaultSchema.protocols?.src ?? []), "file", "http", "https"])],
+  },
+};
+
+let mermaidModulePromise: Promise<typeof import("mermaid")> | null = null;
+let mermaidConfigured = false;
+let mermaidRenderSequence = 0;
+
+function MermaidDiagram({ source }: { source: string }) {
+  const reactId = useId().replace(/[^a-zA-Z0-9_-]/gu, "");
+  const [svg, setSvg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    setSvg(null);
+    setError(null);
+    mermaidModulePromise ??= import("mermaid");
+    void mermaidModulePromise
+      .then(async ({ default: mermaid }) => {
+        if (!mermaidConfigured) {
+          mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: "strict",
+            theme: "neutral",
+            suppressErrorRendering: true,
+          });
+          mermaidConfigured = true;
+        }
+        const renderId = `cc-mermaid-${reactId}-${++mermaidRenderSequence}`;
+        return mermaid.render(renderId, source);
+      })
+      .then((result) => {
+        if (active) setSvg(result.svg);
+      })
+      .catch((reason) => {
+        if (active) setError(reason instanceof Error ? reason.message : "Mermaid 图表渲染失败");
+      });
+    return () => { active = false; };
+  }, [reactId, source]);
+
+  if (error) return <div className="mermaid-error"><strong>Mermaid 图表渲染失败</strong><span>{error}</span><pre>{source}</pre></div>;
+  if (!svg) return <div className="mermaid-loading"><span className="loading-spinner" />正在渲染 Mermaid 图表…</div>;
+  return <div className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: svg }} />;
+}
+
+function MarkdownPre({
+  children,
+  node: _node,
+  showLineNumbers = false,
+  ...props
+}: ComponentPropsWithoutRef<"pre"> & { node?: unknown; showLineNumbers?: boolean }) {
+  const codeElement = Children.toArray(children).find((child) => isValidElement<{ className?: string; children?: ReactNode }>(child));
+  const className = isValidElement<{ className?: string }>(codeElement) ? codeElement.props.className ?? "" : "";
+  if (/(?:^|\s)language-mermaid(?:\s|$)/u.test(className)) {
+    return <MermaidDiagram source={reactNodeText(codeElement).replace(/\n$/u, "")} />;
+  }
+  return <CopyableCodeBlock {...props} showLineNumbers={showLineNumbers}>{children}</CopyableCodeBlock>;
+}
+
+function LineNumberedMarkdownPre(props: ComponentPropsWithoutRef<"pre"> & { node?: unknown }) {
+  return <MarkdownPre {...props} showLineNumbers />;
+}
+
+const embeddedResourceFileLimit = 50;
+const embeddedResourceByteLimit = 32 * 1024 * 1024;
+const embeddedResourceConcurrency = 4;
+
+interface LoadedEmbeddedResource {
+  file: WorkspaceFileDescriptor;
+  blob: Blob;
+  objectUrl: string;
+}
+
+class EmbeddedWorkspaceResourceLoader {
+  private readonly pending = new Map<string, Promise<LoadedEmbeddedResource>>();
+  private readonly objectUrls = new Set<string>();
+  private readonly queue: Array<() => void> = [];
+  private active = 0;
+  private totalBytes = 0;
+  private disposed = false;
+
+  constructor(private readonly conversationId: string) {}
+
+  load(path: string, baseFileId?: string): Promise<LoadedEmbeddedResource> {
+    if (this.disposed) return Promise.reject(new Error("文档预览已经关闭"));
+    const key = `${baseFileId ?? ""}\0${path}`;
+    const existing = this.pending.get(key);
+    if (existing) return existing;
+    if (this.pending.size >= embeddedResourceFileLimit) {
+      return Promise.reject(new Error(`单个文档最多自动加载 ${embeddedResourceFileLimit} 个关联文件`));
+    }
+    const request = this.schedule(async () => {
+      if (this.disposed) throw new Error("文档预览已经关闭");
+      const file = await openWorkspaceFile(this.conversationId, path, baseFileId, { recordHistory: false });
+      if (this.totalBytes + file.size > embeddedResourceByteLimit) {
+        throw new Error("文档关联文件合计超过 32 MiB，已停止自动加载");
+      }
+      this.totalBytes += file.size;
+      let blob: Blob;
+      try {
+        blob = await fetchWorkspaceFileContent(file);
+      } catch (error) {
+        this.totalBytes -= file.size;
+        throw error;
+      }
+      const objectUrl = URL.createObjectURL(blob);
+      if (this.disposed) {
+        URL.revokeObjectURL(objectUrl);
+        throw new Error("文档预览已经关闭");
+      }
+      this.objectUrls.add(objectUrl);
+      return { file, blob, objectUrl };
+    }).catch((error) => {
+      this.pending.delete(key);
+      throw error;
+    });
+    this.pending.set(key, request);
+    return request;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    for (const url of this.objectUrls) URL.revokeObjectURL(url);
+    this.objectUrls.clear();
+    this.pending.clear();
+  }
+
+  private schedule<T>(work: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const start = () => {
+        this.active += 1;
+        void work().then(resolve, reject).finally(() => {
+          this.active -= 1;
+          this.queue.shift()?.();
+        });
+      };
+      if (this.active < embeddedResourceConcurrency) start();
+      else this.queue.push(start);
+    });
+  }
+}
+
+function LocalMarkdownImage({
+  src,
+  alt,
+  baseFileId,
+  loadResource,
+  onOpen,
+}: {
+  src: string;
+  alt: string;
+  baseFileId?: string;
+  loadResource: (path: string, baseFileId?: string) => Promise<LoadedEmbeddedResource>;
+  onOpen?: (path: string, baseFileId?: string) => void;
+}) {
+  const [resource, setResource] = useState<LoadedEmbeddedResource | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    setResource(null);
+    setError(null);
+    void loadResource(src, baseFileId)
+      .then((value) => { if (active) setResource(value); })
+      .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "图片读取失败"); });
+    return () => { active = false; };
+  }, [baseFileId, loadResource, src]);
+
+  if (error) return <button className="local-image-error" type="button" title={error} onClick={() => onOpen?.(src, baseFileId)}>图片加载失败：{alt || src}</button>;
+  if (!resource) return <span className="local-image-loading"><span className="loading-spinner" />正在读取图片…</span>;
+  return <button className="local-image-preview" type="button" title="在新标签页打开图片" onClick={() => onOpen?.(src, baseFileId)}>
+    <img src={resource.objectUrl} alt={alt} loading="lazy" />
+  </button>;
 }
 
 const uriSchemePattern = /^([a-z][a-z\d+.-]*):/iu;
@@ -560,20 +768,35 @@ interface MarkdownContentProps {
   children: string;
   baseFileId?: string;
   onOpenLocalPath?: (path: string, baseFileId?: string) => void;
+  loadEmbeddedResource?: (path: string, baseFileId?: string) => Promise<LoadedEmbeddedResource>;
+  showCodeLineNumbers?: boolean;
 }
 
-function MarkdownContent({ children, baseFileId, onOpenLocalPath }: MarkdownContentProps) {
+function MarkdownContent({
+  children,
+  baseFileId,
+  onOpenLocalPath,
+  loadEmbeddedResource,
+  showCodeLineNumbers = false,
+}: MarkdownContentProps) {
   const markdown = useMemo(() => normalizeMathMarkdown(children), [children]);
   return (
     <div className="markdown-content">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }], rehypeHighlight]}
+        rehypePlugins={[
+          rehypeRaw,
+          rehypeSlug,
+          [rehypeSanitize, markdownSanitizeSchema],
+          [rehypeKatex, { strict: false, throwOnError: false }],
+          rehypeHighlight,
+        ]}
         urlTransform={safeMarkdownUrl}
         components={{
-          pre: CopyableCodeBlock,
+          pre: showCodeLineNumbers ? LineNumberedMarkdownPre : MarkdownPre,
           a: ({ href = "", children: linkChildren, node: _node, ...props }) => {
             if (!href || isUnsafeHref(href)) return <span>{linkChildren}</span>;
+            if (href.startsWith("#")) return <a {...props} href={`#${markdownIdPrefix}${href.slice(1)}`}>{linkChildren}</a>;
             if (isLocalWorkspaceHref(href) && onOpenLocalPath) {
               return <a
                 {...props}
@@ -590,6 +813,15 @@ function MarkdownContent({ children, baseFileId, onOpenLocalPath }: MarkdownCont
           },
           img: ({ src = "", alt = "", node: _node, ...props }) => {
             if (!src || isUnsafeHref(src)) return <span className="local-image-unavailable">图片地址不可用</span>;
+            if (isLocalWorkspaceHref(src) && loadEmbeddedResource) {
+              return <LocalMarkdownImage
+                src={src}
+                alt={alt}
+                baseFileId={baseFileId}
+                loadResource={loadEmbeddedResource}
+                onOpen={onOpenLocalPath}
+              />;
+            }
             if (isLocalWorkspaceHref(src) && onOpenLocalPath) {
               return <button
                 className="local-image-button"
@@ -696,6 +928,173 @@ function workspaceFilePreviewPath(fileId: string): string {
   return `/workspace-files/${encodeURIComponent(fileId)}`;
 }
 
+function workspaceFileOpeningPath(conversationId: string, path: string, baseFileId?: string): string {
+  const parameters = new URLSearchParams({ conversationId, path });
+  if (baseFileId) parameters.set("baseFileId", baseFileId);
+  return `/workspace-files/opening?${parameters}`;
+}
+
+function blobDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("文件编码失败"));
+    reader.onerror = () => reject(reader.error ?? new Error("文件编码失败"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function embeddedResourceDataUrl(
+  path: string,
+  baseFileId: string,
+  loader: EmbeddedWorkspaceResourceLoader,
+  cssDepth = 0,
+): Promise<string> {
+  const resource = await loader.load(path, baseFileId);
+  const mediaType = resource.file.mediaType.split(";", 1)[0]?.toLowerCase();
+  if (mediaType === "text/css" && cssDepth < 4) {
+    const rewritten = await rewriteCssEmbeddedUrls(await resource.blob.text(), resource.file.id, loader, cssDepth + 1);
+    return blobDataUrl(new Blob([rewritten], { type: "text/css;charset=utf-8" }));
+  }
+  return blobDataUrl(resource.blob);
+}
+
+export async function rewriteCssEmbeddedUrls(
+  source: string,
+  baseFileId: string,
+  loader: EmbeddedWorkspaceResourceLoader,
+  cssDepth = 0,
+): Promise<string> {
+  const matches = [...source.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)/giu)];
+  if (!matches.length) return source;
+  let result = "";
+  let offset = 0;
+  for (const match of matches) {
+    const index = match.index ?? 0;
+    const reference = match[2]?.trim() ?? "";
+    result += source.slice(offset, index);
+    if (!reference || !isLocalWorkspaceHref(reference) || isUnsafeHref(reference)) {
+      result += match[0];
+    } else {
+      try {
+        const dataUrl = await embeddedResourceDataUrl(reference, baseFileId, loader, cssDepth);
+        result += `url("${dataUrl}")`;
+      } catch {
+        result += match[0];
+      }
+    }
+    offset = index + match[0].length;
+  }
+  return result + source.slice(offset);
+}
+
+async function prepareHtmlPreviewDocument(
+  source: string,
+  file: WorkspaceFileDescriptor,
+  loader: EmbeddedWorkspaceResourceLoader,
+): Promise<string> {
+  const document = new DOMParser().parseFromString(source, "text/html");
+  document.querySelectorAll("base, meta[http-equiv='content-security-policy' i]").forEach((element) => element.remove());
+
+  const localDataUrl = (path: string, baseFileId = file.id) => embeddedResourceDataUrl(path, baseFileId, loader);
+  const rewriteAttribute = async (element: Element, attribute: string, baseFileId = file.id) => {
+    const value = element.getAttribute(attribute)?.trim() ?? "";
+    if (!value || !isLocalWorkspaceHref(value) || isUnsafeHref(value)) return;
+    try {
+      element.setAttribute(attribute, await localDataUrl(value, baseFileId));
+    } catch (reason) {
+      element.removeAttribute(attribute);
+      element.setAttribute("data-controller-center-resource-error", reason instanceof Error ? reason.message : "资源读取失败");
+    }
+  };
+
+  const directResources: Array<[Element, string]> = [];
+  document.querySelectorAll("img[src], input[type='image'][src], source[src], video[src], video[poster], audio[src], track[src]").forEach((element) => {
+    for (const attribute of ["src", "poster"]) if (element.hasAttribute(attribute)) directResources.push([element, attribute]);
+  });
+  await Promise.all(directResources.map(([element, attribute]) => rewriteAttribute(element, attribute)));
+
+  await Promise.all([...document.querySelectorAll("img[srcset], source[srcset]")].map(async (element) => {
+    const candidates = (element.getAttribute("srcset") ?? "").split(",").map((candidate) => candidate.trim()).filter(Boolean);
+    const rewritten = await Promise.all(candidates.map(async (candidate) => {
+      const match = /^(\S+)(\s+.+)?$/u.exec(candidate);
+      const reference = match?.[1] ?? "";
+      if (!reference || !isLocalWorkspaceHref(reference) || isUnsafeHref(reference)) return candidate;
+      try { return `${await localDataUrl(reference)}${match?.[2] ?? ""}`; } catch { return ""; }
+    }));
+    const usable = rewritten.filter(Boolean).join(", ");
+    if (usable) element.setAttribute("srcset", usable);
+    else element.removeAttribute("srcset");
+  }));
+
+  await Promise.all([...document.querySelectorAll("style")].map(async (element) => {
+    element.textContent = await rewriteCssEmbeddedUrls(element.textContent ?? "", file.id, loader);
+  }));
+  await Promise.all([...document.querySelectorAll<HTMLElement>("[style]")].map(async (element) => {
+    element.setAttribute("style", await rewriteCssEmbeddedUrls(element.getAttribute("style") ?? "", file.id, loader));
+  }));
+
+  await Promise.all([...document.querySelectorAll<HTMLLinkElement>("link[rel~='stylesheet'][href]")].map(async (link) => {
+    const href = link.getAttribute("href")?.trim() ?? "";
+    if (!href || !isLocalWorkspaceHref(href) || isUnsafeHref(href)) return;
+    try {
+      const stylesheet = await loader.load(href, file.id);
+      const style = document.createElement("style");
+      style.textContent = await rewriteCssEmbeddedUrls(await stylesheet.blob.text(), stylesheet.file.id, loader, 1);
+      link.replaceWith(style);
+    } catch (reason) {
+      link.replaceWith(document.createComment(`本地样式读取失败：${reason instanceof Error ? reason.message : href}`));
+    }
+  }));
+
+  await Promise.all([...document.querySelectorAll<HTMLScriptElement>("script[src]")].map(async (script) => {
+    const src = script.getAttribute("src")?.trim() ?? "";
+    if (!src || !isLocalWorkspaceHref(src) || isUnsafeHref(src)) return;
+    try {
+      const resource = await loader.load(src, file.id);
+      script.removeAttribute("src");
+      script.removeAttribute("integrity");
+      script.removeAttribute("crossorigin");
+      script.textContent = `${await resource.blob.text()}\n//# sourceURL=${resource.file.name.replace(/[\r\n]/gu, "_")}`;
+    } catch (reason) {
+      script.removeAttribute("src");
+      script.textContent = `console.error(${JSON.stringify(`本地脚本读取失败：${reason instanceof Error ? reason.message : src}`)});`;
+    }
+  }));
+
+  for (const anchor of document.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+    const href = anchor.getAttribute("href")?.trim() ?? "";
+    if (!href || isUnsafeHref(href)) {
+      anchor.removeAttribute("href");
+      continue;
+    }
+    if (href.startsWith("#")) continue;
+    anchor.target = "_blank";
+    anchor.rel = "noreferrer noopener";
+    if (isLocalWorkspaceHref(href)) {
+      anchor.href = new URL(workspaceFileOpeningPath(file.conversationId, href, file.id), window.location.origin).toString();
+    }
+  }
+
+  const securityPolicy = document.createElement("meta");
+  securityPolicy.httpEquiv = "Content-Security-Policy";
+  securityPolicy.content = [
+    "default-src 'none'",
+    "img-src data: blob: https: http:",
+    "style-src 'unsafe-inline' data: https: http:",
+    "font-src data: https: http:",
+    "script-src 'unsafe-inline' data: blob: https: http:",
+    "connect-src https: http: wss: ws:",
+    "media-src data: blob: https: http:",
+    "frame-src data: blob: https: http:",
+    "worker-src data: blob:",
+    "form-action https: http:",
+    "object-src 'none'",
+    "base-uri 'none'",
+  ].join("; ");
+  document.head.prepend(securityPolicy);
+  return `<!doctype html>\n${document.documentElement.outerHTML}`;
+}
+
 function WorkspaceFileLoadingCard() {
   return (
     <section className="workspace-file-loading-card" role="status" aria-live="polite">
@@ -709,7 +1108,19 @@ function WorkspaceFileLoadingCard() {
 }
 
 function WorkspaceFileOpeningPage() {
-  const failed = new URLSearchParams(window.location.search).get("state") === "error";
+  const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
+  const [failed, setFailed] = useState(parameters.get("state") === "error");
+
+  useEffect(() => {
+    const conversationId = parameters.get("conversationId")?.trim() ?? "";
+    const path = parameters.get("path")?.trim() ?? "";
+    const baseFileId = parameters.get("baseFileId")?.trim() || undefined;
+    if (!conversationId || !path || failed) return;
+    void openWorkspaceFile(conversationId, path, baseFileId)
+      .then((descriptor) => window.location.replace(workspaceFilePreviewPath(descriptor.id)))
+      .catch(() => setFailed(true));
+  }, [failed, parameters]);
+
   return (
     <main className="workspace-file-transition-page">
       {failed ? <section className="workspace-file-loading-card workspace-file-loading-failed" role="alert">
@@ -727,8 +1138,21 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
   const [file, setFile] = useState<WorkspaceFileDescriptor | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [textContent, setTextContent] = useState<string | null>(null);
+  const [preparedHtml, setPreparedHtml] = useState<string | null>(null);
+  const [htmlError, setHtmlError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openingPath, setOpeningPath] = useState(false);
+  const embeddedResourceLoader = useMemo(
+    () => file ? new EmbeddedWorkspaceResourceLoader(file.conversationId) : null,
+    [file],
+  );
+
+  useEffect(() => () => embeddedResourceLoader?.dispose(), [embeddedResourceLoader]);
+
+  const loadEmbeddedResource = useCallback((path: string, baseFileId?: string) => {
+    if (!embeddedResourceLoader) return Promise.reject(new Error("文档资源加载器尚未就绪"));
+    return embeddedResourceLoader.load(path, baseFileId);
+  }, [embeddedResourceLoader]);
 
   useEffect(() => {
     let active = true;
@@ -736,6 +1160,8 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
     setFile(null);
     setObjectUrl(null);
     setTextContent(null);
+    setPreparedHtml(null);
+    setHtmlError(null);
     setError(null);
     void getWorkspaceFile(fileId)
       .then(async (descriptor) => {
@@ -760,13 +1186,23 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
 
   const openNestedFile = useCallback((nestedPath: string, baseFileId?: string) => {
     if (!file || openingPath) return;
+    const previewWindow = window.open(new URL("/workspace-files/opening", window.location.origin).toString(), "_blank");
+    if (!previewWindow) {
+      setError("浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试");
+      return;
+    }
+    previewWindow.opener = null;
     setOpeningPath(true);
     setError(null);
     void openWorkspaceFile(file.conversationId, nestedPath, baseFileId)
-      .then((descriptor) => window.location.assign(workspaceFilePreviewPath(descriptor.id)))
+      .then((descriptor) => {
+        previewWindow.location.replace(new URL(workspaceFilePreviewPath(descriptor.id), window.location.origin).toString());
+        setOpeningPath(false);
+      })
       .catch((reason) => {
         setError(formatErrorMessage(reason, "打开 Agent 文件"));
         setOpeningPath(false);
+        previewWindow.location.replace(new URL("/workspace-files/opening?state=error", window.location.origin).toString());
       });
   }, [file, openingPath]);
 
@@ -784,42 +1220,113 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
   if (mediaType === "application/json" && textContent !== null) {
     try { visibleText = JSON.stringify(JSON.parse(textContent), null, 2); } catch { /* Keep the original invalid JSON visible. */ }
   }
-  const htmlSource = textContent === null ? "" : `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:">${textContent}`;
+
+  useEffect(() => {
+    if (!file || !isHtml || textContent === null || !embeddedResourceLoader) {
+      setPreparedHtml(null);
+      setHtmlError(null);
+      return;
+    }
+    let active = true;
+    setPreparedHtml(null);
+    setHtmlError(null);
+    void prepareHtmlPreviewDocument(textContent, file, embeddedResourceLoader)
+      .then((value) => { if (active) setPreparedHtml(value); })
+      .catch((reason) => { if (active) setHtmlError(reason instanceof Error ? reason.message : "HTML 页面准备失败"); });
+    return () => { active = false; };
+  }, [embeddedResourceLoader, file, isHtml, textContent]);
+
+  const previewLayout = !file || error
+    ? "status"
+    : isMarkdown ? "document"
+      : isHtml ? "html"
+        : mediaType === "application/pdf" ? "media"
+        : table ? "data"
+          : mediaType.startsWith("image/") ? "image"
+            : visibleText !== null ? "source"
+              : "status";
+  const previewKind = isMarkdown ? "Markdown"
+    : isHtml ? "HTML"
+      : isCsv ? "CSV"
+        : isTsv ? "TSV"
+          : mediaType === "application/pdf" ? "PDF"
+            : mediaType.startsWith("image/") ? "图片"
+              : language ? language.toUpperCase()
+                : "文件";
+  const previewBadge = isMarkdown ? "MD"
+    : isHtml ? "HTML"
+      : isCsv ? "CSV"
+        : isTsv ? "TSV"
+          : mediaType === "application/pdf" ? "PDF"
+            : extension ? extension.slice(0, 4).toUpperCase()
+              : "FILE";
+  const fileSize = file ? `${(file.size / 1024).toFixed(file.size < 1024 ? 2 : 1)} KB` : "";
 
   return (
     <main className="workspace-file-page">
-      <section className="workspace-file-viewer" aria-labelledby="workspace-file-title">
+      <section className={`workspace-file-viewer ${isHtml ? "workspace-file-viewer-html" : ""}`} aria-label="Agent 文件预览">
         <header>
-          <div>
-            <span>AGENT 文件预览</span>
-            <h1 id="workspace-file-title">{file?.name ?? "正在读取文件"}</h1>
-            {file && <code title={file.path}>{file.path}</code>}
+          <div className="workspace-file-brand">
+            <span aria-hidden="true">A</span>
+            <div>
+              <strong>{isHtml && file ? file.name : "AGENT"}</strong>
+              <small title={isHtml && file ? file.path : undefined}>{isHtml && file ? file.path : "文件预览"}</small>
+            </div>
           </div>
-          {file && objectUrl && <a className="workspace-file-download" href={objectUrl} download={file.name}>下载</a>}
-          <a className="workspace-file-home" href="/">控制中心</a>
-          <button type="button" onClick={() => window.close()} aria-label="关闭文件预览">×</button>
+          <div className="workspace-file-actions">
+            {file && objectUrl && <a className="workspace-file-download" href={objectUrl} download={file.name}>下载</a>}
+            <a className="workspace-file-home" href="/">控制中心</a>
+            <button type="button" onClick={() => window.close()} aria-label="关闭文件预览">×</button>
+          </div>
         </header>
-        <div className="workspace-file-body">
-          {!file && !error && <WorkspaceFileLoadingCard />}
-          {error && <div className="workspace-file-error" role="alert">{error}</div>}
-          {openingPath && <div className="workspace-file-navigation"><span className="loading-spinner" />正在打开关联文件…</div>}
-          {file && objectUrl && mediaType.startsWith("image/") && mediaType !== "image/svg+xml" && <img className="workspace-file-image" src={objectUrl} alt={file.name} />}
-          {file && isMarkdown && textContent !== null && <MarkdownContent baseFileId={file.id} onOpenLocalPath={openNestedFile}>{textContent}</MarkdownContent>}
-          {file && isHtml && textContent !== null && <iframe className="workspace-file-html" sandbox="" srcDoc={htmlSource} title={file.name} />}
-          {file && table && <div className="workspace-file-table-wrap">
-            <table className="workspace-file-table">
-              {table.rows[0] && <thead><tr>{table.rows[0].map((cell, index) => <th key={index}>{cell}</th>)}</tr></thead>}
-              <tbody>{table.rows.slice(1).map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody>
-            </table>
-            {table.truncated && <p>预览仅展示前 1000 行、100 列；可下载查看完整文件。</p>}
-          </div>}
-          {file && objectUrl && mediaType === "application/pdf" && <iframe className="workspace-file-pdf" src={objectUrl} title={file.name} />}
-          {file && visibleText !== null && language && !isMarkdown && !isHtml && !isCsv && !isTsv && <MarkdownContent>{fencedSource(visibleText, language)}</MarkdownContent>}
-          {file && visibleText !== null && !language && !isMarkdown && !isHtml && !isCsv && !isTsv && <pre className="workspace-file-text">{visibleText}</pre>}
-          {file && objectUrl && textContent === null && !mediaType.startsWith("image/") && mediaType !== "application/pdf" && <div className="workspace-file-state">该文件类型暂不支持直接预览，请下载后查看。</div>}
-          {file && objectUrl && mediaType === "image/svg+xml" && <div className="workspace-file-state">SVG 为可执行文档格式，为安全起见请下载后查看。</div>}
+        <div className={`workspace-file-body ${isHtml ? "workspace-file-body-html" : ""}`}>
+          <div className={`workspace-file-content workspace-file-content-${previewLayout}`}>
+            {file && !isHtml && <header className="workspace-file-meta">
+              <span className="workspace-file-type-badge" aria-hidden="true">{previewBadge}</span>
+              <div className="workspace-file-meta-copy">
+                <h1 id="workspace-file-title">{file.name}</h1>
+                <code title={file.path}>{file.path}</code>
+              </div>
+              <div className="workspace-file-facts" aria-label="文件信息">
+                <span>{previewKind}</span>
+                <span>{fileSize}</span>
+                <span>只读</span>
+              </div>
+            </header>}
+            <div className="workspace-file-preview">
+              {!file && !error && <WorkspaceFileLoadingCard />}
+              {error && <div className="workspace-file-error" role="alert">{error}</div>}
+              {htmlError && <div className="workspace-file-error" role="alert">{htmlError}</div>}
+              {openingPath && <div className="workspace-file-navigation"><span className="loading-spinner" />正在打开关联文件…</div>}
+              {file && objectUrl && mediaType.startsWith("image/") && <img className="workspace-file-image" src={objectUrl} alt={file.name} />}
+              {file && isMarkdown && textContent !== null && <MarkdownContent
+                baseFileId={file.id}
+                onOpenLocalPath={openNestedFile}
+                loadEmbeddedResource={loadEmbeddedResource}
+              >{textContent}</MarkdownContent>}
+              {file && isHtml && textContent !== null && !preparedHtml && !htmlError && <WorkspaceFileLoadingCard />}
+              {file && isHtml && preparedHtml && <iframe
+                className="workspace-file-html"
+                sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
+                referrerPolicy="no-referrer"
+                srcDoc={preparedHtml}
+                title={file.name}
+              />}
+              {file && table && <div className="workspace-file-table-wrap">
+                <div className="workspace-file-table-summary"><strong>{Math.max(0, table.rows.length - 1)}</strong> 条记录 <span>·</span> <strong>{table.rows[0]?.length ?? 0}</strong> 个字段</div>
+                <table className="workspace-file-table">
+                  {table.rows[0] && <thead><tr><th className="workspace-file-row-number" title="记录序号">#</th>{table.rows[0].map((cell, index) => <th key={index}>{cell}</th>)}</tr></thead>}
+                  <tbody>{table.rows.slice(1).map((row, rowIndex) => <tr key={rowIndex}><th className="workspace-file-row-number" scope="row">{rowIndex + 1}</th>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody>
+                </table>
+                {table.truncated && <p>预览仅展示前 1000 条记录、100 列；可下载查看完整文件。</p>}
+              </div>}
+              {file && objectUrl && mediaType === "application/pdf" && <iframe className="workspace-file-pdf" src={objectUrl} title={file.name} />}
+              {file && visibleText !== null && language && !isMarkdown && !isHtml && !isCsv && !isTsv && <MarkdownContent showCodeLineNumbers>{fencedSource(visibleText, language)}</MarkdownContent>}
+              {file && visibleText !== null && !language && !isMarkdown && !isHtml && !isCsv && !isTsv && <MarkdownContent showCodeLineNumbers>{fencedSource(visibleText, "plaintext")}</MarkdownContent>}
+              {file && objectUrl && textContent === null && !mediaType.startsWith("image/") && mediaType !== "application/pdf" && <div className="workspace-file-state">该文件类型暂不支持直接预览，请下载后查看。</div>}
+            </div>
+          </div>
         </div>
-        {file && <footer>{file.mediaType} · {(file.size / 1024).toFixed(file.size < 1024 ? 2 : 1)} KB · 只读临时预览</footer>}
       </section>
     </main>
   );
@@ -1977,6 +2484,7 @@ function ConversationFileHistoryPanel({
   error,
   deletingId,
   onClose,
+  onAdd,
   onOpen,
   onDelete,
 }: {
@@ -1985,18 +2493,82 @@ function ConversationFileHistoryPanel({
   error: string | null;
   deletingId: string | null;
   onClose: () => void;
+  onAdd: (path: string) => Promise<void>;
   onOpen: (file: ConversationOpenedFile) => void;
   onDelete: (file: ConversationOpenedFile) => void;
 }) {
+  const [addOpen, setAddOpen] = useState(false);
+  const [path, setPath] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+
+  async function submitFilePath(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const requestedPath = path.trim();
+    if (!requestedPath) {
+      setAddError("请输入 Agent 上的文件路径");
+      return;
+    }
+    if (!isLocalWorkspaceHref(requestedPath)) {
+      setAddError("请输入 Agent 本地文件路径，而不是网页地址");
+      return;
+    }
+    setAdding(true);
+    setAddError(null);
+    try {
+      await onAdd(requestedPath);
+      setPath("");
+      setAddOpen(false);
+    } catch (reason) {
+      setAddError(formatErrorMessage(reason, "添加 Agent 文件"));
+    } finally {
+      setAdding(false);
+    }
+  }
+
   return <aside className="conversation-files-panel" aria-label="本会话文件">
     <header>
       <div><span>本会话文件</span><strong>{files.length} 个历史文件</strong></div>
-      <button type="button" onClick={onClose} aria-label="折叠文件侧边栏">×</button>
+      <div className="conversation-files-header-actions">
+        <button
+          className={addOpen ? "conversation-files-add-toggle active" : "conversation-files-add-toggle"}
+          type="button"
+          aria-expanded={addOpen}
+          onClick={() => {
+            setAddOpen((current) => !current);
+            setAddError(null);
+          }}
+        ><span aria-hidden="true">＋</span>添加</button>
+        <button className="conversation-files-close" type="button" onClick={onClose} aria-label="折叠文件侧边栏">×</button>
+      </div>
     </header>
+    {addOpen && <form className="conversation-files-add-form" onSubmit={(event) => void submitFilePath(event)}>
+      <label htmlFor="conversation-file-path">Agent 文件路径</label>
+      <div>
+        <input
+          id="conversation-file-path"
+          value={path}
+          maxLength={4096}
+          autoComplete="off"
+          autoFocus
+          spellCheck={false}
+          disabled={adding}
+          placeholder="/home/ubuntu/documents/a.txt"
+          onChange={(event) => {
+            setPath(event.target.value);
+            setAddError(null);
+          }}
+        />
+        <button type="submit" disabled={adding || !path.trim()}>{adding && <i aria-hidden="true" />}{adding ? "验证中" : "添加"}</button>
+      </div>
+      {addError
+        ? <p role="alert">{addError}</p>
+        : <small>支持绝对路径；相对路径从当前会话工作空间解析</small>}
+    </form>}
     {error && <div className="conversation-files-error" role="alert">{error}</div>}
     <div className="conversation-files-list">
       {loading && files.length === 0 && <div className="conversation-files-state"><span className="loading-spinner" />正在读取文件历史…</div>}
-      {!loading && files.length === 0 && <div className="conversation-files-empty"><FilesIcon /><strong>还没有打开过文件</strong><span>从对话中打开的文件会自动出现在这里。</span></div>}
+      {!loading && files.length === 0 && <div className="conversation-files-empty"><FilesIcon /><strong>还没有添加文件</strong><span>从对话中打开文件，或通过上方路径手动添加。</span></div>}
       {files.map((file) => <div className="conversation-file-row" key={file.id}>
         <button className="conversation-file-open" type="button" onClick={() => onOpen(file)} title={file.path}>
           <span className="conversation-file-kind">{openedFileTypeLabel(file)}</span>
@@ -2079,6 +2651,7 @@ function ChatPanel({
   const uploadsRef = useRef<PendingUpload[]>([]);
   const fileHistoryRequestRef = useRef(0);
   const fileHistoryDeleteRequestRef = useRef(0);
+  const fileHistoryAddRequestRef = useRef(0);
   const fileHistoryConversationRef = useRef<string | null>(detail?.conversation.id ?? null);
   fileHistoryConversationRef.current = detail?.conversation.id ?? null;
   const timeline = useMemo(() => buildTimeline(detail), [detail]);
@@ -2135,6 +2708,7 @@ function ChatPanel({
 
   useEffect(() => {
     fileHistoryDeleteRequestRef.current += 1;
+    fileHistoryAddRequestRef.current += 1;
     setOpenedFiles([]);
     setFileHistoryOpen(false);
     setFileHistoryError(null);
@@ -2316,6 +2890,15 @@ function ChatPanel({
         }
         previewWindow.location.replace(new URL("/workspace-files/opening?state=error", window.location.origin).toString());
       });
+  }
+
+  async function addOpenedFile(path: string): Promise<void> {
+    if (!conversationId) throw new Error("请先打开一个会话");
+    const requestedConversationId = conversationId;
+    const revision = ++fileHistoryAddRequestRef.current;
+    await openWorkspaceFile(requestedConversationId, path);
+    if (revision !== fileHistoryAddRequestRef.current || requestedConversationId !== fileHistoryConversationRef.current) return;
+    await refreshOpenedFiles();
   }
 
   async function removeOpenedFile(file: ConversationOpenedFile): Promise<void> {
@@ -2613,6 +3196,7 @@ function ChatPanel({
           error={fileHistoryError}
           deletingId={deletingFileId}
           onClose={() => setFileHistoryOpen(false)}
+          onAdd={addOpenedFile}
           onOpen={(file) => openAgentFile(file.path)}
           onDelete={(file) => void removeOpenedFile(file)}
         />
@@ -2685,7 +3269,10 @@ function ChatPanel({
             <span aria-hidden="true">↓</span>滑动到底部
           </button>
         )}
-        {viewingHistoricalMessages && loadEarlierError && <div className="history-navigation-error" role="alert">{loadEarlierError}</div>}
+        {viewingHistoricalMessages && loadEarlierError && <div className="history-navigation-error" role="alert">
+          <span>{loadEarlierError}</span>
+          <button className="error-notice-close" type="button" aria-label="关闭历史消息错误提示" title="关闭" onClick={() => setLoadEarlierError(null)}>×</button>
+        </div>}
       </div>
       <div className="run-dock">
         {activeRun && (
@@ -2708,7 +3295,10 @@ function ChatPanel({
         )}
       </div>
       <form className="composer" onSubmit={submit} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
-        {error && !showCompactConfirm && <div className="composer-error">{error}</div>}
+        {error && !showCompactConfirm && <div className="composer-error" role="alert">
+          <span>{error}</span>
+          <button className="error-notice-close" type="button" aria-label="关闭对话错误提示" title="关闭" onClick={() => setError(null)}>×</button>
+        </div>}
         <ConversationUsageBar
           usage={conversation?.tokenUsage ?? null}
           draft={isDraft}
@@ -2865,10 +3455,15 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(() => sessionStoredValue(selectedConversationStorageKey));
   const [draftRequestId, setDraftRequestId] = useState(() => sessionStoredValue(draftRequestStorageKey) ?? newDraftRequestId());
   const [nodesCollapsed, setNodesCollapsed] = useState(() => storedBoolean(nodesCollapsedStorageKey));
-  const [historyCollapsed, setHistoryCollapsed] = useState(() => storedBoolean(historyCollapsedStorageKey));
-  const [mobilePane, setMobilePane] = useState<MobilePane>(() => sessionStoredValue(selectedConversationStorageKey) ? "chat" : "nodes");
+  const [historyCollapsed, setHistoryCollapsed] = useState(() => selectedNodeId && !selectedConversationId
+    ? false
+    : storedBoolean(historyCollapsedStorageKey));
+  const [mobilePane, setMobilePane] = useState<MobilePane>(() => selectedConversationId
+    ? "chat"
+    : selectedNodeId ? "conversations" : "nodes");
   const [streamConnected, setStreamConnected] = useState(false);
   const [backgroundIssues, setBackgroundIssues] = useState<Partial<Record<BackgroundIssueSource, BackgroundIssue>>>({});
+  const [dismissedBackgroundIssues, setDismissedBackgroundIssues] = useState<Partial<Record<BackgroundIssueSource, string>>>({});
   const selectedNodeIdRef = useRef(selectedNodeId);
   const selectedConversationIdRef = useRef(selectedConversationId);
   const draftRequestIdRef = useRef(draftRequestId);
@@ -2949,6 +3544,12 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       delete next[source];
       return next;
     });
+    setDismissedBackgroundIssues((current) => {
+      if (!current[source]) return current;
+      const next = { ...current };
+      delete next[source];
+      return next;
+    });
   }, []);
 
   const reportBackgroundIssue = useCallback((source: BackgroundIssueSource, reason: unknown, operation: string) => {
@@ -2962,9 +3563,19 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     }));
   }, []);
 
+  const dismissBackgroundIssues = useCallback(() => {
+    setDismissedBackgroundIssues((current) => {
+      const next = { ...current };
+      for (const issue of Object.values(backgroundIssues)) {
+        if (issue) next[issue.source] = issue.message;
+      }
+      return next;
+    });
+  }, [backgroundIssues]);
+
   const backgroundIssue = useMemo(() => Object.values(backgroundIssues)
-    .filter((issue): issue is BackgroundIssue => Boolean(issue))
-    .sort((left, right) => right.occurredAt - left.occurredAt)[0] ?? null, [backgroundIssues]);
+    .filter((issue): issue is BackgroundIssue => Boolean(issue) && dismissedBackgroundIssues[issue.source] !== issue.message)
+    .sort((left, right) => right.occurredAt - left.occurredAt)[0] ?? null, [backgroundIssues, dismissedBackgroundIssues]);
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
 
@@ -3238,6 +3849,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       commitSelectedConversation(null);
       setDetail(null);
       commitDraftRequestId(newDraftRequestId());
+      setHistoryCollapsed(false);
+      setMobilePane("conversations");
     }
   }, [nodes, selectedNodeId, commitSelectedNode, commitSelectedConversation, commitDraftRequestId]);
 
@@ -3420,7 +4033,12 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     const nodeChanged = selectedNodeIdRef.current !== node.id;
     if (!nodeChanged) {
       setPrimaryView("workspace");
-      setMobilePane("chat");
+      if (selectedConversationIdRef.current) {
+        setMobilePane("chat");
+      } else {
+        setHistoryCollapsed(false);
+        setMobilePane("conversations");
+      }
       setOverlay(null);
       return;
     }
@@ -3435,7 +4053,12 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     setDetail(null);
     commitDraftRequestId(newDraftRequestId());
     setPrimaryView("workspace");
-    setMobilePane("chat");
+    if (rememberedConversationId) {
+      setMobilePane("chat");
+    } else {
+      setHistoryCollapsed(false);
+      setMobilePane("conversations");
+    }
     setOverlay(null);
   }
 
@@ -3514,7 +4137,11 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
 
   return (
     <div className="app-root">
-      {backgroundIssue && <div className="connection-banner" role="status"><span>{backgroundIssue.message}</span><button type="button" onClick={refreshAll}>立即重试</button></div>}
+      {backgroundIssue && <div className="connection-banner" role="status">
+        <span>{backgroundIssue.message}</span>
+        <button className="connection-retry" type="button" onClick={refreshAll}>立即重试</button>
+        <button className="error-notice-close" type="button" aria-label="关闭错误提示" title="关闭" onClick={dismissBackgroundIssues}>×</button>
+      </div>}
       <div className={`layout mobile-${mobilePane} ${primaryView === "tasks" ? "task-center-active" : ""} ${nodesCollapsed ? "nodes-collapsed" : ""} ${historyCollapsed ? "history-collapsed" : ""}`}>
         <NodePanel
           nodes={nodes}

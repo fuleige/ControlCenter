@@ -284,12 +284,17 @@ export async function openWorkspaceFile(
   conversationId: string,
   path: string,
   baseFileId?: string,
+  options: { recordHistory?: boolean } = {},
 ): Promise<WorkspaceFileDescriptor> {
   return (await api<{ file: WorkspaceFileDescriptor }>(
     `/api/conversations/${encodeURIComponent(conversationId)}/workspace-files`,
     {
       method: "POST",
-      body: JSON.stringify({ path, ...(baseFileId ? { baseFileId } : {}) }),
+      body: JSON.stringify({
+        path,
+        ...(baseFileId ? { baseFileId } : {}),
+        ...(options.recordHistory === false ? { recordHistory: false } : {}),
+      }),
     },
   )).file;
 }

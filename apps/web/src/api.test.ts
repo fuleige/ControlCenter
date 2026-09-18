@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, formatErrorMessage, isWorkspaceConcurrencyConflict, listNodes } from "./api";
+import { ApiError, formatErrorMessage, isWorkspaceConcurrencyConflict, listNodes, openWorkspaceFile } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -108,5 +108,32 @@ describe("API errors", () => {
     expect(captured).toMatchObject({ kind: "invalid-response", status: 200 });
     expect(formatErrorMessage(captured, "刷新节点状态"))
       .toContain("请检查反向代理是否返回了错误页面");
+  });
+});
+
+describe("workspace file API", () => {
+  it("marks automatically embedded resources as excluded from file history", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _request?: RequestInit) => new Response(JSON.stringify({
+      file: {
+        id: "file-image",
+        conversationId: "conversation-1",
+        name: "preview.png",
+        path: "/workspace/preview.png",
+        mediaType: "image/png",
+        size: 12,
+        expiresAt: "2026-09-18T12:00:00.000Z",
+        contentUrl: "/api/workspace-files/file-image/content",
+      },
+    }), { status: 201, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await openWorkspaceFile("conversation-1", "preview.png", "file-markdown", { recordHistory: false });
+
+    const [, request] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(String(request?.body))).toEqual({
+      path: "preview.png",
+      baseFileId: "file-markdown",
+      recordHistory: false,
+    });
   });
 });

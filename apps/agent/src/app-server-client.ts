@@ -24,6 +24,14 @@ export class AppServerRpcError extends Error {
   }
 }
 
+export function appServerSpawnOptions(workingDirectory?: string) {
+  return {
+    stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"],
+    env: process.env,
+    cwd: workingDirectory,
+  };
+}
+
 function oneLineMessage(value: unknown, fallback = "Codex 执行失败"): string {
   const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
   if (!text) return fallback;
@@ -215,7 +223,11 @@ export class AppServerClient extends EventEmitter {
   private readonly pending = new Map<RpcRequestId, RpcPending>();
   private starting: Promise<void> | null = null;
 
-  constructor(private readonly codexBinary: string, private readonly yolo = false) {
+  constructor(
+    private readonly codexBinary: string,
+    private readonly yolo = false,
+    private readonly workingDirectory?: string,
+  ) {
     super();
   }
 
@@ -231,10 +243,13 @@ export class AppServerClient extends EventEmitter {
   }
 
   private async startInternal(): Promise<void> {
-    const child = spawn(this.codexBinary, appServerArguments(this.yolo), {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-    });
+    // Agent releases may be replaced while this process is running. Do not
+    // let Codex inherit a package directory that can later be removed.
+    const child = spawn(
+      this.codexBinary,
+      appServerArguments(this.yolo),
+      appServerSpawnOptions(this.workingDirectory),
+    );
     this.process = child;
     const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => this.onLine(line));
@@ -260,7 +275,7 @@ export class AppServerClient extends EventEmitter {
       clientInfo: {
         name: "controller_center_agent",
         title: "Controller Center Agent",
-        version: "0.3.12",
+        version: "0.3.13",
       },
     });
     this.notify("initialized", {});

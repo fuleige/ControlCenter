@@ -117,6 +117,9 @@ npm run dev:web
 本机非容器部署可以同时保留生产版和开发版：
 
 ```bash
+# 构建并重启控制中心，固定带上生产域名白名单、公开 Origin 与代理信任配置
+npm run deploy:control-plane:production
+
 # 构建后发布到 Nginx，固定监听 5173；只有再次执行此命令才会更新生产页面
 npm run deploy:web:production
 
@@ -125,6 +128,8 @@ CONTROL_PROXY_ORIGIN=https://control.example.com npm run dev:web
 ```
 
 两个 Web 入口都代理到同一个 `8787` 控制面，因此共享 SQLite 数据、登录配置、节点、Agent 连接和附件。生产页面使用 `/var/www/controller-center-web/current` 指向的独立 release，编辑工作区源码不会自动改变已发布页面。
+
+生产控制中心不要直接执行 `node apps/control-plane/dist/index.js`。统一使用 `npm run deploy:control-plane:production`，脚本默认设置 `PUBLIC_ORIGIN=https://c.llmdev.cn`、`CORS_ORIGIN=https://c.llmdev.cn` 和 `TRUST_PROXY=true`，并在重启后检查健康状态及 CORS 响应。如需迁移域名，可通过 `CONTROLLER_CENTER_PUBLIC_ORIGIN` 覆盖公开地址，通过 `CONTROLLER_CENTER_CORS_ORIGIN` 配置逗号分隔的额外白名单。
 
 若临时通过域名反向代理 Vite 开发服务，可用逗号分隔的 `WEB_ALLOWED_HOSTS` 配置 Host 白名单；仓库默认允许 `c.llmdev.cn`。生产部署仍应使用构建后的 Nginx Web 容器，而不是长期运行 Vite。
 
@@ -165,7 +170,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可直接下载当前版本的完整客户端安装包；该包已经包含编译结果和生产依赖，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.12.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.13.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent

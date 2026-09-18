@@ -9,6 +9,7 @@ import {
   normalizeMathMarkdown,
   isLocalWorkspaceHref,
   parseDelimitedPreview,
+  previewLineNumberText,
 } from "./App";
 import type { ConversationDetail, Message } from "./types";
 
@@ -179,6 +180,11 @@ describe("conversation file links", () => {
       ["name", "value"],
       ["alpha", "1"],
     ]);
+  });
+
+  it("builds preview line numbers without counting a trailing empty line", () => {
+    expect(previewLineNumberText("alpha\nbeta\ngamma\n")).toBe("1\n2\n3");
+    expect(previewLineNumberText("")).toBe("1");
   });
 });
 

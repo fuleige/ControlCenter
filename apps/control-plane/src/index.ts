@@ -128,21 +128,21 @@ function publicWorkspaceFile(file: WorkspaceFileCacheEntry) {
   };
 }
 
-function consumeWorkspaceFileRateLimit(conversationId: string): boolean {
+function consumeWorkspaceFileRateLimit(bucketId: string, limit: number): boolean {
   const cutoff = Date.now() - 60_000;
   for (const [id, timestamps] of workspaceFileRequests) {
-    if (id === conversationId) continue;
+    if (id === bucketId) continue;
     const active = timestamps.filter((timestamp) => timestamp > cutoff);
     if (active.length) workspaceFileRequests.set(id, active);
     else workspaceFileRequests.delete(id);
   }
-  const recent = (workspaceFileRequests.get(conversationId) ?? []).filter((timestamp) => timestamp > cutoff);
-  if (recent.length >= 20) {
-    workspaceFileRequests.set(conversationId, recent);
+  const recent = (workspaceFileRequests.get(bucketId) ?? []).filter((timestamp) => timestamp > cutoff);
+  if (recent.length >= limit) {
+    workspaceFileRequests.set(bucketId, recent);
     return false;
   }
   recent.push(Date.now());
-  workspaceFileRequests.set(conversationId, recent);
+  workspaceFileRequests.set(bucketId, recent);
   return true;
 }
 
@@ -1074,7 +1074,7 @@ app.delete<{ Params: { id: string; fileId: string } }>("/api/conversations/:id/w
 
 app.post<{
   Params: { id: string };
-  Body: { path?: string; baseFileId?: string };
+  Body: { path?: string; baseFileId?: string; recordHistory?: boolean };
 }>("/api/conversations/:id/workspace-files", async (request, reply) => {
   const conversation = database.getConversation(request.params.id);
   if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除", code: "conversation_not_found" });
@@ -1088,7 +1088,8 @@ app.post<{
   if (!connections.hasCapability(conversation.nodeId, WORKSPACE_FILE_READ_CAPABILITY)) {
     return reply.code(409).send({ error: "该 Agent 版本尚不支持对话文件预览，请先升级并重启 Agent", code: "agent_upgrade_required" });
   }
-  if (!consumeWorkspaceFileRateLimit(conversation.id)) {
+  const recordHistory = request.body?.recordHistory !== false;
+  if (!consumeWorkspaceFileRateLimit(`${conversation.id}:${recordHistory ? "open" : "embed"}`, recordHistory ? 20 : 80)) {
     return reply.code(429).send({ error: "文件打开过于频繁，请稍后再试", code: "workspace_file_rate_limited" });
   }
 
@@ -1154,6 +1155,7 @@ app.post<{
   };
   workspaceFileCache.set(file.id, file);
   pruneWorkspaceFileCache();
+  if (!recordHistory) return reply.code(201).send({ file: publicWorkspaceFile(file) });
   const history = database.upsertConversationOpenedFile({
     id: randomUUID(),
     conversationId: conversation.id,

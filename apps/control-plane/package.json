@@ -1,6 +1,6 @@
 {
   "name": "@controller-center/control-plane",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
