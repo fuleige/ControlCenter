@@ -1,4 +1,5 @@
 export const CONTROL_PROTOCOL_VERSION = 5 as const;
+export const WORKSPACE_FILE_READ_CAPABILITY = "workspace_file_read_v1" as const;
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -83,6 +84,8 @@ export interface NodeDescriptor {
   maxConcurrentRuns: number;
   workspaces: WorkspaceDescriptor[];
   models?: ModelDescriptor[];
+  /** Optional features supported without requiring a protocol-version bump. */
+  capabilities?: string[];
 }
 
 export interface AgentHelloMessage {
@@ -112,6 +115,26 @@ export interface AgentWorkspaceValidationMessage {
   valid: boolean;
   canonicalPath?: string;
   suggestedName?: string;
+  error?: string;
+}
+
+export type WorkspaceFileReadErrorCode =
+  | "not_found"
+  | "not_file"
+  | "forbidden"
+  | "too_large"
+  | "read_failed";
+
+export interface AgentWorkspaceFileMessage {
+  type: "agent.workspaceFile";
+  requestId: string;
+  ok: boolean;
+  path?: string;
+  name?: string;
+  mediaType?: string;
+  size?: number;
+  contentBase64?: string;
+  errorCode?: WorkspaceFileReadErrorCode;
   error?: string;
 }
 
@@ -281,6 +304,7 @@ export type AgentToControlMessage =
   | AgentHeartbeatMessage
   | AgentCommandAckMessage
   | AgentWorkspaceValidationMessage
+  | AgentWorkspaceFileMessage
   | AgentDurableMessage;
 
 export interface CreateConversationCommand {
@@ -400,6 +424,16 @@ export interface ControlWorkspaceValidateMessage {
   path: string;
 }
 
+export interface ControlWorkspaceFileReadMessage {
+  type: "control.workspaceFileRead";
+  requestId: string;
+  workspaceId: string;
+  path: string;
+  /** Canonical path of a previously opened file, used for nested relative links. */
+  basePath?: string;
+  maxBytes: number;
+}
+
 export interface ControlWorkspaceSyncMessage {
   type: "control.workspaceSync";
   workspaces: ManagedWorkspaceDescriptor[];
@@ -410,6 +444,7 @@ export type ControlToAgentMessage =
   | ControlWelcomeMessage
   | ControlDeliveryAckMessage
   | ControlWorkspaceValidateMessage
+  | ControlWorkspaceFileReadMessage
   | ControlWorkspaceSyncMessage
   | ControlErrorMessage;
 
@@ -427,6 +462,7 @@ export function parseAgentMessage(input: string): AgentToControlMessage {
     value.type !== "agent.heartbeat" &&
     value.type !== "agent.commandAck" &&
     value.type !== "agent.workspaceValidation" &&
+    value.type !== "agent.workspaceFile" &&
     value.type !== "agent.message"
   ) {
     throw new Error(`Unsupported agent message type: ${value.type}`);
@@ -444,6 +480,7 @@ export function parseControlMessage(input: string): ControlToAgentMessage {
     value.type !== "control.welcome" &&
     value.type !== "control.deliveryAck" &&
     value.type !== "control.workspaceValidate" &&
+    value.type !== "control.workspaceFileRead" &&
     value.type !== "control.workspaceSync" &&
     value.type !== "control.error"
   ) {

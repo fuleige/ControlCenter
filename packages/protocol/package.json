@@ -1,6 +1,6 @@
 {
   "name": "@controller-center/protocol",
-  "version": "0.3.9",
+  "version": "0.3.12",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",

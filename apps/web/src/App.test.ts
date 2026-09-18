@@ -7,6 +7,8 @@ import {
   mergedConversationDetail,
   messageHistoryCacheLimit,
   normalizeMathMarkdown,
+  isLocalWorkspaceHref,
+  parseDelimitedPreview,
 } from "./App";
 import type { ConversationDetail, Message } from "./types";
 
@@ -143,6 +145,40 @@ describe("normalizeMathMarkdown", () => {
     expect(normalized).toContain("$$\\int_0^1 x^2 dx$$");
     expect(normalized).toContain(String.raw`\`\(literal\)\``);
     expect(normalized).toContain(String.raw`\[literal block\]`);
+  });
+});
+
+describe("conversation file links", () => {
+  it("only sends local and file paths to the Agent", () => {
+    expect(isLocalWorkspaceHref("/home/ubuntu/documents/a.txt")).toBe(true);
+    expect(isLocalWorkspaceHref("../reports/a.csv")).toBe(true);
+    expect(isLocalWorkspaceHref("C:\\reports\\a.tsv")).toBe(true);
+    expect(isLocalWorkspaceHref("file:///home/ubuntu/a.md")).toBe(true);
+    for (const external of [
+      "https://example.com/a.md",
+      "http://example.com",
+      "mailto:user@example.com",
+      "tel:+8610010",
+      "ftp://example.com/a.csv",
+      "ws://example.com/socket",
+      "wss://example.com/socket",
+      "ssh://example.com",
+      "//cdn.example.com/image.png",
+      "#section",
+      "custom-protocol:value",
+    ]) expect(isLocalWorkspaceHref(external), external).toBe(false);
+  });
+
+  it("parses quoted CSV and tab-separated TSV previews", () => {
+    expect(parseDelimitedPreview('name,note\nalpha,"one,two"\nbeta,"line 1\nline 2"', ",").rows).toEqual([
+      ["name", "note"],
+      ["alpha", "one,two"],
+      ["beta", "line 1\nline 2"],
+    ]);
+    expect(parseDelimitedPreview("name\tvalue\nalpha\t1", "\t").rows).toEqual([
+      ["name", "value"],
+      ["alpha", "1"],
+    ]);
   });
 });
 

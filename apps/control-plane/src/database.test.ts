@@ -176,6 +176,38 @@ describe("ControlDatabase", () => {
     expect(database.listConversationPage({ query: "searchable", limit: 10, includeTotal: false }).total).toBeUndefined();
     expect(database.listConversationPage({ nodeId: "node-1", runStatus: "active", limit: 10 }).data.map((conversation) => conversation.id)).toEqual(["conversation-1"]);
 
+    const firstOpenedFile = database.upsertConversationOpenedFile({
+      id: "opened-file-1",
+      conversationId: "conversation-1",
+      path: "/repo/report.md",
+      name: "report.md",
+      mediaType: "text/markdown; charset=utf-8",
+      size: 12,
+      openedAt: "2026-09-09T10:02:00.000Z",
+    });
+    database.upsertConversationOpenedFile({
+      id: "opened-file-2",
+      conversationId: "conversation-1",
+      path: "/repo/results.tsv",
+      name: "results.tsv",
+      mediaType: "text/tab-separated-values; charset=utf-8",
+      size: 24,
+      openedAt: "2026-09-09T10:03:00.000Z",
+    });
+    const reopenedFile = database.upsertConversationOpenedFile({
+      id: "ignored-on-conflict",
+      conversationId: "conversation-1",
+      path: "/repo/report.md",
+      name: "report.md",
+      mediaType: "text/markdown; charset=utf-8",
+      size: 18,
+      openedAt: "2026-09-09T10:04:00.000Z",
+    });
+    expect(reopenedFile).toMatchObject({ id: firstOpenedFile.id, openCount: 2, size: 18 });
+    expect(database.listConversationOpenedFiles("conversation-1").map((file) => file.name)).toEqual(["report.md", "results.tsv"]);
+    expect(database.deleteConversationOpenedFile("conversation-1", "opened-file-2")).toBe(true);
+    expect(database.deleteConversationOpenedFile("conversation-1", "opened-file-2")).toBe(false);
+
     database.createCommand("command-1", "node-1", {
       type: "run.interrupt",
       conversationId: "conversation-1",
@@ -296,6 +328,7 @@ describe("ControlDatabase", () => {
     expect(database.canDispatchQueuedRun("node-1", "conversation-1")).toBe(true);
     expect(database.deleteConversation("conversation-1")).toBe(true);
     expect(database.getConversation("conversation-1")).toBeNull();
+    expect(database.listConversationOpenedFiles("conversation-1")).toEqual([]);
     database.close();
   });
 

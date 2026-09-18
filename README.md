@@ -1,6 +1,6 @@
 # Controller Center
 
-一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据和工作区文件都不会交给控制中心。
+一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据始终留在节点本地。工作区文件默认不上传，只有管理员在对话中明确点击文件链接时，所选文件才会经控制中心短时只读转发用于预览。
 
 产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。Agent 可用参数、环境变量、优先级和组合示例见 [Agent 客户端命令与配置](docs/agent-cli.md)。代码按这些边界实施。
 
@@ -50,6 +50,8 @@ Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agen
 - Agent 本地 SQLite inbox/outbox、命令去重、消息补发和重连状态协调。
 - 浏览器 SSE 使用持久游标重放并按资源精准刷新；正常连接时每 60 秒权威同步，断线时每 10 秒兜底轮询，页面恢复可见时立即同步。
 - 回复流式刷新时同步渲染 Markdown 和 KaTeX，兼容 `$...$`、`$$...$$`、`\(...\)` 与 `\[...\]`。
+- 对话中的本地绝对路径和相对路径由当前会话绑定的 Agent 只读打开，并在独立标签页预览；支持 Markdown、沙箱 HTML、CSV、TSV、常见图片、PDF、JSON、常见脚本/配置文件和其他文本文件，外部 URI 不会请求 Agent。
+- 每个会话持久保存成功打开过的文件路径，并在可折叠的右侧文件栏按最后查看时间倒序展示；重复打开自动去重，点击时重新读取最新内容，删除只移除查看记录。
 - 长对话默认读取最近 60 条消息，可按游标加载更早消息；历史阅读窗口最多保留 500 条，并提供“返回最新消息”，同时使用动态高度虚拟列表，避免长时间挂机或连续翻页导致前端内存无限增长。
 - 已就绪且没有运行中任务的会话可在输入框附近手动压缩上下文；操作需要二次确认，压缩状态可跨刷新和短暂断线恢复，聊天记录不会被删除。
 - Codex App Server 错误会归类为上下文超限、额度/限流、登录失效、服务或响应流中断、沙箱、安全策略、无效请求等稳定业务类型，同时保留简短上游诊断信息。
@@ -110,6 +112,8 @@ npm run dev:web
 
 打开 `http://127.0.0.1:5174` 并使用上面的管理员 Token 登录。开发服务器会把同源 `/api`、`/agent/connect`、`/agent/enroll` 和附件下载代理到本机控制中心。如果开发版使用与控制面配置不同的 Origin，启动时通过 `CONTROL_PROXY_ORIGIN=https://control.example.com` 让开发代理重写 Origin，无需放宽生产控制面的 CORS 白名单。
 
+当共享控制面按 HTTPS 生产域名签发 `Secure` 会话 Cookie 时，5174 开发代理会把它转换为仅供本地 HTTP 使用的 `cc_dev_session` HttpOnly Cookie，并在转发请求时映射回控制面所需名称。因此 `http://localhost:5174` 与 `http://127.0.0.1:5174` 都可登录，且不会改变 5173 的生产 Cookie。
+
 本机非容器部署可以同时保留生产版和开发版：
 
 ```bash
@@ -161,7 +165,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可直接下载当前版本的完整客户端安装包；该包已经包含编译结果和生产依赖，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.9.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.12.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -245,6 +249,11 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 - `POST /api/conversations/start`（首次发送时幂等创建会话和首轮任务）
 - `GET /api/conversations/:id?messageLimit=60&beforeMessage=<cursor>`（最近消息与向前分页）
 - `DELETE /api/conversations/:id`
+- `GET /api/conversations/:id/workspace-file-history`（按最后查看时间读取当前会话的全部文件历史）
+- `DELETE /api/conversations/:id/workspace-file-history/:fileId`（仅删除文件查看记录）
+- `POST /api/conversations/:id/workspace-files`（从会话绑定的 Agent 创建短时只读文件预览）
+- `GET /api/workspace-files/:id`（登录后读取短时预览元数据）
+- `GET /api/workspace-files/:id/content`（登录后读取短时预览内容）
 - `POST /api/conversations/:id/runs`
 - `POST /api/runs/:id/steer`
 - `POST /api/runs/:id/interrupt`
@@ -269,6 +278,8 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 - 管理员 Token 原文仅保存在控制中心本机权限为 `0600` 的文件；数据库只保存哈希，浏览器登录后只持有 HttpOnly Cookie。
 - 节点注册 Token 在 10 分钟有效期内可由已登录管理员查看和复制，但仍只能成功使用一次；数据库保存校验哈希及由本机独立密钥加密的临时展示内容，到期自动删除整条记录。节点长期凭证与固定节点 ID 绑定。
 - Agent 在保存和实际执行前都验证路径，并始终使用规范绝对路径；目录权限边界由 Agent 的操作系统用户决定。
+- 对话文件预览只由明确点击触发：相对路径从会话工作空间或当前已打开文件目录解析，绝对路径可位于工作空间外，因此其读取边界同样是 Agent 运行用户的操作系统权限。仅普通文件可读，拒绝 `/proc`、`/sys`、`/dev` 和设备路径，单文件限制为 8 MiB。
+- 预览文件内容只在控制面内存中保留 5 分钟并使用随机 ID，不写入 SQLite；成功打开后只持久保存会话、规范路径、类型、大小和查看时间。删除文件历史只删除这条元数据，不会请求 Agent 删除实际文件。每个会话限流且每个 Agent 限制并发读取。HTML 在无脚本、无同源权限的 iframe sandbox 中渲染，SVG 不直接渲染。
 - 默认工作空间只能由 Agent 的进程启动目录决定，不能通过 Web 改名、迁移、停用或删除。
 - Agent 默认使用 `workspaceWrite` sandbox 并关闭网络访问；只有在本机启动命令显式传入 `--yolo` 时才切换为无审批、无沙箱的全权限模式，Web 会持续标识该状态。
 - 默认情况下 Agent 自身网络与 Codex 都遵循代理环境变量及 `NO_PROXY`；显式传入 `--codex-proxy-only` 后，Agent 自身连接强制直连，代理变量只由 Codex 子进程继承。

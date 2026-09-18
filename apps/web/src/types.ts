@@ -64,6 +64,29 @@ export interface Conversation {
   updatedAt: string;
 }
 
+export interface WorkspaceFileDescriptor {
+  id: string;
+  conversationId: string;
+  name: string;
+  path: string;
+  mediaType: string;
+  size: number;
+  expiresAt: string;
+  contentUrl: string;
+}
+
+export interface ConversationOpenedFile {
+  id: string;
+  conversationId: string;
+  path: string;
+  name: string;
+  mediaType: string;
+  size: number;
+  openCount: number;
+  firstOpenedAt: string;
+  lastOpenedAt: string;
+}
+
 export type RunErrorCode =
   | "context_window_exceeded"
   | "session_budget_exceeded"

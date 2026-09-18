@@ -11,6 +11,22 @@ const allowedHosts = (process.env.WEB_ALLOWED_HOSTS ?? "c.llmdev.cn")
 const controlPlaneUrl = process.env.CONTROL_PROXY_URL?.trim() || "http://127.0.0.1:8787";
 const controlPlaneWebSocketUrl = controlPlaneUrl.replace(/^http/, "ws");
 const controlProxyOrigin = process.env.CONTROL_PROXY_ORIGIN?.trim();
+const developmentSessionCookie = "cc_dev_session";
+
+function upstreamCookieHeader(cookieHeader: string): string {
+  const cookies = cookieHeader.split(/;\s*/u);
+  const developmentCookie = cookies.find((cookie) => cookie.startsWith(`${developmentSessionCookie}=`));
+  if (!developmentCookie) return cookieHeader;
+  const value = developmentCookie.slice(developmentSessionCookie.length + 1);
+  const withoutDevelopmentCookie = cookies.filter((cookie) => !cookie.startsWith(`${developmentSessionCookie}=`));
+  return [...withoutDevelopmentCookie, `__Host-cc_session=${value}`, `cc_session=${value}`].join("; ");
+}
+
+function developmentSetCookieHeader(value: string): string {
+  return value
+    .replace(/^(?:__Host-cc_session|cc_session)=/u, `${developmentSessionCookie}=`)
+    .replace(/;\s*Secure\b/giu, "");
+}
 
 function controlProxy(target: string, websocket = false): ProxyOptions {
   return {
@@ -18,12 +34,18 @@ function controlProxy(target: string, websocket = false): ProxyOptions {
     changeOrigin: true,
     ...(websocket ? { ws: true } : {}),
     configure(proxy) {
-      if (!controlProxyOrigin) return;
       proxy.on("proxyReq", (proxyRequest, request) => {
-        if (request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
+        if (request.headers.cookie) proxyRequest.setHeader("Cookie", upstreamCookieHeader(request.headers.cookie));
+        if (controlProxyOrigin && request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
       });
       proxy.on("proxyReqWs", (proxyRequest, request) => {
-        if (request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
+        if (controlProxyOrigin && request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
+      });
+      proxy.on("proxyRes", (proxyResponse) => {
+        const setCookie = proxyResponse.headers["set-cookie"];
+        if (!setCookie) return;
+        proxyResponse.headers["set-cookie"] = (Array.isArray(setCookie) ? setCookie : [setCookie])
+          .map(developmentSetCookieHeader);
       });
     },
   };

@@ -5,6 +5,7 @@ import type {
   Conversation,
   ConversationCompaction,
   ConversationDetail,
+  ConversationOpenedFile,
   GlobalSettings,
   EnrollmentToken,
   NodeRecord,
@@ -13,6 +14,7 @@ import type {
   TaskCenterEntry,
   TaskCenterPolicy,
   Workspace,
+  WorkspaceFileDescriptor,
 } from "./types";
 
 const configuredApiUrl = (import.meta.env.VITE_API_URL as string | undefined)?.trim();
@@ -276,6 +278,66 @@ export async function getConversation(id: string, options: { beforeMessage?: str
     // Allows the Web and Control Plane to be restarted independently during a rolling deployment.
     messagePage: result.messagePage ?? { hasMore: false, before: null },
   };
+}
+
+export async function openWorkspaceFile(
+  conversationId: string,
+  path: string,
+  baseFileId?: string,
+): Promise<WorkspaceFileDescriptor> {
+  return (await api<{ file: WorkspaceFileDescriptor }>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/workspace-files`,
+    {
+      method: "POST",
+      body: JSON.stringify({ path, ...(baseFileId ? { baseFileId } : {}) }),
+    },
+  )).file;
+}
+
+export async function listConversationOpenedFiles(conversationId: string): Promise<ConversationOpenedFile[]> {
+  return (await api<{ data: ConversationOpenedFile[] }>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/workspace-file-history`,
+  )).data;
+}
+
+export async function deleteConversationOpenedFile(conversationId: string, fileId: string): Promise<void> {
+  await api<void>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/workspace-file-history/${encodeURIComponent(fileId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function getWorkspaceFile(fileId: string): Promise<WorkspaceFileDescriptor> {
+  return (await api<{ file: WorkspaceFileDescriptor }>(`/api/workspace-files/${encodeURIComponent(fileId)}`)).file;
+}
+
+export async function fetchWorkspaceFileContent(file: WorkspaceFileDescriptor): Promise<Blob> {
+  const requestPath = `/api/workspace-files/${encodeURIComponent(file.id)}/content`;
+  const method = "GET";
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${requestPath}`, { credentials: "include" });
+  } catch (cause) {
+    throw new ApiError(cause instanceof Error && cause.message ? cause.message : "网络请求失败", {
+      kind: "network",
+      method,
+      path: requestPath,
+      cause,
+    });
+  }
+  if (!response.ok) {
+    const body = await responseBody<Record<string, never>>(response, method, requestPath);
+    if (response.status === 401) window.dispatchEvent(new CustomEvent("controller-center:unauthorized"));
+    throw new ApiError(apiErrorMessage(body, response.status), {
+      kind: "http",
+      status: response.status,
+      code: typeof body?.code === "string" ? body.code : null,
+      method,
+      path: requestPath,
+      requestId: responseRequestId(response, body),
+    });
+  }
+  return response.blob();
 }
 
 export async function createConversation(input: {

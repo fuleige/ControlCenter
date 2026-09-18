@@ -48,6 +48,15 @@ Browser ⇄ Control Plane ⇄ Node Agent ⇄ Codex App Server
 - 注册 CLI 是独立进程，必须独立解析同名参数。代理地址、用户名和密码不进入日志、协议或数据库。
 - Control Plane 对重复序列去重。
 
+### 2.5 对话文件预览
+
+- 文件读取是有 15 秒超时的非耐久请求—响应，不进入命令表或 Agent Outbox；断线、进程重启或超时后直接失败，不自动重放读取。
+- Agent 通过可选 capability 宣告支持，Control Plane 只向支持该能力的在线 Agent 发送请求，便于旧 Agent 滚动升级。
+- 同一 Agent 最多同时处理 4 个读取请求。成功内容经 WSS 返回后只在 Control Plane 内存缓存 5 分钟；缓存丢失只要求用户重新点击，不影响会话状态。
+- 浏览器后续相对链接只提交短时文件 ID，Control Plane 校验其会话和节点归属后才把服务端保存的规范路径作为基准传给 Agent，避免浏览器伪造另一个会话的基准文件。
+- Agent 成功返回后，Control Plane 以会话和规范绝对路径为唯一键持久保存文件查看元数据，并发布可重放 UI 事件；其他标签页打开相对文件时，原聊天页也能刷新文件栏。文件内容仍不落库。
+- 文件历史删除只操作 Control Plane 元数据。重新打开历史记录时再次执行受限的 Agent 文件读取，因此文件修改、删除、Agent 离线和权限变化都会反映为当次真实结果。
+
 当前实现已具备该基础；协议 v5 使用产品级消息、进度和会话压缩事件，并增加工作空间同步与在线验证。
 
 ## 3. 协议 v5
@@ -266,6 +275,7 @@ Agent 将 App Server `error` 通知中的 `codexErrorInfo` 映射为稳定的 `e
 - `settings(scope, scope_id, key, value_json, updated_at)`
 - `conversations.compaction_json` 保存最近一次会话级压缩状态；`runs.error_code` 保存稳定错误分类。
 - `attachments(id, conversation_id, message_client_id, name, media_type, size, sha256, status, storage_key, expires_at, created_at)`
+- `conversation_opened_files(id, conversation_id, path, name, media_type, size, open_count, first_opened_at, last_opened_at)`，以 `(conversation_id, path)` 去重并随会话级联删除。
 - `ui_events(revision, type, resource_id, occurred_at)`
 
 ### 7.2 修改表

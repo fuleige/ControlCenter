@@ -7,6 +7,7 @@ import websocket from "@fastify/websocket";
 import type { WebSocket } from "ws";
 import {
   CONTROL_PROTOCOL_VERSION,
+  WORKSPACE_FILE_READ_CAPABILITY,
   isRecord,
   parseAgentMessage,
   type AgentDurableMessage,
@@ -46,6 +47,24 @@ const events = new UiEventBus();
 const app = Fastify({ logger: true, trustProxy: config.trustProxy });
 const uiStreams = new Set<FastifyReply["raw"]>();
 const taskCenterPolicy = { limit: 200, replyPreviewCharacters: 120, readRetentionDays: 30, unreadRetentionDays: 90 } as const;
+const workspaceFileMaxBytes = 8 * 1024 * 1024;
+const workspaceFileCacheMaxBytes = 64 * 1024 * 1024;
+const workspaceFileLifetimeMs = 5 * 60 * 1000;
+
+interface WorkspaceFileCacheEntry {
+  id: string;
+  conversationId: string;
+  nodeId: string;
+  path: string;
+  name: string;
+  mediaType: string;
+  content: Buffer;
+  createdAt: number;
+  expiresAt: number;
+}
+
+const workspaceFileCache = new Map<string, WorkspaceFileCacheEntry>();
+const workspaceFileRequests = new Map<string, number[]>();
 mkdirSync(config.attachmentDirectory, { recursive: true, mode: 0o700 });
 app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: 2 * 1024 * 1024 }, (_request, body, done) => {
   done(null, body);
@@ -81,6 +100,50 @@ app.setErrorHandler((error, request, reply) => {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function pruneWorkspaceFileCache(): void {
+  const timestamp = Date.now();
+  for (const [id, entry] of workspaceFileCache) {
+    if (entry.expiresAt <= timestamp) workspaceFileCache.delete(id);
+  }
+  let totalBytes = [...workspaceFileCache.values()].reduce((sum, entry) => sum + entry.content.byteLength, 0);
+  for (const [id, entry] of workspaceFileCache) {
+    if (totalBytes <= workspaceFileCacheMaxBytes) break;
+    workspaceFileCache.delete(id);
+    totalBytes -= entry.content.byteLength;
+  }
+}
+
+function publicWorkspaceFile(file: WorkspaceFileCacheEntry) {
+  return {
+    id: file.id,
+    conversationId: file.conversationId,
+    name: file.name,
+    path: file.path,
+    mediaType: file.mediaType,
+    size: file.content.byteLength,
+    expiresAt: new Date(file.expiresAt).toISOString(),
+    contentUrl: `/api/workspace-files/${file.id}/content`,
+  };
+}
+
+function consumeWorkspaceFileRateLimit(conversationId: string): boolean {
+  const cutoff = Date.now() - 60_000;
+  for (const [id, timestamps] of workspaceFileRequests) {
+    if (id === conversationId) continue;
+    const active = timestamps.filter((timestamp) => timestamp > cutoff);
+    if (active.length) workspaceFileRequests.set(id, active);
+    else workspaceFileRequests.delete(id);
+  }
+  const recent = (workspaceFileRequests.get(conversationId) ?? []).filter((timestamp) => timestamp > cutoff);
+  if (recent.length >= 20) {
+    workspaceFileRequests.set(conversationId, recent);
+    return false;
+  }
+  recent.push(Date.now());
+  workspaceFileRequests.set(conversationId, recent);
+  return true;
 }
 
 function encodeConversationCursor(cursor: ConversationListCursor | null): string | null {
@@ -720,7 +783,10 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
         const restarted = database.upsertNode(message.node, message.bootId, now());
         if (parsedCredential) database.touchNodeCredential(parsedCredential.id, now());
         nodeId = message.node.id;
-        connections.set(nodeId, message.bootId, socket);
+        const capabilities = Array.isArray(message.node.capabilities)
+          ? message.node.capabilities.filter((capability): capability is string => typeof capability === "string")
+          : [];
+        connections.set(nodeId, message.bootId, socket, capabilities);
         connections.send(nodeId, {
           type: "control.welcome",
           protocolVersion: CONTROL_PROTOCOL_VERSION,
@@ -753,6 +819,10 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
       } else if (message.type === "agent.workspaceValidation") {
         if (!connections.resolveWorkspaceValidation(nodeId, message)) {
           app.log.warn({ nodeId, requestId: message.requestId }, "Received an unknown workspace validation response");
+        }
+      } else if (message.type === "agent.workspaceFile") {
+        if (!connections.resolveWorkspaceFileRead(nodeId, message)) {
+          app.log.warn({ nodeId, requestId: message.requestId }, "Received an unknown workspace file response");
         }
       } else if (message.type === "agent.message") {
         processDurableMessage(nodeId, message);
@@ -984,6 +1054,138 @@ app.get<{
     attachments: database.listAttachments(attachmentIds).map(({ downloadToken: _downloadToken, storageKey: _storageKey, ...attachment }) => attachment),
     approvals: database.listApprovals("pending", conversation.id),
   };
+});
+
+app.get<{ Params: { id: string } }>("/api/conversations/:id/workspace-file-history", async (request, reply) => {
+  const conversation = database.getConversation(request.params.id);
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除", code: "conversation_not_found" });
+  return { data: database.listConversationOpenedFiles(conversation.id) };
+});
+
+app.delete<{ Params: { id: string; fileId: string } }>("/api/conversations/:id/workspace-file-history/:fileId", async (request, reply) => {
+  const conversation = database.getConversation(request.params.id);
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除", code: "conversation_not_found" });
+  if (!database.deleteConversationOpenedFile(conversation.id, request.params.fileId)) {
+    return reply.code(404).send({ error: "文件历史记录不存在或已被删除", code: "file_history_not_found" });
+  }
+  publish("workspace-file-history.deleted", request.params.fileId, conversation.id);
+  return reply.code(204).send();
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { path?: string; baseFileId?: string };
+}>("/api/conversations/:id/workspace-files", async (request, reply) => {
+  const conversation = database.getConversation(request.params.id);
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除", code: "conversation_not_found" });
+  const requestedPath = request.body?.path?.trim() ?? "";
+  if (!requestedPath || requestedPath.length > 4096 || requestedPath.includes("\0")) {
+    return reply.code(400).send({ error: "文件路径无效", code: "invalid_file_path" });
+  }
+  if (!connections.has(conversation.nodeId)) {
+    return reply.code(409).send({ error: "该会话所属 Agent 当前离线", code: "agent_offline" });
+  }
+  if (!connections.hasCapability(conversation.nodeId, WORKSPACE_FILE_READ_CAPABILITY)) {
+    return reply.code(409).send({ error: "该 Agent 版本尚不支持对话文件预览，请先升级并重启 Agent", code: "agent_upgrade_required" });
+  }
+  if (!consumeWorkspaceFileRateLimit(conversation.id)) {
+    return reply.code(429).send({ error: "文件打开过于频繁，请稍后再试", code: "workspace_file_rate_limited" });
+  }
+
+  pruneWorkspaceFileCache();
+  let basePath: string | undefined;
+  const baseFileId = request.body?.baseFileId?.trim();
+  if (baseFileId) {
+    const baseFile = workspaceFileCache.get(baseFileId);
+    if (!baseFile || baseFile.expiresAt <= Date.now() || baseFile.conversationId !== conversation.id || baseFile.nodeId !== conversation.nodeId) {
+      return reply.code(404).send({ error: "作为相对路径基准的文件已经失效，请重新打开", code: "base_file_expired" });
+    }
+    basePath = baseFile.path;
+  }
+
+  let result;
+  try {
+    result = await connections.readWorkspaceFile(
+      conversation.nodeId,
+      conversation.workspaceId,
+      requestedPath,
+      basePath,
+      workspaceFileMaxBytes,
+    );
+  } catch (error) {
+    return reply.code(409).send({
+      error: error instanceof Error ? error.message : "Agent 读取文件失败",
+      code: "agent_file_read_unavailable",
+    });
+  }
+  if (!result.ok) {
+    const statusCode = result.errorCode === "not_found" ? 404
+      : result.errorCode === "forbidden" ? 403
+        : result.errorCode === "too_large" ? 413
+          : result.errorCode === "not_file" ? 422
+            : 502;
+    return reply.code(statusCode).send({ error: result.error || "Agent 读取文件失败", code: result.errorCode ?? "read_failed" });
+  }
+  if (!result.path || result.path.length > 4096
+    || !result.name || result.name.length > 1024
+    || !result.mediaType || result.mediaType.length > 128
+    || !result.contentBase64
+    || typeof result.size !== "number" || !Number.isSafeInteger(result.size) || result.size < 0
+    || result.contentBase64.length > Math.ceil(workspaceFileMaxBytes / 3) * 4 + 8) {
+    return reply.code(502).send({ error: "Agent 返回了无效的文件内容", code: "invalid_agent_file" });
+  }
+  const content = Buffer.from(result.contentBase64, "base64");
+  if (content.byteLength !== result.size || content.byteLength > workspaceFileMaxBytes) {
+    return reply.code(502).send({ error: "Agent 返回的文件大小不一致", code: "invalid_agent_file" });
+  }
+  const createdAt = Date.now();
+  const file: WorkspaceFileCacheEntry = {
+    id: randomUUID(),
+    conversationId: conversation.id,
+    nodeId: conversation.nodeId,
+    path: result.path,
+    name: result.name,
+    mediaType: /^[\w.+-]+\/[\w.+-]+(?:;\s*charset=[\w-]+)?$/iu.test(result.mediaType)
+      ? result.mediaType
+      : "application/octet-stream",
+    content,
+    createdAt,
+    expiresAt: createdAt + workspaceFileLifetimeMs,
+  };
+  workspaceFileCache.set(file.id, file);
+  pruneWorkspaceFileCache();
+  const history = database.upsertConversationOpenedFile({
+    id: randomUUID(),
+    conversationId: conversation.id,
+    path: file.path,
+    name: file.name,
+    mediaType: file.mediaType,
+    size: file.content.byteLength,
+    openedAt: new Date(createdAt).toISOString(),
+  });
+  publish("workspace-file-history.updated", history.id, conversation.id);
+  return reply.code(201).send({ file: publicWorkspaceFile(file), history });
+});
+
+app.get<{ Params: { id: string } }>("/api/workspace-files/:id", async (request, reply) => {
+  pruneWorkspaceFileCache();
+  const file = workspaceFileCache.get(request.params.id);
+  if (!file || file.expiresAt <= Date.now()) return reply.code(404).send({ error: "文件预览已经失效，请从对话中重新打开" });
+  return { file: publicWorkspaceFile(file) };
+});
+
+app.get<{ Params: { id: string } }>("/api/workspace-files/:id/content", async (request, reply) => {
+  pruneWorkspaceFileCache();
+  const file = workspaceFileCache.get(request.params.id);
+  if (!file || file.expiresAt <= Date.now()) return reply.code(404).send({ error: "文件预览已经失效，请重新打开" });
+  const encodedName = encodeURIComponent(file.name.replace(/[\uD800-\uDFFF]/gu, "�")).replace(/'/gu, "%27");
+  return reply
+    .header("Cache-Control", "private, no-store")
+    .header("X-Content-Type-Options", "nosniff")
+    .header("Content-Security-Policy", "sandbox; default-src 'none'")
+    .header("Content-Disposition", `attachment; filename*=UTF-8''${encodedName}`)
+    .type(file.mediaType)
+    .send(file.content);
 });
 
 app.post<{

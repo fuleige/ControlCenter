@@ -195,6 +195,18 @@ export interface AttachmentRecord {
   createdAt: string;
 }
 
+export interface ConversationOpenedFileRecord {
+  id: string;
+  conversationId: string;
+  path: string;
+  name: string;
+  mediaType: string;
+  size: number;
+  openCount: number;
+  firstOpenedAt: string;
+  lastOpenedAt: string;
+}
+
 export interface UiEventRecord {
   revision: number;
   type: string;
@@ -511,6 +523,20 @@ export class ControlDatabase {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS attachments_expiry_idx ON attachments(status, expires_at);
+      CREATE TABLE IF NOT EXISTS conversation_opened_files (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        open_count INTEGER NOT NULL DEFAULT 1,
+        first_opened_at TEXT NOT NULL,
+        last_opened_at TEXT NOT NULL,
+        UNIQUE (conversation_id, path)
+      );
+      CREATE INDEX IF NOT EXISTS conversation_opened_files_order_idx
+        ON conversation_opened_files(conversation_id, last_opened_at DESC, id DESC);
       CREATE TABLE IF NOT EXISTS ui_events (
         revision INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL,
@@ -1035,6 +1061,62 @@ export class ControlDatabase {
       "SELECT * FROM conversations WHERE client_request_id = ?",
     ).get(clientRequestId) as Row | undefined;
     return row ? this.conversationFromRow(row) : null;
+  }
+
+  private conversationOpenedFileFromRow(row: Row): ConversationOpenedFileRecord {
+    return {
+      id: text(row, "id"),
+      conversationId: text(row, "conversation_id"),
+      path: text(row, "path"),
+      name: text(row, "name"),
+      mediaType: text(row, "media_type"),
+      size: Number(row.size),
+      openCount: Number(row.open_count),
+      firstOpenedAt: text(row, "first_opened_at"),
+      lastOpenedAt: text(row, "last_opened_at"),
+    };
+  }
+
+  upsertConversationOpenedFile(record: Omit<ConversationOpenedFileRecord, "openCount" | "firstOpenedAt" | "lastOpenedAt"> & { openedAt: string }): ConversationOpenedFileRecord {
+    this.sqlite.prepare(`
+      INSERT INTO conversation_opened_files (
+        id, conversation_id, path, name, media_type, size, open_count, first_opened_at, last_opened_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(conversation_id, path) DO UPDATE SET
+        name = excluded.name,
+        media_type = excluded.media_type,
+        size = excluded.size,
+        open_count = conversation_opened_files.open_count + 1,
+        last_opened_at = excluded.last_opened_at
+    `).run(
+      record.id,
+      record.conversationId,
+      record.path,
+      record.name,
+      record.mediaType,
+      record.size,
+      record.openedAt,
+      record.openedAt,
+    );
+    const row = this.sqlite.prepare(
+      "SELECT * FROM conversation_opened_files WHERE conversation_id = ? AND path = ?",
+    ).get(record.conversationId, record.path) as Row | undefined;
+    if (!row) throw new Error("Conversation opened file was not persisted");
+    return this.conversationOpenedFileFromRow(row);
+  }
+
+  listConversationOpenedFiles(conversationId: string): ConversationOpenedFileRecord[] {
+    return (this.sqlite.prepare(`
+      SELECT * FROM conversation_opened_files
+      WHERE conversation_id = ?
+      ORDER BY last_opened_at DESC, id DESC
+    `).all(conversationId) as Row[]).map((row) => this.conversationOpenedFileFromRow(row));
+  }
+
+  deleteConversationOpenedFile(conversationId: string, id: string): boolean {
+    return this.sqlite.prepare(
+      "DELETE FROM conversation_opened_files WHERE conversation_id = ? AND id = ?",
+    ).run(conversationId, id).changes > 0;
   }
 
   listConversations(nodeId?: string): ConversationRecord[] {

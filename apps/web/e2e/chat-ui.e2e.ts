@@ -117,6 +117,8 @@ $$
 2. 第二项检查代码横向滚动。
 3. 第三项检查移动端宽度。
 
+[打开本地报告](/home/ubuntu/documents/report.md) · [访问外部文档](https://example.com/docs)
+
 ${"补充说明：流式内容到达时保持在底部；用户主动向上阅读后停止自动跟随。\n\n".repeat(14)}`;
 
 const longConversationHistory = Array.from({ length: 160 }, (_, index) => {
@@ -141,6 +143,19 @@ async function mockControlCenter(page: Page, options: { idleConversation?: boole
   const presenceReports: Array<{ conversationId?: string | null; visible?: boolean }> = [];
   const quickSearchRequests: string[] = [];
   const compactRequests: Array<{ clientRequestId?: string }> = [];
+  const workspaceFileRequests: Array<{ path?: string; baseFileId?: string }> = [];
+  let workspaceFileHistory: Array<{
+    id: string;
+    conversationId: string;
+    path: string;
+    name: string;
+    mediaType: string;
+    size: number;
+    openCount: number;
+    firstOpenedAt: string;
+    lastOpenedAt: string;
+  }> = [];
+  let workspaceFileHistoryClock = 0;
   let compactionState: Record<string, unknown> | null = null;
   const conversationResponse = () => ({
     ...conversation,
@@ -154,7 +169,7 @@ async function mockControlCenter(page: Page, options: { idleConversation?: boole
     sessionStorage.setItem("controller-center:selected-node", "qa-node");
     sessionStorage.setItem("controller-center:selected-conversation", "qa-conversation");
   });
-  await page.route("**/api/**", async (route) => {
+  await page.context().route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/api/auth/session") {
       await route.fulfill({ json: { authenticated: true, expiresAt: "2026-10-10T00:00:00.000Z" } });
@@ -167,6 +182,72 @@ async function mockControlCenter(page: Page, options: { idleConversation?: boole
     } else if (url.pathname === "/api/conversations") {
       if (!url.searchParams.has("nodeId")) quickSearchRequests.push(url.search);
       await route.fulfill({ json: { data: [conversationResponse()] } });
+    } else if (url.pathname === `/api/conversations/${conversation.id}/workspace-file-history` && route.request().method() === "GET") {
+      await route.fulfill({ json: { data: workspaceFileHistory } });
+    } else if (url.pathname.startsWith(`/api/conversations/${conversation.id}/workspace-file-history/`) && route.request().method() === "DELETE") {
+      const fileId = decodeURIComponent(url.pathname.slice(url.pathname.lastIndexOf("/") + 1));
+      workspaceFileHistory = workspaceFileHistory.filter((file) => file.id !== fileId);
+      await route.fulfill({ status: 204 });
+    } else if (url.pathname === `/api/conversations/${conversation.id}/workspace-files`) {
+      const request = route.request().postDataJSON() as { path?: string; baseFileId?: string };
+      workspaceFileRequests.push(request);
+      const tsv = request.path === "data.tsv";
+      workspaceFileHistoryClock += 1;
+      const historyId = tsv ? "history-tsv" : "history-markdown";
+      const historyPath = tsv ? "/home/ubuntu/documents/data.tsv" : "/home/ubuntu/documents/report.md";
+      const historyName = tsv ? "data.tsv" : "report.md";
+      const historyMediaType = tsv ? "text/tab-separated-values; charset=utf-8" : "text/markdown; charset=utf-8";
+      const existingHistory = workspaceFileHistory.find((file) => file.path === historyPath);
+      const openedAt = new Date(Date.parse(now) + workspaceFileHistoryClock * 1_000).toISOString();
+      const history = {
+        id: existingHistory?.id ?? historyId,
+        conversationId: conversation.id,
+        path: historyPath,
+        name: historyName,
+        mediaType: historyMediaType,
+        size: 64,
+        openCount: (existingHistory?.openCount ?? 0) + 1,
+        firstOpenedAt: existingHistory?.firstOpenedAt ?? openedAt,
+        lastOpenedAt: openedAt,
+      };
+      workspaceFileHistory = [history, ...workspaceFileHistory.filter((file) => file.path !== historyPath)];
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await route.fulfill({ status: 201, json: { file: {
+        id: tsv ? "workspace-file-tsv" : "workspace-file-markdown",
+        conversationId: conversation.id,
+        name: tsv ? "data.tsv" : "report.md",
+        path: tsv ? "/home/ubuntu/documents/data.tsv" : "/home/ubuntu/documents/report.md",
+        mediaType: tsv ? "text/tab-separated-values; charset=utf-8" : "text/markdown; charset=utf-8",
+        size: 64,
+        expiresAt: "2026-09-10T00:05:00.000Z",
+        contentUrl: `/api/workspace-files/${tsv ? "workspace-file-tsv" : "workspace-file-markdown"}/content`,
+      }, history } });
+    } else if (url.pathname === "/api/workspace-files/workspace-file-markdown") {
+      await route.fulfill({ status: 200, json: { file: {
+        id: "workspace-file-markdown",
+        conversationId: conversation.id,
+        name: "report.md",
+        path: "/home/ubuntu/documents/report.md",
+        mediaType: "text/markdown; charset=utf-8",
+        size: 64,
+        expiresAt: "2026-09-10T00:05:00.000Z",
+        contentUrl: "/api/workspace-files/workspace-file-markdown/content",
+      } } });
+    } else if (url.pathname === "/api/workspace-files/workspace-file-tsv") {
+      await route.fulfill({ status: 200, json: { file: {
+        id: "workspace-file-tsv",
+        conversationId: conversation.id,
+        name: "data.tsv",
+        path: "/home/ubuntu/documents/data.tsv",
+        mediaType: "text/tab-separated-values; charset=utf-8",
+        size: 64,
+        expiresAt: "2026-09-10T00:05:00.000Z",
+        contentUrl: "/api/workspace-files/workspace-file-tsv/content",
+      } } });
+    } else if (url.pathname === "/api/workspace-files/workspace-file-markdown/content") {
+      await route.fulfill({ status: 200, contentType: "text/markdown; charset=utf-8", body: "# Agent 报告\n\n[打开相对表格](data.tsv)" });
+    } else if (url.pathname === "/api/workspace-files/workspace-file-tsv/content") {
+      await route.fulfill({ status: 200, contentType: "text/tab-separated-values; charset=utf-8", body: "名称\t数值\nalpha\t1\nbeta\t2" });
     } else if (url.pathname === `/api/conversations/${conversation.id}/compact`) {
       compactRequests.push(route.request().postDataJSON() as { clientRequestId?: string });
       compactionState = {
@@ -248,8 +329,94 @@ async function mockControlCenter(page: Page, options: { idleConversation?: boole
       await route.fulfill({ status: 204 });
     }
   });
-  return { presenceReports, quickSearchRequests, compactRequests };
+  return { presenceReports, quickSearchRequests, compactRequests, workspaceFileRequests };
 }
+
+test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV 预览", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "文件预览行为在桌面项目验证一次");
+  const { workspaceFileRequests } = await mockControlCenter(page);
+  await page.goto("/");
+
+  const externalLink = page.getByRole("link", { name: "访问外部文档" });
+  await expect(externalLink).toHaveAttribute("href", "https://example.com/docs");
+  await expect(externalLink).toHaveAttribute("target", "_blank");
+  const popupPromise = page.waitForEvent("popup");
+  await page.getByRole("link", { name: "打开本地报告" }).click();
+  const preview = await popupPromise;
+  await expect(preview).toHaveURL(/\/workspace-files\/opening$/u);
+  await expect(preview.getByRole("status")).toContainText("正在读取文件");
+  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
+  await expect(preview.getByRole("heading", { name: "Agent 报告" })).toBeVisible();
+  const previewLayout = await preview.locator(".workspace-file-viewer").evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return {
+      left: bounds.left,
+      top: bounds.top,
+      width: bounds.width,
+      height: bounds.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  expect(previewLayout.left).toBe(0);
+  expect(previewLayout.top).toBe(0);
+  expect(previewLayout.width).toBe(previewLayout.viewportWidth);
+  expect(previewLayout.height).toBe(previewLayout.viewportHeight);
+  expect(workspaceFileRequests[0]).toEqual({ path: "/home/ubuntu/documents/report.md" });
+
+  const fileRail = page.getByRole("button", { name: "展开本会话文件，1 个历史文件" });
+  await expect(fileRail).toBeVisible();
+  await fileRail.click();
+  const filePanel = page.getByRole("complementary", { name: "本会话文件" });
+  await expect(filePanel).toBeVisible();
+  await expect(filePanel).toContainText("report.md");
+  await page.screenshot({ path: "/tmp/controller-center-files-desktop.png", fullPage: true });
+  const reopenPromise = page.waitForEvent("popup");
+  await filePanel.locator(".conversation-file-open").click();
+  const reopenedPreview = await reopenPromise;
+  await expect(reopenedPreview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
+  await reopenedPreview.close();
+  expect(workspaceFileRequests.filter((request) => request.path === "/home/ubuntu/documents/report.md")).toHaveLength(2);
+  await filePanel.getByRole("button", { name: "删除 report.md 的查看记录" }).click();
+  await expect(filePanel).toContainText("还没有打开过文件");
+
+  await preview.getByRole("link", { name: "打开相对表格" }).click();
+  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-tsv$/u);
+  await expect(preview.getByRole("cell", { name: "alpha" })).toBeVisible();
+  await expect(preview.getByRole("cell", { name: "2" })).toBeVisible();
+  expect(workspaceFileRequests.findLast((request) => request.path === "data.tsv")).toEqual({ path: "data.tsv", baseFileId: "workspace-file-markdown" });
+});
+
+test("移动端顶部栏可以打开历史抽屉、新建会话和本会话文件侧栏", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "移动端顶部栏只在标准移动项目验证一次");
+  await mockControlCenter(page);
+  await page.goto("/");
+
+  const topbar = page.locator(".mobile-chat-topbar");
+  await expect(topbar).toBeVisible();
+  await expect(topbar.getByRole("button", { name: "打开历史会话" })).toBeVisible();
+  await expect(topbar.getByRole("button", { name: "新建会话" })).toBeVisible();
+  await topbar.getByRole("button", { name: "打开历史会话" }).click();
+  await expect(page.locator(".conversations-pane")).toBeVisible();
+  await expect(page.locator(".conversations-pane").getByRole("button", { name: "新建会话" })).toBeVisible();
+  await page.locator(".mobile-history-backdrop").click({ position: { x: 380, y: 120 } });
+
+  const popupPromise = page.waitForEvent("popup");
+  await page.getByRole("link", { name: "打开本地报告" }).click();
+  const preview = await popupPromise;
+  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
+  await preview.close();
+
+  const filesButton = topbar.getByRole("button", { name: "打开本会话文件，1 个历史文件" });
+  await expect(filesButton).toBeVisible();
+  await filesButton.click();
+  const filePanel = page.getByRole("complementary", { name: "本会话文件" });
+  await expect(filePanel).toBeVisible();
+  await expect(filePanel).toContainText("report.md");
+  await page.screenshot({ path: "/tmp/controller-center-files-mobile.png", fullPage: true });
+  await page.locator(".conversation-files-backdrop").click({ position: { x: 10, y: 120 } });
+  await expect(filePanel).toBeHidden();
+});
 
 test("手动压缩上下文需要确认并在执行期间锁定输入", async ({ page }) => {
   const { compactRequests } = await mockControlCenter(page, { idleConversation: true });
@@ -425,7 +592,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
     await expect(mobileToolbar.locator("button").nth(3)).toContainText("设置");
     await expect(mobileToolbar.locator(".node-count")).toHaveCount(0);
   }
-  await expect(page.locator(".settings-version")).toContainText("v0.3.9");
+  await expect(page.locator(".settings-version")).toContainText("v0.3.12");
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -949,7 +1116,7 @@ test("新会话创建结果不会抢占用户后来选择的会话", async ({ pa
     await expect(page.locator(".chat-pane")).toBeVisible();
     await expect(page.getByRole("button", { name: "关闭历史会话" })).toBeVisible();
     await page.screenshot({ path: `/tmp/controller-center-history-${testInfo.project.name}.png`, fullPage: true });
-    await page.getByRole("button", { name: "新建会话" }).click();
+    await page.locator(".conversations-pane").getByRole("button", { name: "新建会话" }).click();
     const draftAlignment = await page.locator(".draft-welcome").evaluate((element) => {
       const graphic = element.querySelector(".empty-visual")!.getBoundingClientRect();
       const timeline = element.closest(".timeline")!.getBoundingClientRect();
@@ -1039,14 +1206,14 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
     } else if (url.pathname === "/api/agent-package/download") {
       await route.fulfill({
         contentType: "application/gzip",
-        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.9.tar.gz\"" },
+        headers: { "Content-Disposition": "attachment; filename=\"controller-center-agent-v0.3.12.tar.gz\"" },
         body: "portable-agent-package",
       });
     } else if (url.pathname === "/api/agent-package") {
       await route.fulfill({ json: { package: {
         available: true,
-        version: "0.3.9",
-        fileName: "controller-center-agent-v0.3.9.tar.gz",
+        version: "0.3.12",
+        fileName: "controller-center-agent-v0.3.12.tar.gz",
         size: 580_000,
         sha256: "cb9bd8bd4ff984ee13b78a4f9b1ff9a72b950ed2a468d69e20fc0abe1bda2aa6",
         builtAt: now,
@@ -1064,10 +1231,10 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
-  await expect(page.getByText("v0.3.9 · 566 KB · Linux / macOS")).toBeVisible();
+  await expect(page.getByText("v0.3.12 · 566 KB · Linux / macOS")).toBeVisible();
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载客户端" }).click();
-  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.9.tar.gz");
+  await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.12.tar.gz");
   await page.getByRole("button", { name: "生成注册 Token" }).click();
   await expect(page.getByRole("dialog", { name: "一次性注册 Token" })).toHaveCount(0);
   await expect(page.getByText(registrationToken)).toBeVisible();

@@ -21,13 +21,16 @@ import {
   ApiError,
   compactConversation,
   deleteConversation,
+  deleteConversationOpenedFile,
   createEnrollmentToken,
   createNodeWorkspace,
   deleteNodeWorkspace,
   createAttachmentUpload,
   deleteAttachmentUpload,
   downloadAgentPackage,
+  fetchWorkspaceFileContent,
   getConversation,
+  getWorkspaceFile,
   getAuthSession,
   getAgentPackageInfo,
   getSettings,
@@ -35,6 +38,7 @@ import {
   interruptRun,
   isWorkspaceConcurrencyConflict,
   listConversations,
+  listConversationOpenedFiles,
   listEnrollmentTokens,
   listNodes,
   listNodeWorkspaces,
@@ -43,6 +47,7 @@ import {
   markConversationRead,
   loginAdmin,
   logoutAdmin,
+  openWorkspaceFile,
   retryRun,
   resolveApproval,
   revokeNodeAccess,
@@ -67,6 +72,7 @@ import type {
   Conversation,
   ConversationCompaction,
   ConversationDetail,
+  ConversationOpenedFile,
   ConversationTokenUsage,
   EnrollmentToken,
   GlobalSettings,
@@ -77,6 +83,7 @@ import type {
   TaskCenterEntry,
   TaskCenterPolicy,
   Workspace,
+  WorkspaceFileDescriptor,
 } from "./types";
 
 type MobilePane = "nodes" | "conversations" | "chat";
@@ -399,6 +406,10 @@ function HistoryIcon() {
   return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4.5h12V6H4V4.5Zm0 4.75h12v1.5H4v-1.5ZM4 14h8v1.5H4V14Z" /></svg>;
 }
 
+function FilesIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.2 2.5h7.1l4.5 4.4v9.4c0 .7-.6 1.2-1.2 1.2H4.2c-.7 0-1.2-.6-1.2-1.2V3.7c0-.7.5-1.2 1.2-1.2Zm6.4 1.6H4.7v11.8h9.5V7.6h-3.6V4.1Zm1.6.7V6h1.3l-1.3-1.2ZM6.4 9h5.9v1.4H6.4V9Zm0 3h5.9v1.4H6.4V12Z" /></svg>;
+}
+
 function SettingsIcon() {
   return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m16.4 11.2 1.1.9-1.5 2.6-1.4-.5c-.5.4-1 .7-1.6.9l-.3 1.4h-3l-.3-1.4c-.6-.2-1.1-.5-1.6-.9l-1.4.5-1.5-2.6 1.1-.9a6.5 6.5 0 0 1 0-1.9l-1.1-.9 1.5-2.6 1.4.5c.5-.4 1-.7 1.6-.9l.3-1.4h3l.3 1.4c.6.2 1.1.5 1.6.9l1.4-.5 1.5 2.6-1.1.9a6.5 6.5 0 0 1 0 1.9ZM11.2 8a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4Z" /></svg>;
 }
@@ -525,18 +536,292 @@ function CopyableCodeBlock({ children, node: _node, ...props }: ComponentPropsWi
   );
 }
 
-function MarkdownContent({ children }: { children: string }) {
+const uriSchemePattern = /^([a-z][a-z\d+.-]*):/iu;
+const unsafeUriSchemes = new Set(["javascript", "data", "vbscript"]);
+
+export function isLocalWorkspaceHref(value: string): boolean {
+  const href = value.trim();
+  if (!href || href.startsWith("#") || href.startsWith("//")) return false;
+  if (/^[a-z]:[\\/]/iu.test(href) || href.startsWith("\\\\")) return true;
+  const scheme = uriSchemePattern.exec(href)?.[1]?.toLowerCase();
+  return scheme ? scheme === "file" : true;
+}
+
+function isUnsafeHref(value: string): boolean {
+  const scheme = uriSchemePattern.exec(value.trim())?.[1]?.toLowerCase();
+  return Boolean(scheme && unsafeUriSchemes.has(scheme));
+}
+
+function safeMarkdownUrl(value: string): string {
+  return isUnsafeHref(value) ? "" : value;
+}
+
+interface MarkdownContentProps {
+  children: string;
+  baseFileId?: string;
+  onOpenLocalPath?: (path: string, baseFileId?: string) => void;
+}
+
+function MarkdownContent({ children, baseFileId, onOpenLocalPath }: MarkdownContentProps) {
   const markdown = useMemo(() => normalizeMathMarkdown(children), [children]);
   return (
     <div className="markdown-content">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }], rehypeHighlight]}
-        components={{ pre: CopyableCodeBlock }}
+        urlTransform={safeMarkdownUrl}
+        components={{
+          pre: CopyableCodeBlock,
+          a: ({ href = "", children: linkChildren, node: _node, ...props }) => {
+            if (!href || isUnsafeHref(href)) return <span>{linkChildren}</span>;
+            if (isLocalWorkspaceHref(href) && onOpenLocalPath) {
+              return <a
+                {...props}
+                href={href}
+                target="_blank"
+                rel="noreferrer noopener"
+                onClick={(event) => {
+                  event.preventDefault();
+                  onOpenLocalPath(href, baseFileId);
+                }}
+              >{linkChildren}</a>;
+            }
+            return <a {...props} href={href} target="_blank" rel="noreferrer noopener">{linkChildren}</a>;
+          },
+          img: ({ src = "", alt = "", node: _node, ...props }) => {
+            if (!src || isUnsafeHref(src)) return <span className="local-image-unavailable">图片地址不可用</span>;
+            if (isLocalWorkspaceHref(src) && onOpenLocalPath) {
+              return <button
+                className="local-image-button"
+                type="button"
+                title={src}
+                onClick={() => onOpenLocalPath(src, baseFileId)}
+              >查看 Agent 图片：{alt || src}</button>;
+            }
+            return <img {...props} src={src} alt={alt} loading="lazy" referrerPolicy="no-referrer" />;
+          },
+        }}
       >
         {markdown}
       </ReactMarkdown>
     </div>
+  );
+}
+
+export function parseDelimitedPreview(source: string, delimiter: "," | "\t"): { rows: string[][]; truncated: boolean } {
+  const input = source.replace(/^\uFEFF/u, "");
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+  let truncated = false;
+  const pushRow = () => {
+    row.push(cell);
+    rows.push(row.slice(0, 100));
+    if (row.length > 100) truncated = true;
+    row = [];
+    cell = "";
+  };
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index]!;
+    if (character === '"') {
+      if (quoted && input[index + 1] === '"') {
+        cell += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (character === delimiter && !quoted) {
+      row.push(cell);
+      cell = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && input[index + 1] === "\n") index += 1;
+      pushRow();
+      if (rows.length >= 1_001) {
+        truncated = index < input.length - 1;
+        break;
+      }
+    } else {
+      cell += character;
+    }
+  }
+  if (rows.length < 1_001 && (cell || row.length > 0)) pushRow();
+  return { rows, truncated };
+}
+
+const sourceLanguageByExtension: Record<string, string> = {
+  sh: "bash", bash: "bash", zsh: "bash", fish: "bash",
+  py: "python", pyw: "python",
+  js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript",
+  ts: "typescript", tsx: "typescript",
+  go: "go", rs: "rust", java: "java",
+  c: "c", h: "c", cc: "cpp", cpp: "cpp", cxx: "cpp", hpp: "cpp", hxx: "cpp",
+  cs: "csharp", rb: "ruby", php: "php", pl: "perl", pm: "perl", lua: "lua",
+  swift: "swift", kt: "kotlin", kts: "kotlin", scala: "scala", sql: "sql", r: "r", dart: "dart",
+  css: "css", json: "json", yaml: "yaml", yml: "yaml", xml: "xml", toml: "ini", ini: "ini",
+  conf: "ini", env: "ini", properties: "ini", gradle: "groovy", graphql: "graphql", gql: "graphql",
+  proto: "protobuf", tf: "hcl", tfvars: "hcl", diff: "diff", patch: "diff",
+  vue: "html", svelte: "html",
+};
+
+const sourceLanguageByName: Record<string, string> = {
+  dockerfile: "dockerfile",
+  makefile: "makefile",
+  gnumakefile: "makefile",
+  "cmakelists.txt": "cmake",
+  jenkinsfile: "groovy",
+  procfile: "bash",
+  gemfile: "ruby",
+  rakefile: "ruby",
+  ".gitignore": "plaintext",
+  ".dockerignore": "plaintext",
+  ".editorconfig": "ini",
+};
+
+function sourceLanguage(file: WorkspaceFileDescriptor): string | null {
+  const lowerName = file.name.toLowerCase();
+  const named = sourceLanguageByName[lowerName];
+  if (named) return named;
+  const extension = lowerName.match(/\.([^.]+)$/u)?.[1] ?? "";
+  return sourceLanguageByExtension[extension] ?? null;
+}
+
+function fencedSource(content: string, language: string): string {
+  const longestTildes = Math.max(3, ...(content.match(/~+/gu) ?? []).map((value) => value.length));
+  const fence = "~".repeat(longestTildes + 1);
+  return `${fence}${language}\n${content}${content.endsWith("\n") ? "" : "\n"}${fence}`;
+}
+
+function workspaceFilePreviewPath(fileId: string): string {
+  return `/workspace-files/${encodeURIComponent(fileId)}`;
+}
+
+function WorkspaceFileLoadingCard() {
+  return (
+    <section className="workspace-file-loading-card" role="status" aria-live="polite">
+      <div className="workspace-file-loader" aria-hidden="true"><span /></div>
+      <span className="workspace-file-loading-label">AGENT 文件预览</span>
+      <h1>正在读取文件</h1>
+      <p>正在通过当前会话连接对应 Agent，并准备安全的只读预览。</p>
+      <small>文件不会写入控制中心数据库</small>
+    </section>
+  );
+}
+
+function WorkspaceFileOpeningPage() {
+  const failed = new URLSearchParams(window.location.search).get("state") === "error";
+  return (
+    <main className="workspace-file-transition-page">
+      {failed ? <section className="workspace-file-loading-card workspace-file-loading-failed" role="alert">
+        <div className="workspace-file-failed-mark" aria-hidden="true">!</div>
+        <span className="workspace-file-loading-label">AGENT 文件预览</span>
+        <h1>文件读取失败</h1>
+        <p>请返回原对话查看错误信息，确认 Agent 在线和文件路径正确后重试。</p>
+        <button type="button" onClick={() => window.close()}>关闭标签页</button>
+      </section> : <WorkspaceFileLoadingCard />}
+    </main>
+  );
+}
+
+function WorkspaceFilePage({ fileId }: { fileId: string }) {
+  const [file, setFile] = useState<WorkspaceFileDescriptor | null>(null);
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [textContent, setTextContent] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [openingPath, setOpeningPath] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let createdObjectUrl: string | null = null;
+    setFile(null);
+    setObjectUrl(null);
+    setTextContent(null);
+    setError(null);
+    void getWorkspaceFile(fileId)
+      .then(async (descriptor) => {
+        const blob = await fetchWorkspaceFileContent(descriptor);
+        if (!active) return;
+        createdObjectUrl = URL.createObjectURL(blob);
+        const mediaType = descriptor.mediaType.split(";", 1)[0]!.toLowerCase();
+        const isText = mediaType.startsWith("text/")
+          || ["application/json", "application/xml", "application/yaml", "application/toml"].includes(mediaType);
+        setFile(descriptor);
+        setObjectUrl(createdObjectUrl);
+        if (isText) setTextContent(await blob.text());
+      })
+      .catch((reason) => {
+        if (active) setError(formatErrorMessage(reason, "打开 Agent 文件"));
+      });
+    return () => {
+      active = false;
+      if (createdObjectUrl) URL.revokeObjectURL(createdObjectUrl);
+    };
+  }, [fileId]);
+
+  const openNestedFile = useCallback((nestedPath: string, baseFileId?: string) => {
+    if (!file || openingPath) return;
+    setOpeningPath(true);
+    setError(null);
+    void openWorkspaceFile(file.conversationId, nestedPath, baseFileId)
+      .then((descriptor) => window.location.assign(workspaceFilePreviewPath(descriptor.id)))
+      .catch((reason) => {
+        setError(formatErrorMessage(reason, "打开 Agent 文件"));
+        setOpeningPath(false);
+      });
+  }, [file, openingPath]);
+
+  const mediaType = file?.mediaType.split(";", 1)[0]?.toLowerCase() ?? "";
+  const extension = file?.name.match(/\.([^.]+)$/u)?.[1]?.toLowerCase() ?? "";
+  const isMarkdown = mediaType === "text/markdown" || ["md", "markdown"].includes(extension);
+  const isHtml = mediaType === "text/html" || ["html", "htm"].includes(extension);
+  const isCsv = mediaType === "text/csv" || extension === "csv";
+  const isTsv = mediaType === "text/tab-separated-values" || extension === "tsv";
+  const language = file ? sourceLanguage(file) : null;
+  const table = textContent !== null && (isCsv || isTsv)
+    ? parseDelimitedPreview(textContent, isTsv ? "\t" : ",")
+    : null;
+  let visibleText = textContent;
+  if (mediaType === "application/json" && textContent !== null) {
+    try { visibleText = JSON.stringify(JSON.parse(textContent), null, 2); } catch { /* Keep the original invalid JSON visible. */ }
+  }
+  const htmlSource = textContent === null ? "" : `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:">${textContent}`;
+
+  return (
+    <main className="workspace-file-page">
+      <section className="workspace-file-viewer" aria-labelledby="workspace-file-title">
+        <header>
+          <div>
+            <span>AGENT 文件预览</span>
+            <h1 id="workspace-file-title">{file?.name ?? "正在读取文件"}</h1>
+            {file && <code title={file.path}>{file.path}</code>}
+          </div>
+          {file && objectUrl && <a className="workspace-file-download" href={objectUrl} download={file.name}>下载</a>}
+          <a className="workspace-file-home" href="/">控制中心</a>
+          <button type="button" onClick={() => window.close()} aria-label="关闭文件预览">×</button>
+        </header>
+        <div className="workspace-file-body">
+          {!file && !error && <WorkspaceFileLoadingCard />}
+          {error && <div className="workspace-file-error" role="alert">{error}</div>}
+          {openingPath && <div className="workspace-file-navigation"><span className="loading-spinner" />正在打开关联文件…</div>}
+          {file && objectUrl && mediaType.startsWith("image/") && mediaType !== "image/svg+xml" && <img className="workspace-file-image" src={objectUrl} alt={file.name} />}
+          {file && isMarkdown && textContent !== null && <MarkdownContent baseFileId={file.id} onOpenLocalPath={openNestedFile}>{textContent}</MarkdownContent>}
+          {file && isHtml && textContent !== null && <iframe className="workspace-file-html" sandbox="" srcDoc={htmlSource} title={file.name} />}
+          {file && table && <div className="workspace-file-table-wrap">
+            <table className="workspace-file-table">
+              {table.rows[0] && <thead><tr>{table.rows[0].map((cell, index) => <th key={index}>{cell}</th>)}</tr></thead>}
+              <tbody>{table.rows.slice(1).map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody>
+            </table>
+            {table.truncated && <p>预览仅展示前 1000 行、100 列；可下载查看完整文件。</p>}
+          </div>}
+          {file && objectUrl && mediaType === "application/pdf" && <iframe className="workspace-file-pdf" src={objectUrl} title={file.name} />}
+          {file && visibleText !== null && language && !isMarkdown && !isHtml && !isCsv && !isTsv && <MarkdownContent>{fencedSource(visibleText, language)}</MarkdownContent>}
+          {file && visibleText !== null && !language && !isMarkdown && !isHtml && !isCsv && !isTsv && <pre className="workspace-file-text">{visibleText}</pre>}
+          {file && objectUrl && textContent === null && !mediaType.startsWith("image/") && mediaType !== "application/pdf" && <div className="workspace-file-state">该文件类型暂不支持直接预览，请下载后查看。</div>}
+          {file && objectUrl && mediaType === "image/svg+xml" && <div className="workspace-file-state">SVG 为可执行文档格式，为安全起见请下载后查看。</div>}
+        </div>
+        {file && <footer>{file.mediaType} · {(file.size / 1024).toFixed(file.size < 1024 ? 2 : 1)} KB · 只读临时预览</footer>}
+      </section>
+    </main>
   );
 }
 
@@ -929,12 +1214,20 @@ function ApprovalCard({ approval, onDone }: { approval: Approval; onDone: () => 
   );
 }
 
-function TimelineCard({ entry, attachments }: { entry: TimelineEntry; attachments: AttachmentRecord[] }) {
+function TimelineCard({
+  entry,
+  attachments,
+  onOpenLocalPath,
+}: {
+  entry: TimelineEntry;
+  attachments: AttachmentRecord[];
+  onOpenLocalPath?: (path: string, baseFileId?: string) => void;
+}) {
   const linkedAttachments = attachments.filter((attachment) => entry.attachmentIds.includes(attachment.id));
   return (
     <article className={`timeline-card timeline-${entry.kind}`} title={formatDate(entry.at)}>
       {linkedAttachments.length > 0 && <div className="message-attachments">{linkedAttachments.map((attachment) => <span key={attachment.id}>{attachment.mediaType.startsWith("image/") ? "图片" : "文件"} · {attachment.name}</span>)}</div>}
-      <MarkdownContent>{entry.content}</MarkdownContent>
+      <MarkdownContent onOpenLocalPath={onOpenLocalPath}>{entry.content}</MarkdownContent>
     </article>
   );
 }
@@ -1669,6 +1962,64 @@ interface PendingUpload {
   previewUrl: string | null;
 }
 
+function openedFileTypeLabel(file: ConversationOpenedFile): string {
+  const extension = file.name.match(/\.([^.]+)$/u)?.[1]?.toUpperCase();
+  if (extension && extension.length <= 6) return extension;
+  const mediaType = file.mediaType.split(";", 1)[0]?.toLowerCase() ?? "";
+  if (mediaType.startsWith("image/")) return "IMG";
+  if (mediaType === "application/pdf") return "PDF";
+  return "FILE";
+}
+
+function ConversationFileHistoryPanel({
+  files,
+  loading,
+  error,
+  deletingId,
+  onClose,
+  onOpen,
+  onDelete,
+}: {
+  files: ConversationOpenedFile[];
+  loading: boolean;
+  error: string | null;
+  deletingId: string | null;
+  onClose: () => void;
+  onOpen: (file: ConversationOpenedFile) => void;
+  onDelete: (file: ConversationOpenedFile) => void;
+}) {
+  return <aside className="conversation-files-panel" aria-label="本会话文件">
+    <header>
+      <div><span>本会话文件</span><strong>{files.length} 个历史文件</strong></div>
+      <button type="button" onClick={onClose} aria-label="折叠文件侧边栏">×</button>
+    </header>
+    {error && <div className="conversation-files-error" role="alert">{error}</div>}
+    <div className="conversation-files-list">
+      {loading && files.length === 0 && <div className="conversation-files-state"><span className="loading-spinner" />正在读取文件历史…</div>}
+      {!loading && files.length === 0 && <div className="conversation-files-empty"><FilesIcon /><strong>还没有打开过文件</strong><span>从对话中打开的文件会自动出现在这里。</span></div>}
+      {files.map((file) => <div className="conversation-file-row" key={file.id}>
+        <button className="conversation-file-open" type="button" onClick={() => onOpen(file)} title={file.path}>
+          <span className="conversation-file-kind">{openedFileTypeLabel(file)}</span>
+          <span className="conversation-file-copy">
+            <strong>{file.name}</strong>
+            <code>{file.path}</code>
+            <small><time dateTime={file.lastOpenedAt} title={new Date(file.lastOpenedAt).toLocaleString()}>{relativeTime(file.lastOpenedAt)}</time> · {formatFileSize(file.size)}</small>
+          </span>
+        </button>
+        <button
+          className="conversation-file-delete"
+          type="button"
+          disabled={deletingId !== null}
+          onClick={() => onDelete(file)}
+          aria-label={`删除 ${file.name} 的查看记录`}
+          title="只删除查看记录，不删除实际文件"
+        ><TrashIcon /></button>
+      </div>)}
+    </div>
+    <footer>仅保存文件路径与查看时间；点击后从 Agent 重新读取最新内容。</footer>
+  </aside>;
+}
+
 function ChatPanel({
   detail,
   node,
@@ -1678,6 +2029,7 @@ function ChatPanel({
   onReturnLatest,
   viewingHistoricalMessages,
   onBack,
+  onNew,
   draftRequestId,
   isDraft,
   onConversationStarted,
@@ -1691,6 +2043,7 @@ function ChatPanel({
   onReturnLatest: () => Promise<void>;
   viewingHistoricalMessages: boolean;
   onBack: () => void;
+  onNew: () => void;
   draftRequestId: string;
   isDraft: boolean;
   onConversationStarted: (conversation: Conversation, run: Run, draftRequestId: string) => void;
@@ -1712,6 +2065,11 @@ function ChatPanel({
   const [showWorkspaceConcurrencyConfirm, setShowWorkspaceConcurrencyConfirm] = useState(false);
   const [compactSubmitting, setCompactSubmitting] = useState(false);
   const [compactionRequestId, setCompactionRequestId] = useState(newDraftRequestId);
+  const [openedFiles, setOpenedFiles] = useState<ConversationOpenedFile[]>([]);
+  const [fileHistoryOpen, setFileHistoryOpen] = useState(false);
+  const [fileHistoryLoading, setFileHistoryLoading] = useState(false);
+  const [fileHistoryError, setFileHistoryError] = useState<string | null>(null);
+  const [deletingFileId, setDeletingFileId] = useState<string | null>(null);
   const timelineElement = useRef<HTMLDivElement>(null);
   const promptElement = useRef<HTMLTextAreaElement>(null);
   const fileInputElement = useRef<HTMLInputElement>(null);
@@ -1719,6 +2077,10 @@ function ChatPanel({
   const timelinePositioned = useRef(false);
   const programmaticTimelineScroll = useRef(false);
   const uploadsRef = useRef<PendingUpload[]>([]);
+  const fileHistoryRequestRef = useRef(0);
+  const fileHistoryDeleteRequestRef = useRef(0);
+  const fileHistoryConversationRef = useRef<string | null>(detail?.conversation.id ?? null);
+  fileHistoryConversationRef.current = detail?.conversation.id ?? null;
   const timeline = useMemo(() => buildTimeline(detail), [detail]);
   const activeRun = detail?.runs.findLast((run) => ["queued", "dispatching", "running", "waiting_approval", "recovering"].includes(run.status));
   const compaction = detail?.conversation.compaction ?? null;
@@ -1732,6 +2094,7 @@ function ChatPanel({
   const selectedModel = modelCatalog.find((candidate) => candidate.id === model)
     ?? modelCatalog.find((candidate) => candidate.isDefault);
   const effortOptions = selectedModel?.supportedReasoningEfforts ?? [];
+  const conversationId = detail?.conversation.id ?? null;
   const composerStorageKey = `controller-center:composer:${node?.id ?? "none"}:${detail?.conversation.id ?? "new"}`;
   const draftWorkspaceStorageKey = `controller-center:draft-workspace:${node?.id ?? "none"}`;
   const timelineVirtualizer = useVirtualizer({
@@ -1742,6 +2105,60 @@ function ChatPanel({
     overscan: 6,
     useFlushSync: false,
   });
+
+  const refreshOpenedFiles = useCallback(async () => {
+    const requestedConversationId = conversationId;
+    if (requestedConversationId !== fileHistoryConversationRef.current) return;
+    const revision = ++fileHistoryRequestRef.current;
+    if (!requestedConversationId || isDraft) {
+      setOpenedFiles([]);
+      setFileHistoryLoading(false);
+      setFileHistoryError(null);
+      return;
+    }
+    setFileHistoryLoading(true);
+    try {
+      const result = await listConversationOpenedFiles(requestedConversationId);
+      if (revision !== fileHistoryRequestRef.current || requestedConversationId !== fileHistoryConversationRef.current) return;
+      setOpenedFiles(result);
+      setFileHistoryError(null);
+    } catch (reason) {
+      if (revision === fileHistoryRequestRef.current && requestedConversationId === fileHistoryConversationRef.current) {
+        setFileHistoryError(formatErrorMessage(reason, "读取文件历史"));
+      }
+    } finally {
+      if (revision === fileHistoryRequestRef.current && requestedConversationId === fileHistoryConversationRef.current) {
+        setFileHistoryLoading(false);
+      }
+    }
+  }, [conversationId, isDraft]);
+
+  useEffect(() => {
+    fileHistoryDeleteRequestRef.current += 1;
+    setOpenedFiles([]);
+    setFileHistoryOpen(false);
+    setFileHistoryError(null);
+    setDeletingFileId(null);
+    void refreshOpenedFiles();
+  }, [refreshOpenedFiles]);
+
+  useEffect(() => {
+    const refreshFromEvent = (event: Event) => {
+      const affectedConversationId = (event as CustomEvent<{ conversationId?: string }>).detail?.conversationId;
+      if (!affectedConversationId || affectedConversationId === conversationId) void refreshOpenedFiles();
+    };
+    window.addEventListener("controller-center:workspace-file-history", refreshFromEvent);
+    return () => window.removeEventListener("controller-center:workspace-file-history", refreshFromEvent);
+  }, [conversationId, refreshOpenedFiles]);
+
+  useEffect(() => {
+    if (!fileHistoryOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setFileHistoryOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [fileHistoryOpen]);
 
   useEffect(() => {
     const preferredModel = settings.defaultModel && node?.models.some((candidate) => candidate.id === settings.defaultModel)
@@ -1876,6 +2293,51 @@ function ChatPanel({
     followStreamingOutput.current = true;
     setShowScrollToBottom(false);
     element.scrollTo({ top: element.scrollHeight, behavior: "auto" });
+  }
+
+  function openAgentFile(path: string, baseFileId?: string): void {
+    if (!detail) return;
+    const requestedConversationId = detail.conversation.id;
+    const openingUrl = new URL("/workspace-files/opening", window.location.origin).toString();
+    const previewWindow = window.open(openingUrl, "_blank");
+    if (!previewWindow) {
+      setError("浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试");
+      return;
+    }
+    previewWindow.opener = null;
+    void openWorkspaceFile(detail.conversation.id, path, baseFileId)
+      .then((descriptor) => {
+        if (requestedConversationId === fileHistoryConversationRef.current) void refreshOpenedFiles();
+        previewWindow.location.replace(new URL(workspaceFilePreviewPath(descriptor.id), window.location.origin).toString());
+      })
+      .catch((reason) => {
+        if (requestedConversationId === fileHistoryConversationRef.current) {
+          setError(formatErrorMessage(reason, "打开 Agent 文件"));
+        }
+        previewWindow.location.replace(new URL("/workspace-files/opening?state=error", window.location.origin).toString());
+      });
+  }
+
+  async function removeOpenedFile(file: ConversationOpenedFile): Promise<void> {
+    if (!conversationId || deletingFileId) return;
+    const requestedConversationId = conversationId;
+    const revision = ++fileHistoryDeleteRequestRef.current;
+    setDeletingFileId(file.id);
+    setFileHistoryError(null);
+    try {
+      await deleteConversationOpenedFile(requestedConversationId, file.id);
+      if (revision === fileHistoryDeleteRequestRef.current && requestedConversationId === fileHistoryConversationRef.current) {
+        setOpenedFiles((current) => current.filter((candidate) => candidate.id !== file.id));
+      }
+    } catch (reason) {
+      if (revision === fileHistoryDeleteRequestRef.current && requestedConversationId === fileHistoryConversationRef.current) {
+        setFileHistoryError(formatErrorMessage(reason, "删除文件查看记录"));
+      }
+    } finally {
+      if (revision === fileHistoryDeleteRequestRef.current && requestedConversationId === fileHistoryConversationRef.current) {
+        setDeletingFileId(null);
+      }
+    }
   }
 
   async function loadEarlierMessages(): Promise<void> {
@@ -2123,6 +2585,38 @@ function ChatPanel({
   return (
     <main className={`chat-pane ${isDraft ? "draft-state" : ""}`} aria-label={isDraft ? "新会话" : `对话：${conversation?.title ?? "正在加载"}`}>
       <h1 className="chat-title visually-hidden"><strong>{detail?.conversation.title ?? "新会话"}</strong></h1>
+      <header className="mobile-chat-topbar">
+        <button type="button" onClick={() => { setFileHistoryOpen(false); onBack(); }} aria-label="打开历史会话"><HistoryIcon /><span>历史</span></button>
+        <div><strong>{conversation?.title ?? "新会话"}</strong><small>{node.name}</small></div>
+        <button type="button" onClick={() => { setFileHistoryOpen(false); onNew(); }} aria-label="新建会话"><span className="mobile-chat-new-mark">＋</span><span>新建</span></button>
+        <button
+          type="button"
+          disabled={!conversationId}
+          className={fileHistoryOpen ? "active" : ""}
+          aria-label={`打开本会话文件，${openedFiles.length} 个历史文件`}
+          aria-expanded={fileHistoryOpen}
+          onClick={() => setFileHistoryOpen((current) => !current)}
+        ><FilesIcon /><span>文件</span>{openedFiles.length > 0 && <b>{openedFiles.length > 99 ? "99+" : openedFiles.length}</b>}</button>
+      </header>
+      {conversationId && <button
+        className={`conversation-files-rail ${fileHistoryOpen ? "active" : ""}`}
+        type="button"
+        aria-label={`${fileHistoryOpen ? "折叠" : "展开"}本会话文件，${openedFiles.length} 个历史文件`}
+        aria-expanded={fileHistoryOpen}
+        onClick={() => setFileHistoryOpen((current) => !current)}
+      ><FilesIcon /><span>文件</span>{openedFiles.length > 0 && <b>{openedFiles.length > 99 ? "99+" : openedFiles.length}</b>}</button>}
+      {fileHistoryOpen && conversationId && <>
+        <button className="conversation-files-backdrop" type="button" aria-label="折叠文件侧边栏" onClick={() => setFileHistoryOpen(false)} />
+        <ConversationFileHistoryPanel
+          files={openedFiles}
+          loading={fileHistoryLoading}
+          error={fileHistoryError}
+          deletingId={deletingFileId}
+          onClose={() => setFileHistoryOpen(false)}
+          onOpen={(file) => openAgentFile(file.path)}
+          onDelete={(file) => void removeOpenedFile(file)}
+        />
+      </>}
       <div className="timeline-shell">
         <div
           className="timeline"
@@ -2167,7 +2661,7 @@ function ChatPanel({
                 ref={timelineVirtualizer.measureElement}
                 style={{ transform: `translateY(${virtualRow.start}px)` }}
               >
-                <TimelineCard entry={entry} attachments={detail?.attachments ?? []} />
+                <TimelineCard entry={entry} attachments={detail?.attachments ?? []} onOpenLocalPath={openAgentFile} />
               </div>;
             })}
           </div>}
@@ -2252,7 +2746,6 @@ function ChatPanel({
         />
         <div className="composer-footer">
           <div className="composer-toolbar" aria-label="会话选项">
-            <button className="mobile-history-button" type="button" onClick={onBack} aria-label="打开历史会话"><HistoryIcon /><span>历史</span></button>
             <input ref={fileInputElement} className="file-input" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
             <button className="attach-button" type="button" onClick={() => fileInputElement.current?.click()} disabled={busy || compactionActive || uploads.length >= 10} title="上传文件或图片">＋ 附件</button>
             {isDraft ? (
@@ -2878,6 +3371,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         const selectedConversationAffected = !conversationId || conversationId === selectedConversationIdRef.current;
         if (data.type.startsWith("node.")) {
           schedule("nodes", () => void refreshNodes(), 250);
+        } else if (data.type.startsWith("workspace-file-history.")) {
+          window.dispatchEvent(new CustomEvent("controller-center:workspace-file-history", { detail: { conversationId } }));
         } else if (data.type.startsWith("workspace.")) {
           schedule("nodes", () => void refreshNodes(), 400);
         } else if (data.type.startsWith("conversation.")) {
@@ -3088,6 +3583,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           onReturnLatest={returnToLatestMessages}
           viewingHistoricalMessages={viewingHistoricalMessages}
           onBack={() => setMobilePane("conversations")}
+          onNew={beginNewConversation}
           draftRequestId={draftRequestId}
           isDraft={selectedConversationId === null}
           onConversationStarted={conversationStarted}
@@ -3208,6 +3704,15 @@ export function App() {
       onRetry={() => void checkSession()}
       onAuthenticated={() => setState("authenticated")}
     />;
+  }
+  if (/^\/workspace-files\/opening\/?$/u.test(window.location.pathname)) return <WorkspaceFileOpeningPage />;
+  const workspaceFileRoute = /^\/workspace-files\/([^/]+)\/?$/u.exec(window.location.pathname);
+  if (workspaceFileRoute) {
+    try {
+      return <WorkspaceFilePage fileId={decodeURIComponent(workspaceFileRoute[1]!)} />;
+    } catch {
+      return <main className="workspace-file-page"><div className="workspace-file-error">文件预览地址无效</div></main>;
+    }
   }
   return <AuthenticatedApp onLogout={async () => {
     await logoutAdmin();

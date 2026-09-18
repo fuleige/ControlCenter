@@ -59,6 +59,26 @@ describe("wire protocol", () => {
     })).type).toBe("agent.workspaceValidation");
   });
 
+  it("parses capability-gated workspace file requests and responses", () => {
+    expect(parseControlMessage(JSON.stringify({
+      type: "control.workspaceFileRead",
+      requestId: "file-request-1",
+      workspaceId: "workspace-1",
+      path: "/home/ubuntu/report.tsv",
+      maxBytes: 8 * 1024 * 1024,
+    })).type).toBe("control.workspaceFileRead");
+    expect(parseAgentMessage(JSON.stringify({
+      type: "agent.workspaceFile",
+      requestId: "file-request-1",
+      ok: true,
+      path: "/home/ubuntu/report.tsv",
+      name: "report.tsv",
+      mediaType: "text/tab-separated-values; charset=utf-8",
+      size: 3,
+      contentBase64: "YQli",
+    })).type).toBe("agent.workspaceFile");
+  });
+
   it("parses context compaction commands and durable state", () => {
     const control = parseControlMessage(JSON.stringify({
       type: "control.command",

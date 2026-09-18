@@ -6,6 +6,7 @@ import os from "node:os";
 import WebSocket from "ws";
 import {
   CONTROL_PROTOCOL_VERSION,
+  WORKSPACE_FILE_READ_CAPABILITY,
   isRecord,
   parseControlMessage,
   toJsonValue,
@@ -36,8 +37,9 @@ import {
 import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
+import { readWorkspaceFile } from "./workspace-files.js";
 
-const AGENT_VERSION = "0.3.9";
+const AGENT_VERSION = "0.3.12";
 
 interface ActiveRun {
   conversationId: string;
@@ -1090,6 +1092,7 @@ function connect(): void {
         maxConcurrentRuns: config.maxConcurrentRuns,
         workspaces: config.workspaces,
         models: availableModels,
+        capabilities: [WORKSPACE_FILE_READ_CAPABILITY],
       },
     });
   });
@@ -1145,6 +1148,25 @@ function connect(): void {
             suggestedName: path.basename(result.canonicalPath) || result.canonicalPath,
           }),
         });
+      } else if (message.type === "control.workspaceFileRead") {
+        try {
+          const workspace = workspaceFor(message.workspaceId);
+          const result = readWorkspaceFile({
+            workspacePath: workspace.path,
+            requestedPath: message.path,
+            ...(message.basePath ? { basePath: message.basePath } : {}),
+            maxBytes: message.maxBytes,
+          });
+          send({ type: "agent.workspaceFile", requestId: message.requestId, ...result });
+        } catch (error) {
+          send({
+            type: "agent.workspaceFile",
+            requestId: message.requestId,
+            ok: false,
+            errorCode: "read_failed",
+            error: error instanceof Error ? error.message : "读取文件失败",
+          });
+        }
       } else if (message.type === "control.workspaceSync") {
         applyManagedWorkspaces(message.workspaces);
       } else if (message.type === "control.error") {
