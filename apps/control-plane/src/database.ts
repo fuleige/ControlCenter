@@ -115,6 +115,7 @@ export interface RunRecord {
   recoveryDeadlineAt: string | null;
   error: string | null;
   errorCode: RunErrorCode | null;
+  errorDismissedAt: string | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -427,6 +428,7 @@ export class ControlDatabase {
         status TEXT NOT NULL,
         error TEXT,
         error_code TEXT,
+        error_dismissed_at TEXT,
         created_at TEXT NOT NULL,
         started_at TEXT,
         finished_at TEXT
@@ -602,6 +604,7 @@ export class ControlDatabase {
     this.ensureColumn("runs", "progress_updated_at", "TEXT");
     this.ensureColumn("runs", "recovery_deadline_at", "TEXT");
     this.ensureColumn("runs", "error_code", "TEXT");
+    this.ensureColumn("runs", "error_dismissed_at", "TEXT");
     this.ensureColumn("approvals", "summary", "TEXT NOT NULL DEFAULT '需要你的确认'");
     this.ensureColumn("approvals", "risk", "TEXT");
     this.ensureColumn("enrollment_tokens", "token_ciphertext", "TEXT");
@@ -815,7 +818,7 @@ export class ControlDatabase {
       const recoveryDeadline = new Date(new Date(now).getTime() + 120_000).toISOString();
       this.sqlite.prepare(`
         UPDATE runs
-        SET status = 'recovering', error = NULL, recovery_deadline_at = ?
+        SET status = 'recovering', error = NULL, error_dismissed_at = NULL, recovery_deadline_at = ?
         WHERE conversation_id IN (SELECT id FROM conversations WHERE node_id = ?)
           AND status IN ('dispatching', 'running', 'waiting_approval')
       `).run(recoveryDeadline, node.id);
@@ -1421,8 +1424,8 @@ export class ControlDatabase {
       INSERT INTO runs (
         id, conversation_id, prompt, model, effort, client_request_id, remote_turn_id, status,
         progress_phase, progress_label, progress_updated_at, recovery_deadline_at,
-        error, error_code, created_at, started_at, finished_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        error, error_code, error_dismissed_at, created_at, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id,
       record.conversationId,
@@ -1438,6 +1441,7 @@ export class ControlDatabase {
       record.recoveryDeadlineAt,
       record.error,
       record.errorCode ?? null,
+      record.errorDismissedAt,
       record.createdAt,
       record.startedAt,
       record.finishedAt,
@@ -1468,6 +1472,7 @@ export class ControlDatabase {
       recoveryDeadlineAt: nullableText(row, "recovery_deadline_at"),
       error: nullableText(row, "error"),
       errorCode: nullableText(row, "error_code") as RunErrorCode | null,
+      errorDismissedAt: nullableText(row, "error_dismissed_at"),
       createdAt: text(row, "created_at"),
       startedAt: nullableText(row, "started_at"),
       finishedAt: nullableText(row, "finished_at"),
@@ -1545,7 +1550,7 @@ export class ControlDatabase {
     this.sqlite.prepare(`
       UPDATE runs SET remote_turn_id = ?, status = 'running', progress_phase = 'analyzing',
         progress_label = '正在分析任务', progress_updated_at = ?, recovery_deadline_at = NULL,
-        error = NULL, error_code = NULL, started_at = ? WHERE id = ?
+        error = NULL, error_code = NULL, error_dismissed_at = NULL, started_at = ? WHERE id = ?
     `).run(payload.turnId, payload.startedAt, payload.startedAt, payload.runId);
     this.touchConversation(payload.conversationId, payload.startedAt);
   }
@@ -1562,7 +1567,7 @@ export class ControlDatabase {
 
   finishRun(payload: RunFinishedPayload): void {
     this.sqlite.prepare(`
-      UPDATE runs SET status = ?, error = ?, error_code = ?, finished_at = ?, recovery_deadline_at = NULL,
+      UPDATE runs SET status = ?, error = ?, error_code = ?, error_dismissed_at = NULL, finished_at = ?, recovery_deadline_at = NULL,
         progress_phase = NULL, progress_label = NULL, progress_updated_at = ? WHERE id = ?
         AND status NOT IN ('completed', 'failed', 'interrupted')
     `).run(payload.status, payload.error ?? null, payload.errorCode ?? null, payload.finishedAt, payload.finishedAt, payload.runId);
@@ -1574,9 +1579,15 @@ export class ControlDatabase {
 
   failRun(id: string, error: string, now: string, errorCode: RunErrorCode | null = null): void {
     this.sqlite.prepare(
-      `UPDATE runs SET status = 'failed', error = ?, error_code = ?, finished_at = ?
+      `UPDATE runs SET status = 'failed', error = ?, error_code = ?, error_dismissed_at = NULL, finished_at = ?
        WHERE id = ? AND status NOT IN ('completed', 'failed', 'interrupted')`,
     ).run(error, errorCode, now, id);
+  }
+
+  dismissRunError(id: string, now: string): boolean {
+    return this.sqlite.prepare(
+      "UPDATE runs SET error_dismissed_at = ? WHERE id = ? AND error IS NOT NULL",
+    ).run(now, id).changes > 0;
   }
 
   reconcileNodeRuns(nodeId: string, activeRunIds: string[], now: string): string[] {

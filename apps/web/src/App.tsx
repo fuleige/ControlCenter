@@ -26,6 +26,7 @@ import {
   compactConversation,
   deleteConversation,
   deleteConversationOpenedFile,
+  dismissRunError,
   createEnrollmentToken,
   createNodeWorkspace,
   deleteNodeWorkspace,
@@ -517,11 +518,20 @@ function CopyableCodeBlock({
   children,
   node: _node,
   showLineNumbers = false,
+  highlightedLine = null,
+  lineAnchorPrefix,
   ...props
-}: ComponentPropsWithoutRef<"pre"> & { node?: unknown; showLineNumbers?: boolean }) {
+}: ComponentPropsWithoutRef<"pre"> & {
+  node?: unknown;
+  showLineNumbers?: boolean;
+  highlightedLine?: number | null;
+  lineAnchorPrefix?: string;
+}) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const code = reactNodeText(children).replace(/\n$/, "");
   const lineNumbers = showLineNumbers ? previewLineNumberText(code) : "";
+  const lineNumberValues = lineNumbers ? lineNumbers.split("\n") : [];
+  const hasHighlightedLine = highlightedLine !== null && highlightedLine >= 1 && highlightedLine <= lineNumberValues.length;
   const codeElement = Children.toArray(children).find((child) => isValidElement(child));
   const className = isValidElement<{ className?: string }>(codeElement) ? codeElement.props.className ?? "" : "";
   const language = /(?:^|\s)language-([^\s]+)/.exec(className)?.[1] ?? "代码";
@@ -549,7 +559,11 @@ function CopyableCodeBlock({
         </button>
       </div>
       <div className={`code-block-scroll ${lineNumbers ? "with-line-numbers" : ""}`}>
-        {lineNumbers && <pre className="code-line-numbers" aria-hidden="true">{lineNumbers}</pre>}
+        {lineNumbers && <pre className="code-line-numbers" aria-hidden="true">{hasHighlightedLine ? <>
+          {lineNumberValues.slice(0, highlightedLine - 1).join("\n")}{highlightedLine > 1 ? "\n" : ""}
+          <span id={lineAnchorPrefix ? `${lineAnchorPrefix}-${highlightedLine}` : undefined} className="code-line-number-target">{highlightedLine}</span>
+          {highlightedLine < lineNumberValues.length ? `\n${lineNumberValues.slice(highlightedLine).join("\n")}` : ""}
+        </> : lineNumbers}</pre>}
         <pre {...props} className={[props.className, "code-block-content"].filter(Boolean).join(" ")}>{children}</pre>
       </div>
     </div>
@@ -618,18 +632,26 @@ function MarkdownPre({
   children,
   node: _node,
   showLineNumbers = false,
+  highlightedLine = null,
+  lineAnchorPrefix,
   ...props
-}: ComponentPropsWithoutRef<"pre"> & { node?: unknown; showLineNumbers?: boolean }) {
+}: ComponentPropsWithoutRef<"pre"> & {
+  node?: unknown;
+  showLineNumbers?: boolean;
+  highlightedLine?: number | null;
+  lineAnchorPrefix?: string;
+}) {
   const codeElement = Children.toArray(children).find((child) => isValidElement<{ className?: string; children?: ReactNode }>(child));
   const className = isValidElement<{ className?: string }>(codeElement) ? codeElement.props.className ?? "" : "";
   if (/(?:^|\s)language-mermaid(?:\s|$)/u.test(className)) {
     return <MermaidDiagram source={reactNodeText(codeElement).replace(/\n$/u, "")} />;
   }
-  return <CopyableCodeBlock {...props} showLineNumbers={showLineNumbers}>{children}</CopyableCodeBlock>;
-}
-
-function LineNumberedMarkdownPre(props: ComponentPropsWithoutRef<"pre"> & { node?: unknown }) {
-  return <MarkdownPre {...props} showLineNumbers />;
+  return <CopyableCodeBlock
+    {...props}
+    showLineNumbers={showLineNumbers}
+    highlightedLine={highlightedLine}
+    lineAnchorPrefix={lineAnchorPrefix}
+  >{children}</CopyableCodeBlock>;
 }
 
 const embeddedResourceFileLimit = 50;
@@ -747,6 +769,52 @@ function LocalMarkdownImage({
 const uriSchemePattern = /^([a-z][a-z\d+.-]*):/iu;
 const unsafeUriSchemes = new Set(["javascript", "data", "vbscript"]);
 
+export interface WorkspaceFileReference {
+  path: string;
+  line: number | null;
+  column: number | null;
+}
+
+function looksLikeWorkspaceFilePath(value: string): boolean {
+  const path = value.trim();
+  if (!path || path.includes("\n")) return false;
+  if (/^file:/iu.test(path) || /^[a-z]:[\\/]/iu.test(path) || path.startsWith("\\\\")) return true;
+  if (path.startsWith("/") || path.startsWith("./") || path.startsWith("../")) return true;
+  if (path.includes("/") || path.includes("\\")) return true;
+  return /(?:^|[\\/])(?:[^\\/]+\.[\p{L}][\p{L}\d]{0,15}|Dockerfile|Makefile|Jenkinsfile|Procfile|Gemfile|Rakefile)$/iu.test(path);
+}
+
+function strongInlineWorkspaceFilePath(value: string): boolean {
+  const path = value.trim();
+  return /^file:/iu.test(path)
+    || /^[a-z]:[\\/]/iu.test(path)
+    || path.startsWith("\\\\")
+    || path.startsWith("/")
+    || path.startsWith("./")
+    || path.startsWith("../")
+    || /(?:^|[\\/])(?:[^\\/]+\.[\p{L}][\p{L}\d]{0,15}|Dockerfile|Makefile|Jenkinsfile|Procfile|Gemfile|Rakefile)$/iu.test(path);
+}
+
+export function parseWorkspaceFileReference(value: string): WorkspaceFileReference {
+  const original = value.trim();
+  const candidate = original.replace(/[,.，。;；!！?？、]+$/u, "");
+  const location = /^(.*?)(?:#L([1-9]\d*)(?:C([1-9]\d*))?(?:-L[1-9]\d*(?:C[1-9]\d*)?)?|:([1-9]\d*)(?::([1-9]\d*))?)$/iu.exec(candidate);
+  const referencedPath = location?.[1] ?? "";
+  const externalScheme = uriSchemePattern.exec(referencedPath)?.[1]?.toLowerCase();
+  if (!location
+    || !looksLikeWorkspaceFilePath(referencedPath)
+    || externalScheme && externalScheme !== "file" && !/^[a-z]:[\\/]/iu.test(referencedPath)) {
+    return { path: original, line: null, column: null };
+  }
+  const line = Number(location[2] ?? location[4]);
+  const columnValue = location[3] ?? location[5];
+  const column = columnValue ? Number(columnValue) : null;
+  if (!Number.isSafeInteger(line) || line < 1 || column !== null && (!Number.isSafeInteger(column) || column < 1)) {
+    return { path: original, line: null, column: null };
+  }
+  return { path: referencedPath, line, column };
+}
+
 export function isLocalWorkspaceHref(value: string): boolean {
   const href = value.trim();
   if (!href || href.startsWith("#") || href.startsWith("//")) return false;
@@ -764,12 +832,102 @@ function safeMarkdownUrl(value: string): string {
   return isUnsafeHref(value) ? "" : value;
 }
 
+interface MarkdownAstNode {
+  type: string;
+  value?: string;
+  url?: string;
+  children?: MarkdownAstNode[];
+  data?: { hProperties?: Record<string, unknown> };
+  position?: {
+    start?: { line?: number };
+    end?: { line?: number };
+  };
+}
+
+function fileReferenceNodes(value: string): MarkdownAstNode[] | null {
+  const pattern = /(^|[^\p{L}\p{N}_./\\-])((?:(?:\.{0,2}[\\/]|[A-Za-z]:[\\/]|[\\/])?[^\s`"'<>()[\]{},，。；;！!?？、:：]+(?:[\\/][^\s`"'<>()[\]{},，。；;！!?？、:：]+)+|[\p{L}\p{N}_@.+~-]+\.[\p{L}][\p{L}\p{N}]{0,15})(?::[1-9]\d*(?::[1-9]\d*)?|#L[1-9]\d*(?:C[1-9]\d*)?))/giu;
+  const nodes: MarkdownAstNode[] = [];
+  let offset = 0;
+  for (const match of value.matchAll(pattern)) {
+    const prefix = match[1] ?? "";
+    const reference = match[2] ?? "";
+    const start = (match.index ?? 0) + prefix.length;
+    const parsed = parseWorkspaceFileReference(reference);
+    if (!parsed.line || !isLocalWorkspaceHref(parsed.path)) continue;
+    if (start > offset) nodes.push({ type: "text", value: value.slice(offset, start) });
+    nodes.push({
+      type: "link",
+      url: reference.includes("/") || reference.includes("\\") ? reference : `./${reference}`,
+      children: [{ type: "text", value: reference }],
+    });
+    offset = start + reference.length;
+  }
+  if (!nodes.length) return null;
+  if (offset < value.length) nodes.push({ type: "text", value: value.slice(offset) });
+  return nodes;
+}
+
+function remarkWorkspaceFileReferences() {
+  const protectedTypes = new Set(["code", "definition", "html", "image", "imageReference", "link", "linkReference"]);
+  return (tree: MarkdownAstNode) => {
+    const visit = (node: MarkdownAstNode) => {
+      if (node.type === "link" && node.url) {
+        const parsed = parseWorkspaceFileReference(node.url);
+        if (parsed.line && !node.url.includes("/") && !node.url.includes("\\")) node.url = `./${node.url}`;
+      }
+      if (!node.children || protectedTypes.has(node.type)) return;
+      node.children = node.children.flatMap((child) => {
+        if (child.type === "text" && child.value) return fileReferenceNodes(child.value) ?? [child];
+        visit(child);
+        return [child];
+      });
+    };
+    visit(tree);
+  };
+}
+
+function remarkRenderedSourceLine(options?: { line?: number | null }) {
+  const line = options?.line;
+  const blockTypes = new Set(["blockquote", "code", "heading", "list", "listItem", "paragraph", "table", "tableRow", "thematicBreak"]);
+  return (tree: MarkdownAstNode) => {
+    if (!line || line < 1) return;
+    let best: { node: MarkdownAstNode; contains: boolean; distance: number; span: number } | null = null;
+    const visit = (node: MarkdownAstNode) => {
+      const start = node.position?.start?.line;
+      const end = node.position?.end?.line;
+      if (blockTypes.has(node.type) && start && end) {
+        const contains = start <= line && line <= end;
+        const distance = contains ? 0 : Math.min(Math.abs(line - start), Math.abs(line - end));
+        const span = end - start;
+        if (!best
+          || contains && !best.contains
+          || contains === best.contains && distance < best.distance
+          || contains === best.contains && distance === best.distance && span < best.span) {
+          best = { node, contains, distance, span };
+        }
+      }
+      node.children?.forEach(visit);
+    };
+    visit(tree);
+    const target = (best as { node: MarkdownAstNode } | null)?.node;
+    if (!target) return;
+    target.data ??= {};
+    target.data.hProperties = {
+      ...target.data.hProperties,
+      id: "workspace-markdown-source-target",
+    };
+  };
+}
+
 interface MarkdownContentProps {
   children: string;
   baseFileId?: string;
   onOpenLocalPath?: (path: string, baseFileId?: string) => void;
   loadEmbeddedResource?: (path: string, baseFileId?: string) => Promise<LoadedEmbeddedResource>;
   showCodeLineNumbers?: boolean;
+  highlightedLine?: number | null;
+  lineAnchorPrefix?: string;
+  renderedSourceLine?: number | null;
 }
 
 function MarkdownContent({
@@ -778,12 +936,20 @@ function MarkdownContent({
   onOpenLocalPath,
   loadEmbeddedResource,
   showCodeLineNumbers = false,
+  highlightedLine = null,
+  lineAnchorPrefix,
+  renderedSourceLine = null,
 }: MarkdownContentProps) {
   const markdown = useMemo(() => normalizeMathMarkdown(children), [children]);
   return (
     <div className="markdown-content">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[
+          remarkGfm,
+          remarkMath,
+          remarkWorkspaceFileReferences,
+          [remarkRenderedSourceLine, { line: renderedSourceLine }],
+        ]}
         rehypePlugins={[
           rehypeRaw,
           rehypeSlug,
@@ -793,7 +959,9 @@ function MarkdownContent({
         ]}
         urlTransform={safeMarkdownUrl}
         components={{
-          pre: showCodeLineNumbers ? LineNumberedMarkdownPre : MarkdownPre,
+          pre: showCodeLineNumbers
+            ? (props) => <MarkdownPre {...props} showLineNumbers highlightedLine={highlightedLine} lineAnchorPrefix={lineAnchorPrefix} />
+            : MarkdownPre,
           a: ({ href = "", children: linkChildren, node: _node, ...props }) => {
             if (!href || isUnsafeHref(href)) return <span>{linkChildren}</span>;
             if (href.startsWith("#")) return <a {...props} href={`#${markdownIdPrefix}${href.slice(1)}`}>{linkChildren}</a>;
@@ -810,6 +978,27 @@ function MarkdownContent({
               >{linkChildren}</a>;
             }
             return <a {...props} href={href} target="_blank" rel="noreferrer noopener">{linkChildren}</a>;
+          },
+          code: ({ className, children: codeChildren, node: _node, ...props }) => {
+            const reference = reactNodeText(codeChildren).trim();
+            const parsed = parseWorkspaceFileReference(reference);
+            const isInlineReference = !className
+              && !reference.includes("\n")
+              && isLocalWorkspaceHref(parsed.path)
+              && (parsed.line !== null || strongInlineWorkspaceFilePath(parsed.path));
+            if (isInlineReference && onOpenLocalPath) {
+              const location = parsed.line ? `，第 ${parsed.line} 行${parsed.column ? `第 ${parsed.column} 列` : ""}` : "";
+              return <a
+                className="local-file-reference"
+                href={reference}
+                title={`打开 Agent 文件${location}`}
+                onClick={(event) => {
+                  event.preventDefault();
+                  onOpenLocalPath(reference, baseFileId);
+                }}
+              ><code {...props}>{codeChildren}</code></a>;
+            }
+            return <code {...props} className={className}>{codeChildren}</code>;
           },
           img: ({ src = "", alt = "", node: _node, ...props }) => {
             if (!src || isUnsafeHref(src)) return <span className="local-image-unavailable">图片地址不可用</span>;
@@ -924,14 +1113,103 @@ function fencedSource(content: string, language: string): string {
   return `${fence}${language}\n${content}${content.endsWith("\n") ? "" : "\n"}${fence}`;
 }
 
-function workspaceFilePreviewPath(fileId: string): string {
-  return `/workspace-files/${encodeURIComponent(fileId)}`;
+function workspaceFilePreviewPath(fileId: string, location?: Pick<WorkspaceFileReference, "line" | "column">): string {
+  const parameters = new URLSearchParams();
+  if (location?.line) parameters.set("line", String(location.line));
+  if (location?.column) parameters.set("column", String(location.column));
+  const suffix = parameters.size ? `?${parameters}` : "";
+  return `/workspace-files/${encodeURIComponent(fileId)}${suffix}`;
 }
 
 function workspaceFileOpeningPath(conversationId: string, path: string, baseFileId?: string): string {
   const parameters = new URLSearchParams({ conversationId, path });
   if (baseFileId) parameters.set("baseFileId", baseFileId);
   return `/workspace-files/opening?${parameters}`;
+}
+
+function openWorkspaceFileTab(conversationId: string, path: string, baseFileId?: string): boolean {
+  const openingUrl = new URL(workspaceFileOpeningPath(conversationId, path, baseFileId), window.location.origin).toString();
+  const previewWindow = window.open(openingUrl, "_blank");
+  if (!previewWindow) return false;
+  previewWindow.opener = null;
+  return true;
+}
+
+interface WorkspaceFileOpenFailure {
+  title: string;
+  message: string;
+  path: string;
+  hint?: string;
+}
+
+function workspaceFileDisplayName(filePath: string): string {
+  const trimmed = filePath.replace(/[\\/]+$/u, "");
+  const name = trimmed.split(/[\\/]/u).at(-1) || trimmed || "目标文件";
+  try { return decodeURIComponent(name); } catch { return name; }
+}
+
+function describeWorkspaceFileOpenFailure(reason: unknown, filePath: string): WorkspaceFileOpenFailure {
+  const name = workspaceFileDisplayName(filePath);
+  const code = reason instanceof ApiError ? reason.code : null;
+  if (code === "not_found") return {
+    title: "文件不存在",
+    message: `Agent 上未找到“${name}”。`,
+    path: filePath,
+    hint: "请确认文件名、相对路径及字母大小写是否正确。",
+  };
+  if (code === "too_large") return {
+    title: "文件过大",
+    message: `“${name}”超过当前 8 MB 的在线预览上限。`,
+    path: filePath,
+    hint: "请缩小文件后重试，或在 Agent 所在机器上直接查看。",
+  };
+  if (code === "forbidden") return {
+    title: "无权读取文件",
+    message: `Agent 无法读取“${name}”。`,
+    path: filePath,
+    hint: reason instanceof Error ? reason.message : "请检查文件权限和路径范围。",
+  };
+  if (code === "not_file") return {
+    title: "目标不是文件",
+    message: `“${name}”指向的不是普通文件。`,
+    path: filePath,
+    hint: "请选择具体文件，而不是目录或设备。",
+  };
+  if (code === "agent_offline") return {
+    title: "Agent 当前离线",
+    message: `暂时无法读取“${name}”。`,
+    path: filePath,
+    hint: "请等待对应节点恢复在线后重试。",
+  };
+  if (code === "agent_upgrade_required") return {
+    title: "Agent 需要升级",
+    message: `当前 Agent 版本不支持预览“${name}”。`,
+    path: filePath,
+    hint: "请升级并重启 Agent 后重试。",
+  };
+  if (code === "base_file_expired") return {
+    title: "原文件预览已失效",
+    message: `无法确定“${name}”的相对路径。`,
+    path: filePath,
+    hint: "请从对话中重新打开原文件，再点击其中的链接。",
+  };
+  if (code === "invalid_file_path") return {
+    title: "文件路径无效",
+    message: `无法识别“${name}”的文件路径。`,
+    path: filePath,
+  };
+  if (code === "workspace_file_rate_limited") return {
+    title: "文件打开过于频繁",
+    message: `暂时无法打开“${name}”。`,
+    path: filePath,
+    hint: "请稍后再试。",
+  };
+  return {
+    title: "文件读取失败",
+    message: reason instanceof Error && reason.message ? reason.message : `无法读取“${name}”。`,
+    path: filePath,
+    hint: "请确认 Agent 在线、文件路径正确且当前用户拥有读取权限。",
+  };
 }
 
 function blobDataUrl(blob: Blob): Promise<string> {
@@ -1109,25 +1387,43 @@ function WorkspaceFileLoadingCard() {
 
 function WorkspaceFileOpeningPage() {
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
-  const [failed, setFailed] = useState(parameters.get("state") === "error");
+  const openingStarted = useRef(false);
+  const [failure, setFailure] = useState<WorkspaceFileOpenFailure | null>(() => parameters.get("state") === "error" ? {
+    title: "文件读取失败",
+    message: "未能读取目标文件。",
+    path: parameters.get("path")?.trim() ?? "",
+    hint: "请确认 Agent 在线和文件路径正确后重试。",
+  } : null);
 
   useEffect(() => {
     const conversationId = parameters.get("conversationId")?.trim() ?? "";
-    const path = parameters.get("path")?.trim() ?? "";
+    const reference = parseWorkspaceFileReference(parameters.get("path")?.trim() ?? "");
     const baseFileId = parameters.get("baseFileId")?.trim() || undefined;
-    if (!conversationId || !path || failed) return;
-    void openWorkspaceFile(conversationId, path, baseFileId)
-      .then((descriptor) => window.location.replace(workspaceFilePreviewPath(descriptor.id)))
-      .catch(() => setFailed(true));
-  }, [failed, parameters]);
+    if (failure || openingStarted.current) return;
+    if (!conversationId || !reference.path) {
+      openingStarted.current = true;
+      setFailure({
+        title: "文件预览地址无效",
+        message: "打开链接中缺少会话或文件路径信息。",
+        path: reference.path,
+      });
+      return;
+    }
+    openingStarted.current = true;
+    void openWorkspaceFile(conversationId, reference.path, baseFileId)
+      .then((descriptor) => window.location.replace(workspaceFilePreviewPath(descriptor.id, reference)))
+      .catch((reason) => setFailure(describeWorkspaceFileOpenFailure(reason, reference.path)));
+  }, [failure, parameters]);
 
   return (
     <main className="workspace-file-transition-page">
-      {failed ? <section className="workspace-file-loading-card workspace-file-loading-failed" role="alert">
+      {failure ? <section className="workspace-file-loading-card workspace-file-loading-failed" role="alert">
         <div className="workspace-file-failed-mark" aria-hidden="true">!</div>
         <span className="workspace-file-loading-label">AGENT 文件预览</span>
-        <h1>文件读取失败</h1>
-        <p>请返回原对话查看错误信息，确认 Agent 在线和文件路径正确后重试。</p>
+        <h1>{failure.title}</h1>
+        <p>{failure.message}</p>
+        {failure.path && <code className="workspace-file-failure-path" title={failure.path}>{failure.path}</code>}
+        {failure.hint && <small className="workspace-file-failure-hint">{failure.hint}</small>}
         <button type="button" onClick={() => window.close()}>关闭标签页</button>
       </section> : <WorkspaceFileLoadingCard />}
     </main>
@@ -1135,13 +1431,22 @@ function WorkspaceFileOpeningPage() {
 }
 
 function WorkspaceFilePage({ fileId }: { fileId: string }) {
+  const requestedLocation = useMemo(() => {
+    const parameters = new URLSearchParams(window.location.search);
+    const line = Number(parameters.get("line"));
+    const column = Number(parameters.get("column"));
+    return {
+      line: Number.isSafeInteger(line) && line > 0 ? line : null,
+      column: Number.isSafeInteger(column) && column > 0 ? column : null,
+    };
+  }, []);
   const [file, setFile] = useState<WorkspaceFileDescriptor | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [textContent, setTextContent] = useState<string | null>(null);
   const [preparedHtml, setPreparedHtml] = useState<string | null>(null);
   const [htmlError, setHtmlError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [openingPath, setOpeningPath] = useState(false);
+  const [linkOpenError, setLinkOpenError] = useState<string | null>(null);
   const embeddedResourceLoader = useMemo(
     () => file ? new EmbeddedWorkspaceResourceLoader(file.conversationId) : null,
     [file],
@@ -1185,26 +1490,13 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
   }, [fileId]);
 
   const openNestedFile = useCallback((nestedPath: string, baseFileId?: string) => {
-    if (!file || openingPath) return;
-    const previewWindow = window.open(new URL("/workspace-files/opening", window.location.origin).toString(), "_blank");
-    if (!previewWindow) {
-      setError("浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试");
+    if (!file) return;
+    if (!openWorkspaceFileTab(file.conversationId, nestedPath, baseFileId)) {
+      setLinkOpenError("浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试");
       return;
     }
-    previewWindow.opener = null;
-    setOpeningPath(true);
-    setError(null);
-    void openWorkspaceFile(file.conversationId, nestedPath, baseFileId)
-      .then((descriptor) => {
-        previewWindow.location.replace(new URL(workspaceFilePreviewPath(descriptor.id), window.location.origin).toString());
-        setOpeningPath(false);
-      })
-      .catch((reason) => {
-        setError(formatErrorMessage(reason, "打开 Agent 文件"));
-        setOpeningPath(false);
-        previewWindow.location.replace(new URL("/workspace-files/opening?state=error", window.location.origin).toString());
-      });
-  }, [file, openingPath]);
+    setLinkOpenError(null);
+  }, [file]);
 
   const mediaType = file?.mediaType.split(";", 1)[0]?.toLowerCase() ?? "";
   const extension = file?.name.match(/\.([^.]+)$/u)?.[1]?.toLowerCase() ?? "";
@@ -1220,6 +1512,8 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
   if (mediaType === "application/json" && textContent !== null) {
     try { visibleText = JSON.stringify(JSON.parse(textContent), null, 2); } catch { /* Keep the original invalid JSON visible. */ }
   }
+  const sourcePreview = visibleText !== null && !isMarkdown && !isHtml && !isCsv && !isTsv;
+  const sourcePreviewText = requestedLocation.line && textContent !== null ? textContent : visibleText;
 
   useEffect(() => {
     if (!file || !isHtml || textContent === null || !embeddedResourceLoader) {
@@ -1235,6 +1529,23 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
       .catch((reason) => { if (active) setHtmlError(reason instanceof Error ? reason.message : "HTML 页面准备失败"); });
     return () => { active = false; };
   }, [embeddedResourceLoader, file, isHtml, textContent]);
+
+  useEffect(() => {
+    if (!requestedLocation.line || !isMarkdown && !sourcePreview) return;
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        const target = isMarkdown
+          ? document.querySelector<HTMLElement>('.workspace-file-preview [id$="workspace-markdown-source-target"]')
+          : document.getElementById(`workspace-source-line-${requestedLocation.line}`);
+        target?.scrollIntoView({ block: "center" });
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [isMarkdown, requestedLocation.line, sourcePreview, textContent]);
 
   const previewLayout = !file || error
     ? "status"
@@ -1290,6 +1601,7 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
               <div className="workspace-file-facts" aria-label="文件信息">
                 <span>{previewKind}</span>
                 <span>{fileSize}</span>
+                {requestedLocation.line && <span className="workspace-file-location">引用第 {requestedLocation.line} 行{requestedLocation.column ? ` · 第 ${requestedLocation.column} 列` : ""}</span>}
                 <span>只读</span>
               </div>
             </header>}
@@ -1297,12 +1609,13 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
               {!file && !error && <WorkspaceFileLoadingCard />}
               {error && <div className="workspace-file-error" role="alert">{error}</div>}
               {htmlError && <div className="workspace-file-error" role="alert">{htmlError}</div>}
-              {openingPath && <div className="workspace-file-navigation"><span className="loading-spinner" />正在打开关联文件…</div>}
+              {linkOpenError && <div className="workspace-file-link-error" role="alert">{linkOpenError}<button type="button" aria-label="关闭提示" onClick={() => setLinkOpenError(null)}>×</button></div>}
               {file && objectUrl && mediaType.startsWith("image/") && <img className="workspace-file-image" src={objectUrl} alt={file.name} />}
               {file && isMarkdown && textContent !== null && <MarkdownContent
                 baseFileId={file.id}
                 onOpenLocalPath={openNestedFile}
                 loadEmbeddedResource={loadEmbeddedResource}
+                renderedSourceLine={requestedLocation.line}
               >{textContent}</MarkdownContent>}
               {file && isHtml && textContent !== null && !preparedHtml && !htmlError && <WorkspaceFileLoadingCard />}
               {file && isHtml && preparedHtml && <iframe
@@ -1321,8 +1634,16 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
                 {table.truncated && <p>预览仅展示前 1000 条记录、100 列；可下载查看完整文件。</p>}
               </div>}
               {file && objectUrl && mediaType === "application/pdf" && <iframe className="workspace-file-pdf" src={objectUrl} title={file.name} />}
-              {file && visibleText !== null && language && !isMarkdown && !isHtml && !isCsv && !isTsv && <MarkdownContent showCodeLineNumbers>{fencedSource(visibleText, language)}</MarkdownContent>}
-              {file && visibleText !== null && !language && !isMarkdown && !isHtml && !isCsv && !isTsv && <MarkdownContent showCodeLineNumbers>{fencedSource(visibleText, "plaintext")}</MarkdownContent>}
+              {file && sourcePreviewText !== null && language && sourcePreview && <MarkdownContent
+                showCodeLineNumbers
+                highlightedLine={requestedLocation.line}
+                lineAnchorPrefix="workspace-source-line"
+              >{fencedSource(sourcePreviewText, language)}</MarkdownContent>}
+              {file && sourcePreviewText !== null && !language && sourcePreview && <MarkdownContent
+                showCodeLineNumbers
+                highlightedLine={requestedLocation.line}
+                lineAnchorPrefix="workspace-source-line"
+              >{fencedSource(sourcePreviewText, "plaintext")}</MarkdownContent>}
               {file && objectUrl && textContent === null && !mediaType.startsWith("image/") && mediaType !== "application/pdf" && <div className="workspace-file-state">该文件类型暂不支持直接预览，请下载后查看。</div>}
             </div>
           </div>
@@ -2624,6 +2945,8 @@ function ChatPanel({
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dismissedRunErrorIds, setDismissedRunErrorIds] = useState<Set<string>>(() => new Set());
+  const [dismissingRunErrorId, setDismissingRunErrorId] = useState<string | null>(null);
   const [workspaceId, setWorkspaceId] = useState("");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
@@ -2871,25 +3194,9 @@ function ChatPanel({
 
   function openAgentFile(path: string, baseFileId?: string): void {
     if (!detail) return;
-    const requestedConversationId = detail.conversation.id;
-    const openingUrl = new URL("/workspace-files/opening", window.location.origin).toString();
-    const previewWindow = window.open(openingUrl, "_blank");
-    if (!previewWindow) {
+    if (!openWorkspaceFileTab(detail.conversation.id, path, baseFileId)) {
       setError("浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试");
-      return;
     }
-    previewWindow.opener = null;
-    void openWorkspaceFile(detail.conversation.id, path, baseFileId)
-      .then((descriptor) => {
-        if (requestedConversationId === fileHistoryConversationRef.current) void refreshOpenedFiles();
-        previewWindow.location.replace(new URL(workspaceFilePreviewPath(descriptor.id), window.location.origin).toString());
-      })
-      .catch((reason) => {
-        if (requestedConversationId === fileHistoryConversationRef.current) {
-          setError(formatErrorMessage(reason, "打开 Agent 文件"));
-        }
-        previewWindow.location.replace(new URL("/workspace-files/opening?state=error", window.location.origin).toString());
-      });
   }
 
   async function addOpenedFile(path: string): Promise<void> {
@@ -3097,6 +3404,21 @@ function ChatPanel({
     }
   }
 
+  async function closeRunError(runId: string): Promise<void> {
+    if (dismissingRunErrorId) return;
+    setDismissingRunErrorId(runId);
+    setError(null);
+    try {
+      await dismissRunError(runId);
+      setDismissedRunErrorIds((current) => new Set(current).add(runId));
+      onRefresh();
+    } catch (reason) {
+      setError(formatErrorMessage(reason, "关闭任务错误提示"));
+    } finally {
+      setDismissingRunErrorId(null);
+    }
+  }
+
   function requestCompaction(): void {
     if (!detail || activeRun || compactionActive) return;
     setCompactionRequestId(newDraftRequestId());
@@ -3250,8 +3572,18 @@ function ChatPanel({
             })}
           </div>}
           {currentApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onDone={onRefresh} />)}
-          {detail?.runs.filter((run) => run.error).map((run) => (
-            <div className="run-error" key={`error-${run.id}`}>{run.error}</div>
+          {detail?.runs.filter((run) => run.error && !run.errorDismissedAt && !dismissedRunErrorIds.has(run.id)).map((run) => (
+            <div className="run-error" role="status" key={`error-${run.id}`}>
+              <span>{run.error}</span>
+              <button
+                className="error-notice-close"
+                type="button"
+                aria-label="关闭任务错误提示"
+                title="关闭"
+                disabled={dismissingRunErrorId !== null}
+                onClick={() => void closeRunError(run.id)}
+              >×</button>
+            </div>
           ))}
         </div>
         {viewingHistoricalMessages ? (

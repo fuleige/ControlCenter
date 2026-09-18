@@ -137,6 +137,7 @@ export interface Run {
   recoveryDeadlineAt: string | null;
   error: string | null;
   errorCode?: RunErrorCode | null;
+  errorDismissedAt: string | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;

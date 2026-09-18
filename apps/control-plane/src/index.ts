@@ -37,8 +37,8 @@ import {
 } from "./auth.js";
 
 const config = loadConfig();
-const controlPlanePackage = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
-const agentPackageVersion = controlPlanePackage.version;
+const agentPackage = JSON.parse(readFileSync(new URL("../../agent/package.json", import.meta.url), "utf8")) as { version: string };
+const agentPackageVersion = agentPackage.version;
 const database = new ControlDatabase(config.databasePath);
 ensureAdminToken(database, config.adminTokenPath, config.adminToken);
 const enrollmentDisplayKey = ensureEnrollmentDisplayKey(config.enrollmentDisplayKeyPath);
@@ -1407,6 +1407,7 @@ app.post<{
     recoveryDeadlineAt: null,
     error: null,
     errorCode: null,
+    errorDismissedAt: null,
     createdAt,
     startedAt: null,
     finishedAt: null,
@@ -1517,6 +1518,7 @@ app.post<{
     recoveryDeadlineAt: null,
     error: null,
     errorCode: null,
+    errorDismissedAt: null,
     createdAt,
     startedAt: null,
     finishedAt: null,
@@ -1550,6 +1552,15 @@ app.post<{
   const dispatched = database.getRun(runId)?.status === "dispatching";
   publish("run.created", runId, conversation.id);
   return reply.code(201).send({ run: database.getRun(runId), dispatched });
+});
+
+app.post<{ Params: { id: string } }>("/api/runs/:id/error/dismiss", async (request, reply) => {
+  const run = database.getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: "任务不存在或已被删除" });
+  if (!run.error) return reply.code(409).send({ error: "该任务没有可关闭的错误提示" });
+  database.dismissRunError(run.id, now());
+  publish("run.updated", run.id, run.conversationId);
+  return reply.code(204).send();
 });
 
 app.post<{ Params: { id: string }; Body: { allowWorkspaceConcurrency?: boolean } }>("/api/runs/:id/retry", async (request, reply) => {
@@ -1622,6 +1633,7 @@ app.post<{ Params: { id: string }; Body: { allowWorkspaceConcurrency?: boolean }
     recoveryDeadlineAt: null,
     error: null,
     errorCode: null,
+    errorDismissedAt: null,
     createdAt,
     startedAt: null,
     finishedAt: null,

@@ -8,6 +8,7 @@ import {
   messageHistoryCacheLimit,
   normalizeMathMarkdown,
   isLocalWorkspaceHref,
+  parseWorkspaceFileReference,
   parseDelimitedPreview,
   previewLineNumberText,
 } from "./App";
@@ -90,6 +91,7 @@ describe("buildTimeline", () => {
         progressUpdatedAt: null,
         recoveryDeadlineAt: null,
         error: null,
+        errorDismissedAt: null,
         createdAt: "2026-09-09T10:00:01.000Z",
         startedAt: "2026-09-09T10:00:01.100Z",
         finishedAt: "2026-09-09T10:00:03.000Z",
@@ -185,6 +187,47 @@ describe("conversation file links", () => {
   it("builds preview line numbers without counting a trailing empty line", () => {
     expect(previewLineNumberText("alpha\nbeta\ngamma\n")).toBe("1\n2\n3");
     expect(previewLineNumberText("")).toBe("1");
+  });
+
+  it("separates AI-style line locations and trailing punctuation from file paths", () => {
+    expect(parseWorkspaceFileReference("apps/web/src/App.tsx:3271,")).toEqual({
+      path: "apps/web/src/App.tsx",
+      line: 3271,
+      column: null,
+    });
+    expect(parseWorkspaceFileReference("src/main.ts:18:7。")).toEqual({
+      path: "src/main.ts",
+      line: 18,
+      column: 7,
+    });
+    expect(parseWorkspaceFileReference("src/main.ts#L18C7")).toEqual({
+      path: "src/main.ts",
+      line: 18,
+      column: 7,
+    });
+    expect(parseWorkspaceFileReference("App.tsx:18,")).toEqual({
+      path: "App.tsx",
+      line: 18,
+      column: null,
+    });
+    expect(parseWorkspaceFileReference("C:\\repo\\main.ts:42,")).toEqual({
+      path: "C:\\repo\\main.ts",
+      line: 42,
+      column: null,
+    });
+  });
+
+  it("does not reinterpret external URLs or ordinary paths without a location", () => {
+    expect(parseWorkspaceFileReference("https://example.com/report.ts:18")).toEqual({
+      path: "https://example.com/report.ts:18",
+      line: null,
+      column: null,
+    });
+    expect(parseWorkspaceFileReference("reports/archive,2026.csv")).toEqual({
+      path: "reports/archive,2026.csv",
+      line: null,
+      column: null,
+    });
   });
 });
 

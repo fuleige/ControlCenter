@@ -119,6 +119,8 @@ $$
 
 [打开本地报告](/home/ubuntu/documents/report.md) · [打开脚本](/home/ubuntu/documents/task.py) · [访问外部文档](https://example.com/docs)
 
+定位引用：/home/ubuntu/documents/task.py:2, 以及 ${"`"}/home/ubuntu/documents/task.py:3,${"`"}。
+
 ${"补充说明：流式内容到达时保持在底部；用户主动向上阅读后停止自动跟随。\n\n".repeat(14)}`;
 
 const longConversationHistory = Array.from({ length: 160 }, (_, index) => {
@@ -204,6 +206,14 @@ async function mockControlCenter(page: Page, options: {
     } else if (url.pathname === `/api/conversations/${conversation.id}/workspace-files`) {
       const request = route.request().postDataJSON() as { path?: string; baseFileId?: string; recordHistory?: boolean };
       workspaceFileRequests.push(request);
+      if (request.path === "missing.md") {
+        await route.fulfill({ status: 404, json: { error: "文件不存在", code: "not_found" } });
+        return;
+      }
+      if (request.path === "huge.bin") {
+        await route.fulfill({ status: 413, json: { error: "文件超过 8388608 字节的预览限制", code: "too_large" } });
+        return;
+      }
       const tsv = request.path === "data.tsv";
       const script = request.path === "/home/ubuntu/documents/task.py";
       const image = request.path === "preview.png";
@@ -243,6 +253,9 @@ async function mockControlCenter(page: Page, options: {
           lastOpenedAt: openedAt,
         };
         workspaceFileHistory = [history, ...workspaceFileHistory.filter((file) => file.path !== fileInfo.path)];
+        await page.evaluate((conversationId) => {
+          window.dispatchEvent(new CustomEvent("controller-center:workspace-file-history", { detail: { conversationId } }));
+        }, conversation.id);
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
       await route.fulfill({ status: 201, json: { file: {
@@ -333,7 +346,7 @@ async function mockControlCenter(page: Page, options: {
         contentUrl: "/api/workspace-files/workspace-file-details/content",
       } } });
     } else if (url.pathname === "/api/workspace-files/workspace-file-markdown/content") {
-      await route.fulfill({ status: 200, contentType: "text/markdown; charset=utf-8", body: "# Agent 报告\n\n这是一份由当前 Agent 生成的示例文档，用于确认文件预览页面的阅读体验。\n\n[跳到本次处理](#本次处理)\n\n## 本次处理\n\n- 文件内容已从 Agent 工作目录安全读取\n- Markdown 保持原有结构和链接能力\n- 较窄内容在页面中居中展示\n\n<details open><summary>安全原生 HTML</summary>白名单内容可见</details><script data-unsafe-script>document.body.dataset.unsafe='true'</script>\n\n![Agent 生成的预览图](preview.png)\n\n![外部图片](https://images.example.test/external.png)\n\n```mermaid\ngraph LR\n  Agent --> Preview\n```\n\n> 文件为只读临时预览，重新打开时会读取最新内容。\n\n[打开相对表格](data.tsv)" });
+      await route.fulfill({ status: 200, contentType: "text/markdown; charset=utf-8", body: "# Agent 报告\n\n这是一份由当前 Agent 生成的示例文档，用于确认文件预览页面的阅读体验。\n\n[跳到本次处理](#本次处理)\n\n## 本次处理\n\n- 文件内容已从 Agent 工作目录安全读取\n- Markdown 保持原有结构和链接能力\n- 较窄内容在页面中居中展示\n\n- [x] 已完成的待办事项\n- [ ] 尚未完成的待办事项\n\n<details open><summary>安全原生 HTML</summary>白名单内容可见</details><script data-unsafe-script>document.body.dataset.unsafe='true'</script>\n\n![Agent 生成的预览图](preview.png)\n\n![外部图片](https://images.example.test/external.png)\n\n```mermaid\ngraph LR\n  Agent --> Preview\n```\n\n> 文件为只读临时预览，重新打开时会读取最新内容。\n\n[打开相对表格](data.tsv)\n\n[打开不存在文件](missing.md)\n\n[打开过大文件](huge.bin)" });
     } else if (url.pathname === "/api/workspace-files/workspace-file-tsv/content") {
       await route.fulfill({ status: 200, contentType: "text/tab-separated-values; charset=utf-8", body: "名称\t数值\nalpha\t1\nbeta\t2" });
     } else if (url.pathname === "/api/workspace-files/workspace-file-script/content") {
@@ -457,7 +470,7 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   const popupPromise = page.waitForEvent("popup");
   await page.getByRole("link", { name: "打开本地报告" }).click();
   const preview = await popupPromise;
-  await expect(preview).toHaveURL(/\/workspace-files\/opening$/u);
+  await expect(preview).toHaveURL(/\/workspace-files\/opening\?/u);
   await expect(preview.getByRole("status")).toContainText("正在读取文件");
   await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
   await expect(preview.getByRole("heading", { name: "report.md" })).toBeVisible();
@@ -469,6 +482,12 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   await expect(preview.getByLabel("文件信息")).toContainText("Markdown");
   await expect(preview.getByText("安全原生 HTML")).toBeVisible();
   await expect(preview.locator("script[data-unsafe-script]")).toHaveCount(0);
+  const taskCheckboxes = preview.locator(".markdown-content .task-list-item input[type=checkbox]");
+  await expect(taskCheckboxes).toHaveCount(2);
+  await expect(taskCheckboxes.first()).toBeChecked();
+  await expect(taskCheckboxes.first()).toHaveCSS("width", "15px");
+  await expect(taskCheckboxes.first()).toHaveCSS("height", "15px");
+  await expect(preview.locator(".markdown-content .task-list-item").first()).toHaveCSS("list-style-type", "none");
   await expect(preview.getByRole("img", { name: "Agent 生成的预览图" })).toBeVisible();
   await expect(preview.getByRole("img", { name: "外部图片" })).toBeVisible();
   await expect(preview.locator(".mermaid-diagram svg")).toBeVisible();
@@ -544,6 +563,40 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   await nestedPreview.screenshot({ path: "/tmp/controller-center-file-preview-tsv.png", fullPage: true });
   expect(workspaceFileRequests.findLast((request) => request.path === "data.tsv")).toEqual({ path: "data.tsv", baseFileId: "workspace-file-markdown" });
   await nestedPreview.close();
+  await expect(preview.locator(".workspace-file-content")).toHaveClass(/workspace-file-content-document/u);
+
+  const missingPopupPromise = preview.waitForEvent("popup");
+  await preview.getByRole("link", { name: "打开不存在文件" }).click();
+  const missingPreview = await missingPopupPromise;
+  await expect(missingPreview.getByRole("heading", { name: "文件不存在" })).toBeVisible();
+  await expect(missingPreview.getByRole("alert")).toContainText("missing.md");
+  await expect(missingPreview.locator(".workspace-file-failure-path")).toHaveText("missing.md");
+  await expect(preview.locator(".workspace-file-content")).toHaveClass(/workspace-file-content-document/u);
+  await expect(preview.locator(".workspace-file-error")).toHaveCount(0);
+  await missingPreview.close();
+
+  const oversizedPopupPromise = preview.waitForEvent("popup");
+  await preview.getByRole("link", { name: "打开过大文件" }).click();
+  const oversizedPreview = await oversizedPopupPromise;
+  await expect(oversizedPreview.getByRole("heading", { name: "文件过大" })).toBeVisible();
+  await expect(oversizedPreview.getByRole("alert")).toContainText("huge.bin");
+  await expect(oversizedPreview.getByRole("alert")).toContainText("8 MB");
+  await expect(preview.locator(".workspace-file-content")).toHaveClass(/workspace-file-content-document/u);
+  await oversizedPreview.close();
+
+  const locationReference = page.getByRole("link", { name: "/home/ubuntu/documents/task.py:2" });
+  await expect(locationReference).toBeVisible();
+  await expect(page.getByRole("link", { name: "/home/ubuntu/documents/task.py:3," })).toHaveClass(/local-file-reference/u);
+  const locatedPopupPromise = page.waitForEvent("popup");
+  await locationReference.click();
+  const locatedPreview = await locatedPopupPromise;
+  await expect.poll(() => workspaceFileRequests.at(-1)).toEqual({ path: "/home/ubuntu/documents/task.py" });
+  await expect(locatedPreview).toHaveURL(/\/workspace-files\/workspace-file-script\?line=2$/u);
+  await expect(locatedPreview.locator(".workspace-file-location")).toContainText("第 2 行");
+  await expect(locatedPreview.locator("#workspace-source-line-2")).toHaveText("2");
+  await expect(locatedPreview.locator("#workspace-source-line-2")).toHaveCSS("animation-name", "workspace-source-target-flash");
+  expect(workspaceFileRequests.findLast((request) => request.path === "/home/ubuntu/documents/task.py")).toEqual({ path: "/home/ubuntu/documents/task.py" });
+  await locatedPreview.close();
 
   const scriptPopupPromise = page.waitForEvent("popup");
   await page.getByRole("link", { name: "打开脚本" }).click();
@@ -582,9 +635,10 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
 test("HTML 文件使用全屏隔离网页并加载本地样式脚本图片", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "HTML 网页预览行为在桌面项目验证一次");
   const { workspaceFileRequests } = await mockControlCenter(page);
-  await page.goto("/workspace-files/workspace-file-html");
+  await page.goto("/workspace-files/workspace-file-html?line=2");
 
   await expect(page.locator(".workspace-file-viewer-html")).toBeVisible();
+  await expect(page.locator(".workspace-file-content-source")).toHaveCount(0);
   await expect(page.locator(".workspace-file-brand")).toContainText("interactive.html");
   await expect(page.locator(".workspace-file-html")).toHaveAttribute("sandbox", /allow-scripts/u);
   await expect(page.locator(".workspace-file-html")).not.toHaveAttribute("sandbox", /allow-same-origin/u);
@@ -627,6 +681,20 @@ test("HTML 文件使用全屏隔离网页并加载本地样式脚本图片", asy
     baseFileId: "workspace-file-html",
   });
   await detailsPreview.close();
+});
+
+test("Markdown 行号引用保持渲染视图并定位对应内容块", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Markdown 行定位行为在桌面项目验证一次");
+  await mockControlCenter(page);
+  await page.goto("/workspace-files/workspace-file-markdown?line=7");
+
+  await expect(page.locator(".workspace-file-content-document")).toBeVisible();
+  await expect(page.locator(".workspace-file-content-source")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Agent 报告" })).toBeVisible();
+  const target = page.locator('[id$="workspace-markdown-source-target"]');
+  await expect(target).toHaveCount(1);
+  await expect(target).toContainText("本次处理");
+  await expect(target).toHaveCSS("animation-name", "workspace-source-target-flash");
 });
 
 test("SVG 文件以图片上下文预览且不执行内嵌脚本", async ({ page }, testInfo) => {

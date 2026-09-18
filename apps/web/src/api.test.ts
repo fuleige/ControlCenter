@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, formatErrorMessage, isWorkspaceConcurrencyConflict, listNodes, openWorkspaceFile } from "./api";
+import { ApiError, dismissRunError, formatErrorMessage, isWorkspaceConcurrencyConflict, listNodes, openWorkspaceFile } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -135,5 +135,19 @@ describe("workspace file API", () => {
       baseFileId: "file-markdown",
       recordHistory: false,
     });
+  });
+});
+
+describe("run error API", () => {
+  it("persists dismissal through the run error endpoint", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await dismissRunError("run-restarted");
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/runs/run-restarted/error/dismiss", expect.objectContaining({
+      method: "POST",
+      credentials: "include",
+    }));
   });
 });

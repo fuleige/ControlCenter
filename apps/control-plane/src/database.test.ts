@@ -146,6 +146,7 @@ describe("ControlDatabase", () => {
       recoveryDeadlineAt: null,
       error: null,
       errorCode: null,
+      errorDismissedAt: null,
       createdAt: at,
       startedAt: null,
       finishedAt: null,
@@ -326,6 +327,37 @@ describe("ControlDatabase", () => {
     });
     expect(database.hasActiveRunInWorkspace("node-1", "repo")).toBe(false);
     expect(database.canDispatchQueuedRun("node-1", "conversation-1")).toBe(true);
+
+    database.createRun({
+      id: "run-error",
+      conversationId: "conversation-1",
+      prompt: "Task interrupted by restart",
+      model: null,
+      effort: null,
+      clientRequestId: "run-error-request",
+      remoteTurnId: null,
+      status: "queued",
+      progressPhase: null,
+      progressLabel: null,
+      progressUpdatedAt: null,
+      recoveryDeadlineAt: null,
+      error: null,
+      errorCode: null,
+      errorDismissedAt: null,
+      createdAt: at,
+      startedAt: null,
+      finishedAt: null,
+    });
+    database.failRun("run-error", "节点重启后无法确认原任务状态", at);
+    expect(database.getRun("run-error")?.errorDismissedAt).toBeNull();
+    const dismissedAt = "2026-09-09T10:05:00.000Z";
+    expect(database.dismissRunError("run-error", dismissedAt)).toBe(true);
+    expect(database.getRun("run-error")).toMatchObject({
+      status: "failed",
+      error: "节点重启后无法确认原任务状态",
+      errorDismissedAt: dismissedAt,
+    });
+
     expect(database.deleteConversation("conversation-1")).toBe(true);
     expect(database.getConversation("conversation-1")).toBeNull();
     expect(database.listConversationOpenedFiles("conversation-1")).toEqual([]);

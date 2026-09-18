@@ -525,6 +525,10 @@ export async function markAllNotificationsRead(): Promise<void> {
   await api<void>("/api/notifications/read-all", { method: "POST" });
 }
 
+export async function dismissRunError(runId: string): Promise<void> {
+  await api<void>(`/api/runs/${runId}/error/dismiss`, { method: "POST" });
+}
+
 export async function retryRun(runId: string, allowWorkspaceConcurrency = false): Promise<Run> {
   return (await api<{ run: Run }>(`/api/runs/${runId}/retry`, {
     method: "POST",
