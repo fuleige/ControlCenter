@@ -271,7 +271,7 @@ Agent 将 App Server `error` 通知中的 `codexErrorInfo` 映射为稳定的 `e
 ### 7.1 新增表
 
 - `messages(id, conversation_id, run_id, role, content, revision, complete, created_at, updated_at)`
-- `notifications(id, run_id, conversation_id, node_id, kind, status, read_at, created_at)`
+- `notifications(id, run_id, conversation_id, node_id, kind, title, read_at, created_at, attention_at, manual_unread_at)`，`conversation_id` 唯一，同一会话的自动提醒更新原记录；手动未读记录回看意图，不改任务时间。
 - `settings(scope, scope_id, key, value_json, updated_at)`
 - `conversations.compaction_json` 保存最近一次会话级压缩状态；`runs.error_code` 保存稳定错误分类。
 - `attachments(id, conversation_id, message_client_id, name, media_type, size, sha256, status, storage_key, expires_at, created_at)`
@@ -327,7 +327,12 @@ Agent 将 App Server `error` 通知中的 `codexErrorInfo` 映射为稳定的 `e
 - 详细命令与命令输出：不进入中心存储。
 - Command 元数据：最终状态后保留 7 天，用于可靠性去重和诊断。
 - UI cursor events：24 小时或最近 100,000 条。
-- 通知页面最多返回最近 200 条；已读通知保留 30 天，未读通知保留 90 天，数据库优先清理超期和较旧的已读通知。
+- 消息中心每个会话返回一条最新任务概况，按未读和最近提醒/活动时间排序后最多返回 200 个会话；全局与各节点未读数从完整提醒表统计。
+- 已读提醒从最后已读或提醒时间保留 30 天，自动未读从最近提醒时间保留 90 天；手动未读直到被读完或全部已读才解除清理保护。审批解决时也不得删除尚未读取的手动标记。清理产生 SSE 更新，避免页面保留已清理的红点。
+- 升级在事务内合并同一会话的旧通知，保留最新通知元数据和任一旧通知的未读状态，再建立会话唯一索引；不修改会话、消息或任务历史。标记未读和已读操作幂等，实际可见会话在前端和 Control Plane presence 两端约束。
+- 会话分页游标包含置顶、未读、排序时间和 ID。通知引起排序变化时重建当前列表第一页和游标，避免沿用旧排序位置漏掉会话；SSE 刷新窗口合并相关事件，不增加定时请求。
+- 已读/未读写接口返回受影响会话的权威状态与全量未读计数，不执行消息中心完整查询。Web 成功后直接更新会话、节点和消息中心红点；失败时不预先清除。已读事件约 100ms 校准列表，资源级刷新取更早的截止时间，取消被替代的较慢计时器；高频进度仍按原窗口合并，不新增轮询。
+- 写响应、消息中心和会话列表使用持久 UI 事件序号作为快照版本，忽略早于已确认操作的查询。会话局部状态与全局计数分别处理乱序写响应，全部已读保留之后的新未读。序号从 SQLite AUTOINCREMENT 高水位读取，清空过期事件和重启 Control Plane 均不回退。旧 Control Plane 的 204 响应仍可依赖 SSE 同步，支持分组件部署。
 - Control Plane 临时附件：7 天；会话删除时提前清理。
 - Agent 附件缓存：任务结束 24 小时后清理。
 

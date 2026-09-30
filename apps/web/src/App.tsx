@@ -12,6 +12,7 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
@@ -50,6 +51,7 @@ import {
   listPendingApprovals,
   markAllNotificationsRead,
   markConversationRead,
+  markConversationUnread,
   loginAdmin,
   logoutAdmin,
   openWorkspaceFile,
@@ -75,6 +77,7 @@ import type {
   AgentPackageInfo,
   AttachmentRecord,
   Conversation,
+  ConversationAttentionUpdate,
   ConversationCompaction,
   ConversationDetail,
   ConversationOpenedFile,
@@ -90,6 +93,8 @@ import type {
   Workspace,
   WorkspaceFileDescriptor,
 } from "./types";
+import { AttentionStateVersions } from "./attention-state";
+import { RefreshScheduler } from "./refresh-scheduler";
 
 type MobilePane = "nodes" | "conversations" | "chat";
 type JsonRecord = Record<string, unknown>;
@@ -1660,7 +1665,7 @@ function NodePanel({
   onRenamed,
   collapsed,
   onToggleCollapsed,
-  taskEntries,
+  nodeUnreadCounts,
   unreadCount,
   taskCenterActive,
   onOpenSwitcher,
@@ -1673,7 +1678,7 @@ function NodePanel({
   onRenamed: (node: NodeRecord) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
-  taskEntries: TaskCenterEntry[];
+  nodeUnreadCounts: Record<string, number>;
   unreadCount: number;
   taskCenterActive: boolean;
   onOpenSwitcher: () => void;
@@ -1718,18 +1723,19 @@ function NodePanel({
       <div className="pane-heading"><span>节点</span><small>{nodes.filter((node) => node.status === "online").length} 在线</small></div>
       <div className="node-list">
         {nodes.map((node) => {
-          const nodeAttention = taskEntries.filter((entry) => entry.nodeId === node.id && entry.unread).length;
+          const nodeAttention = nodeUnreadCounts[node.id] ?? 0;
           return (
           <div className="node-entry" key={node.id}>
             <div className="node-row">
               <button className={`node-card ${selectedId === node.id ? "selected" : ""}`} onClick={() => onSelect(node)}>
-                <span className={`node-identity ${node.permissionMode === "danger-full-access" ? "full-access" : ""}`} title={`${node.name}${node.permissionMode === "danger-full-access" ? " · 全权限" : ""}`}>{nodeShortLabel(node.name)}{nodeAttention > 0 && <i>{nodeAttention > 9 ? "9+" : nodeAttention}</i>}</span>
+                <span className={`node-identity ${node.permissionMode === "danger-full-access" ? "full-access" : ""}`} title={`${node.name}${node.permissionMode === "danger-full-access" ? " · 全权限" : ""}`}>{nodeShortLabel(node.name)}</span>
                 <span className={`presence ${node.status}`} />
                 <span className="node-main">
                   <span className="node-title"><strong>{node.name}</strong>{node.permissionMode === "danger-full-access" && <em className="node-permission-badge" title="此节点启动时启用了 --yolo，不经过审批或 Codex 沙箱">全权限</em>}</span>
                   <small>{node.platform} · {node.arch}</small>
                 </span>
                 <span className="node-load">{node.activeRuns}/{node.maxConcurrentRuns}</span>
+                {nodeAttention > 0 && <span className="node-unread-badge" aria-label={`${nodeAttention} 个未读会话`}>{nodeAttention > 9 ? "9+" : nodeAttention}</span>}
               </button>
               <button
                 className="row-action"
@@ -1792,6 +1798,7 @@ function ConversationPanel({
   onNew,
   onDelete,
   onUpdate,
+  onMarkUnread,
   onBack,
   collapsed,
   onToggleCollapsed,
@@ -1813,6 +1820,7 @@ function ConversationPanel({
   onNew: () => void;
   onDelete: (conversation: Conversation) => Promise<void>;
   onUpdate: (conversation: Conversation, input: { title?: string; pinned?: boolean }) => Promise<void>;
+  onMarkUnread: (conversation: Conversation) => Promise<void>;
   onBack: () => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
@@ -1830,10 +1838,43 @@ function ConversationPanel({
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [titleDraft, setTitleDraft] = useState("");
+  const [actionMenuId, setActionMenuId] = useState<string | null>(null);
+  const [actionMenuPosition, setActionMenuPosition] = useState({ top: 0, left: 0 });
+  const [markingUnreadId, setMarkingUnreadId] = useState<string | null>(null);
 
   useEffect(() => {
     setError(null);
+    setActionMenuId(null);
   }, [node?.id]);
+
+  useEffect(() => {
+    if (!actionMenuId) return;
+    const closeOnOutside = (event: PointerEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest(".conversation-actions, .conversation-action-menu")) setActionMenuId(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setActionMenuId(null); };
+    const closeMenu = () => setActionMenuId(null);
+    document.addEventListener("pointerdown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("scroll", closeMenu, true);
+    window.addEventListener("resize", closeMenu);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("scroll", closeMenu, true);
+      window.removeEventListener("resize", closeMenu);
+    };
+  }, [actionMenuId]);
+
+  async function markUnread(conversation: Conversation): Promise<void> {
+    if (conversation.id === selectedId || conversation.unread) return;
+    setActionMenuId(null);
+    setMarkingUnreadId(conversation.id);
+    setError(null);
+    try { await onMarkUnread(conversation); }
+    catch (reason) { setError(formatErrorMessage(reason, "标记会话未读")); }
+    finally { setMarkingUnreadId(null); }
+  }
 
   async function remove(conversation: Conversation) {
     if (!window.confirm(`确定删除“${conversation.title}”吗？此操作会同时删除节点上的 Codex 会话。`)) return;
@@ -1913,24 +1954,24 @@ function ConversationPanel({
                 className={`conversation-card ${selectedId === conversation.id ? "selected" : ""}`}
                 onClick={() => onSelect(conversation)}
               >
-                <span className="conversation-title">{conversation.pinnedAt && <i title="已置顶">◆</i>}{conversation.title}</span>
+                <span className="conversation-title">{conversation.unread && <b className="conversation-unread-dot" aria-label="未读会话" />}{conversation.pinnedAt && <i title="已置顶">◆</i>}{conversation.title}</span>
                 <span className="conversation-meta">
                   <StatusBadge status={conversation.latestRunStatus ?? conversation.status} /> {relativeTime(conversation.updatedAt)}
                   {approvalCount > 0 && <span className="approval-pill">{approvalCount} 项审批</span>}
                 </span>
               </button>
               <div className="conversation-actions">
-                <button className={`row-action ${conversation.pinnedAt ? "active" : ""}`} title={conversation.pinnedAt ? "取消置顶" : "置顶"} aria-label={conversation.pinnedAt ? `取消置顶 ${conversation.title}` : `置顶 ${conversation.title}`} onClick={() => void togglePinned(conversation)}><PinIcon /></button>
-                <button className="row-action" title="重命名会话" aria-label={`重命名 ${conversation.title}`} onClick={() => { setEditingId(conversation.id); setTitleDraft(conversation.title); }}><PencilIcon /></button>
-              <button
-                className="row-action danger"
-                disabled={deletingId === conversation.id}
-                title="删除会话"
-                aria-label={`删除 ${conversation.title}`}
-                onClick={() => void remove(conversation)}
-              >
-                {deletingId === conversation.id ? "…" : <TrashIcon />}
-              </button>
+                <button className="row-action" aria-label={`会话操作 ${conversation.title}`} aria-haspopup="menu" aria-expanded={actionMenuId === conversation.id} disabled={markingUnreadId === conversation.id || deletingId === conversation.id} onClick={(event) => {
+                  const bounds = event.currentTarget.getBoundingClientRect();
+                  setActionMenuPosition({ top: Math.max(8, Math.min(bounds.bottom + 3, window.innerHeight - 168)), left: Math.max(8, Math.min(bounds.right - 152, window.innerWidth - 160)) });
+                  setActionMenuId((current) => current === conversation.id ? null : conversation.id);
+                }}>⋯</button>
+                {actionMenuId === conversation.id && createPortal(<div className="conversation-action-menu" style={actionMenuPosition} role="menu" aria-label={`${conversation.title} 的操作`}>
+                  {conversation.id !== selectedId && !conversation.unread && <button role="menuitem" onClick={() => void markUnread(conversation)}><BellIcon />标记未读</button>}
+                  <button role="menuitem" onClick={() => { setActionMenuId(null); void togglePinned(conversation); }}><PinIcon />{conversation.pinnedAt ? "取消置顶" : "置顶"}</button>
+                  <button role="menuitem" onClick={() => { setActionMenuId(null); setEditingId(conversation.id); setTitleDraft(conversation.title); }}><PencilIcon />重命名</button>
+                  <button role="menuitem" className="danger" onClick={() => { setActionMenuId(null); void remove(conversation); }}><TrashIcon />删除会话</button>
+                </div>, document.body)}
               </div>
               </>}
             </div>
@@ -2686,13 +2727,13 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
   const [error, setError] = useState<string | null>(null);
   const [workspaceConflict, setWorkspaceConflict] = useState<{ entry: TaskCenterEntry; detail: string } | null>(null);
   const activeCount = entries.filter((entry) => ["queued", "dispatching", "running", "recovering"].includes(entry.status)).length;
-  const attentionCount = entries.filter((entry) => entry.unread && ["failed", "waiting_approval", "waiting_user"].includes(entry.status)).length;
+  const attentionCount = entries.filter((entry) => ["waiting_approval", "waiting_user"].includes(entry.status)).length;
   const keyword = query.trim().toLocaleLowerCase();
   const visible = entries.filter((entry) => (nodeId === "all" || entry.nodeId === nodeId)
     && (!keyword || `${entry.conversationTitle} ${entry.nodeName}`.toLocaleLowerCase().includes(keyword))
     && (filter === "all"
       || filter === "active" && ["queued", "dispatching", "running", "recovering"].includes(entry.status)
-      || filter === "attention" && ["failed", "waiting_approval", "waiting_user"].includes(entry.status)
+      || filter === "attention" && (entry.unread || ["failed", "waiting_approval", "waiting_user"].includes(entry.status))
       || filter === "completed" && entry.status === "completed"));
 
   async function runAction(key: string, operation: string, action: () => Promise<void>): Promise<void> {
@@ -2724,14 +2765,14 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
   return <main className="task-center-page" aria-label="全局任务中心">
     <header className="task-center-page-header">
       <button type="button" onClick={onBack} aria-label="返回工作台">‹</button>
-      <div><span>跨节点任务调度</span><h1>任务中心</h1><p>从这里查看所有节点的运行进度、未读结果和等待操作。</p></div>
-      <div className="task-center-header-meta">{unreadCount > 0 ? `${unreadCount} 条未读` : "全部已读"}</div>
+      <div><span>跨节点会话概览</span><h1>消息中心</h1><p>每个会话展示一条最新状态，查看运行进度、未读结果和待回看会话。</p></div>
+      <div className="task-center-header-meta">{unreadCount > 0 ? `${unreadCount} 个未读会话` : "全部已读"}</div>
     </header>
     <div className="task-center-page-body">
       <section className="task-center-summary" aria-label="任务概览">
         <div><span>进行中</span><strong>{activeCount}</strong></div>
-        <div><span>需要关注</span><strong>{attentionCount}</strong></div>
-        <div><span>未读消息</span><strong>{unreadCount}</strong></div>
+        <div><span>等待操作</span><strong>{attentionCount}</strong></div>
+        <div><span>未读会话</span><strong>{unreadCount}</strong></div>
       </section>
       <section className="task-center-content">
         <div className="task-center-tools">
@@ -2753,21 +2794,23 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
             <span className="task-center-main">
               <strong>{entry.conversationTitle}</strong>
               <span className="task-reply-preview">{entry.replyPreview ? `Codex：${entry.replyPreview}` : entry.progressLabel ?? statusText[entry.status] ?? entry.status}</span>
-              <small>{entry.nodeName} · {entry.progressLabel ?? statusText[entry.status] ?? entry.status}</small>
+              <small>{entry.nodeName} · {entry.manualUnread ? "待回看 · " : ""}{entry.progressLabel ?? statusText[entry.status] ?? entry.status}</small>
             </span>
-            <span className="task-center-side"><StatusBadge status={entry.status} /><time>{relativeTime(entry.occurredAt)}</time></span>
+            <span className="task-center-side"><StatusBadge status={entry.status} /><time title={`${entry.runId ? "任务时间" : "会话活动时间"}：${new Date(entry.occurredAt).toLocaleString()}`}>{entry.manualUnread ? "标记于 " : ""}{relativeTime(entry.manualUnreadAt ?? entry.occurredAt)}</time></span>
           </button>
-          {entry.runId && ["failed", "interrupted"].includes(entry.status) && <button
-            type="button"
-            className="task-retry"
-            disabled={busyAction !== null}
-            onClick={() => void requestRetry(entry)}
-          >{busyAction === `retry:${entry.id}` ? "正在重试…" : "重新执行"}</button>}
+          {entry.runId && ["failed", "interrupted"].includes(entry.status) && <div className="task-center-actions">
+            {entry.runId && ["failed", "interrupted"].includes(entry.status) && <button
+              type="button"
+              className="task-retry"
+              disabled={busyAction !== null}
+              onClick={() => void requestRetry(entry)}
+            >{busyAction === `retry:${entry.id}` ? "正在重试…" : "重新执行"}</button>}
+          </div>}
         </div>)}
         {visible.length === 0 && <div className="empty"><strong>这里暂时没有任务</strong><span>运行中的任务和需要你关注的结果会显示在这里。</span></div>}
         </div>
         <footer className="task-center-policy">
-          最多展示最近 {policy.limit} 条；回复摘要最多 {policy.replyPreviewCharacters} 个字符。已读通知保留 {policy.readRetentionDays} 天，未读通知保留 {policy.unreadRetentionDays} 天。清理通知不会删除会话历史。
+          每个会话展示一条，未读优先，最多 {policy.limit} 个会话；摘要最多 {policy.replyPreviewCharacters} 个字符。已读提醒保留 {policy.readRetentionDays} 天，自动未读保留 {policy.unreadRetentionDays} 天；手动标记保留至已读。会话历史保留。
         </footer>
       </section>
     </div>
@@ -3763,6 +3806,17 @@ function ChatPanel({
   );
 }
 
+function visibleConversationId(context: {
+  selectedConversationId: string | null;
+  primaryView: "workspace" | "tasks";
+  overlay: "settings" | "switcher" | null;
+  mobilePane: MobilePane;
+}): string | null {
+  if (document.visibilityState !== "visible" || context.primaryView !== "workspace" || context.overlay !== null) return null;
+  if (window.innerWidth <= 840 && context.mobilePane !== "chat") return null;
+  return context.selectedConversationId;
+}
+
 function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }) {
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -3777,6 +3831,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const [settings, setSettings] = useState<GlobalSettings>({ defaultModel: null, defaultEffort: null });
   const [taskEntries, setTaskEntries] = useState<TaskCenterEntry[]>([]);
   const [unreadTaskCount, setUnreadTaskCount] = useState(0);
+  const [nodeUnreadCounts, setNodeUnreadCounts] = useState<Record<string, number>>({});
   const [taskPolicy, setTaskPolicy] = useState<TaskCenterPolicy>({ limit: 200, replyPreviewCharacters: 120, readRetentionDays: 30, unreadRetentionDays: 90 });
   const [quickConversations, setQuickConversations] = useState<Conversation[]>([]);
   const [quickLoading, setQuickLoading] = useState(false);
@@ -3812,8 +3867,11 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const conversationDetailAppliedRef = useRef(0);
   const taskCenterRequestRef = useRef(0);
   const taskCenterAppliedRef = useRef(0);
+  const attentionVersionsRef = useRef(new AttentionStateVersions());
+  const pendingReadsRef = useRef(new Map<string, { promise: Promise<void>; minimumRevision: number }>());
   const detailRef = useRef<ConversationDetail | null>(null);
   const viewingHistoricalMessagesRef = useRef(false);
+  const lastVisibleConversationIdRef = useRef<string | null>(null);
   const presenceContextRef = useRef({
     selectedConversationId,
     primaryView,
@@ -3958,7 +4016,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       if (selectedNodeIdRef.current === requestedNodeId
         && conversationSearchRef.current === requestedQuery
         && conversationFilterRef.current === requestedFilter
-        && requestRevision > conversationListAppliedRef.current) {
+        && requestRevision > conversationListAppliedRef.current
+        && attentionVersionsRef.current.acceptSnapshot("conversations", result.revision)) {
         conversationListAppliedRef.current = requestRevision;
         if (mode === "append") {
           setConversations((current) => {
@@ -4102,10 +4161,14 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     const requestRevision = ++taskCenterRequestRef.current;
     try {
       const result = await getTaskCenter();
-      if (requestRevision > taskCenterAppliedRef.current) {
+      if (requestRevision > taskCenterAppliedRef.current
+        && attentionVersionsRef.current.acceptSnapshot("tasks", result.revision)) {
         taskCenterAppliedRef.current = requestRevision;
         setTaskEntries(result.entries);
-        setUnreadTaskCount(result.unreadCount);
+        if (attentionVersionsRef.current.acceptCounts(result.revision)) {
+          setUnreadTaskCount(result.unreadCount);
+          setNodeUnreadCounts(result.nodeUnreadCounts);
+        }
         setTaskPolicy(result.policy);
         clearBackgroundIssue("tasks");
       }
@@ -4116,6 +4179,40 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     }
   }, [clearBackgroundIssue, reportBackgroundIssue]);
 
+  const applyAttentionUpdate = useCallback((update: ConversationAttentionUpdate | null) => {
+    if (!update) return; // Older Control Plane releases return 204; SSE remains the fallback.
+    const versions = attentionVersionsRef.current;
+    versions.record(update);
+    if (versions.acceptCounts(update.revision)) {
+      setUnreadTaskCount(update.unreadCount);
+      setNodeUnreadCounts(update.nodeUnreadCounts);
+    }
+    setConversations((current) => versions.patchConversations(current));
+    setTaskEntries((current) => versions.patchTasks(current));
+  }, []);
+
+  const readConversation = useCallback((conversationId: string, minimumRevision = 0): Promise<void> => {
+    const pending = pendingReadsRef.current.get(conversationId);
+    if (pending) {
+      pending.minimumRevision = Math.max(pending.minimumRevision, minimumRevision);
+      return pending.promise;
+    }
+    const state = { promise: Promise.resolve(), minimumRevision };
+    const send = async () => {
+      let result: ConversationAttentionUpdate | null;
+      do {
+        result = await markConversationRead(conversationId);
+        applyAttentionUpdate(result);
+        // A new reminder may arrive after the server processed a still-pending
+        // read. Only that newer event requires another read request.
+      } while (result && result.revision < state.minimumRevision);
+    };
+    state.promise = send()
+      .finally(() => pendingReadsRef.current.delete(conversationId));
+    pendingReadsRef.current.set(conversationId, state);
+    return state.promise;
+  }, [applyAttentionUpdate]);
+
   const refreshAll = useCallback(() => {
     void refreshNodes();
     void refreshConversations();
@@ -4123,6 +4220,10 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     void refreshApprovals();
     void refreshTasks();
   }, [refreshNodes, refreshConversations, refreshDetail, refreshApprovals, refreshTasks]);
+
+  useEffect(() => {
+    if (primaryView === "tasks") void refreshTasks();
+  }, [primaryView, refreshTasks]);
 
   const searchQuickConversations = useCallback(async (query: string) => {
     const requestRevision = ++quickSearchRequestRef.current;
@@ -4233,7 +4334,6 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       return;
     }
     void refreshDetail();
-    void markConversationRead(selectedConversationId).then(refreshTasks).catch(() => undefined);
   }, [selectedConversationId, refreshDetail]);
 
   useEffect(() => {
@@ -4242,10 +4342,11 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     const report = (force = false) => {
       const context = presenceContextRef.current;
       const pageIsVisible = document.visibilityState === "visible";
-      const chatIsVisible = context.primaryView === "workspace"
-        && context.overlay === null
-        && (window.innerWidth > 840 || context.mobilePane === "chat");
-      const conversationId = pageIsVisible && chatIsVisible ? context.selectedConversationId : null;
+      const conversationId = visibleConversationId(context);
+      if (conversationId !== lastVisibleConversationIdRef.current) {
+        lastVisibleConversationIdRef.current = conversationId;
+        if (conversationId) void readConversation(conversationId).catch(() => undefined);
+      }
       const signature = `${conversationId ?? ""}:${pageIsVisible}`;
       if (!force && signature === lastPresence) return;
       lastPresence = signature;
@@ -4272,7 +4373,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       window.removeEventListener("resize", onResize);
       void updatePresence(browserSessionId, presenceContextRef.current.selectedConversationId, false).catch(() => undefined);
     };
-  }, [browserSessionId]);
+  }, [browserSessionId, readConversation]);
 
   useEffect(() => {
     presenceReporterRef.current(false);
@@ -4281,15 +4382,16 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   useEffect(() => {
     const storedRevision = Number(storedValue(streamRevisionStorageKey) ?? 0);
     const source = new EventSource(streamUrl(Number.isSafeInteger(storedRevision) ? storedRevision : 0), { withCredentials: true });
-    const refreshTimers = new Map<string, number>();
+    const refreshScheduler = new RefreshScheduler();
     let hasBeenReady = false;
+    let conversationOrderChanged = false;
+    const refreshConversationList = () => {
+      const mode = conversationOrderChanged ? "replace" : "refresh";
+      conversationOrderChanged = false;
+      void refreshConversations({ mode });
+    };
     const schedule = (key: string, callback: () => void, delay: number) => {
-      if (refreshTimers.has(key)) return;
-      const timer = window.setTimeout(() => {
-        refreshTimers.delete(key);
-        callback();
-      }, delay);
-      refreshTimers.set(key, timer);
+      refreshScheduler.schedule(key, callback, delay);
     };
     source.addEventListener("ready", () => {
       setStreamConnected(true);
@@ -4321,21 +4423,34 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         } else if (data.type.startsWith("workspace.")) {
           schedule("nodes", () => void refreshNodes(), 400);
         } else if (data.type.startsWith("conversation.")) {
-          schedule("conversations", () => void refreshConversations(), 400);
+          schedule("conversations", refreshConversationList, 400);
+          if (data.type === "conversation.updated" || data.type === "conversation.deleted") schedule("tasks", () => void refreshTasks(), 400);
           if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 400);
         } else if (data.type.startsWith("usage.")) {
           if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 400);
         } else if (data.type.startsWith("message.")) {
           if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 500);
-          schedule("conversations", () => void refreshConversations(), 1_500);
+          schedule("conversations", refreshConversationList, 1_500);
         } else if (data.type.startsWith("run.") || data.type === "agent.error") {
+          if (data.type !== "run.progress" || presenceContextRef.current.primaryView === "tasks") {
+            schedule("tasks", () => void refreshTasks(), data.type === "run.progress" ? 1_500 : 500);
+          }
           if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 500);
-          schedule("conversations", () => void refreshConversations(), 1_000);
+          schedule("conversations", refreshConversationList, 1_000);
         } else if (data.type.startsWith("approval.")) {
+          schedule("tasks", () => void refreshTasks(), 300);
+          schedule("conversations", refreshConversationList, 300);
           schedule("approvals", () => void refreshApprovals(), 300);
           if (selectedConversationAffected) schedule("detail", () => void refreshDetail(), 500);
         } else if (data.type.startsWith("notification.")) {
-          schedule("tasks", () => void refreshTasks(), 300);
+          const delay = data.type === "notification.updated" ? 100 : 300;
+          schedule("tasks", () => void refreshTasks(), delay);
+          conversationOrderChanged = true;
+          schedule("conversations", refreshConversationList, delay);
+          if ((data.type === "notification.created" || data.type === "notification.unread") && conversationId
+            && conversationId === visibleConversationId(presenceContextRef.current)) {
+            void readConversation(conversationId, data.revision ?? 0).catch(() => undefined);
+          }
         } else if (data.type.startsWith("settings.")) {
           schedule("settings", () => void refreshSettings(), 300);
         } else if (data.type.startsWith("enrollment.")) {
@@ -4348,10 +4463,10 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
       }
     });
     return () => {
-      for (const timer of refreshTimers.values()) window.clearTimeout(timer);
+      refreshScheduler.cancelAll();
       source.close();
     };
-  }, [refreshAll, refreshApprovals, refreshConversations, refreshDetail, refreshNodes, refreshSettings, refreshTasks]);
+  }, [readConversation, refreshAll, refreshApprovals, refreshConversations, refreshDetail, refreshNodes, refreshSettings, refreshTasks]);
 
   function beginNewConversation() {
     commitSelectedConversation(null);
@@ -4462,7 +4577,6 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
     setMobilePane("chat");
     setPrimaryView("workspace");
     void refreshDetail();
-    void markConversationRead(entry.conversationId).then(refreshTasks).catch(() => undefined);
   }
 
   const onlineNodeCount = nodes.filter((node) => node.status === "online").length;
@@ -4482,7 +4596,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           onRenamed={(updated) => setNodes((current) => current.map((node) => node.id === updated.id ? updated : node))}
           collapsed={nodesCollapsed}
           onToggleCollapsed={() => setNodesCollapsed((current) => !current)}
-          taskEntries={taskEntries}
+          nodeUnreadCounts={nodeUnreadCounts}
           unreadCount={unreadTaskCount}
           taskCenterActive={primaryView === "tasks"}
           onOpenSwitcher={openQuickSwitcher}
@@ -4498,6 +4612,10 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
           onNew={beginNewConversation}
           onDelete={removeConversation}
           onUpdate={changeConversation}
+          onMarkUnread={async (conversation) => {
+            if (conversation.id === selectedConversationIdRef.current) return;
+            applyAttentionUpdate(await markConversationUnread(conversation.id));
+          }}
           onBack={() => setMobilePane("nodes")}
           collapsed={historyCollapsed}
           onToggleCollapsed={() => setHistoryCollapsed((current) => !current)}
@@ -4525,7 +4643,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
             policy={taskPolicy}
             onBack={() => setPrimaryView("workspace")}
             onOpen={openTask}
-            onMarkAllRead={async () => { await markAllNotificationsRead(); await refreshTasks(); }}
+            onMarkAllRead={async () => { applyAttentionUpdate(await markAllNotificationsRead()); }}
             onRetry={async (entry, allowWorkspaceConcurrency) => {
               if (!entry.runId) return;
               await retryRun(entry.runId, allowWorkspaceConcurrency);

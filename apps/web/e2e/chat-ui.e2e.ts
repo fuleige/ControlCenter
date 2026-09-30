@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
 
+const webVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version as string;
 const now = "2026-09-10T00:00:00.000Z";
 const node = {
   id: "qa-node",
@@ -435,6 +437,7 @@ async function mockControlCenter(page: Page, options: {
       await route.fulfill({ json: {
         data: [{
           id: "notification-1",
+          notificationId: "notification-1",
           nodeId: node.id,
           nodeName: node.name,
           conversationId: conversation.id,
@@ -447,6 +450,7 @@ async function mockControlCenter(page: Page, options: {
           occurredAt: now,
         }],
         unreadCount: 1,
+        nodeUnreadCounts: { [node.id]: 1 },
         policy: { limit: 200, replyPreviewCharacters: 120, readRetentionDays: 30, unreadRetentionDays: 90 },
       } });
     } else if (url.pathname === "/api/ui/presence") {
@@ -458,6 +462,306 @@ async function mockControlCenter(page: Page, options: {
   });
   return { presenceReports, quickSearchRequests, compactRequests, workspaceFileRequests };
 }
+
+async function mockUiStream(page: Page) {
+  await page.addInitScript(() => {
+    const streams = new Set<EventTarget>();
+    class MockEventSource extends EventTarget {
+      constructor() {
+        super();
+        streams.add(this);
+        queueMicrotask(() => this.dispatchEvent(new Event("ready")));
+      }
+      close() { streams.delete(this); }
+    }
+    Object.defineProperty(window, "EventSource", { value: MockEventSource });
+    Object.assign(window, {
+      emitUiUpdate: (event: unknown) => {
+        for (const stream of streams) stream.dispatchEvent(new MessageEvent("update", { data: JSON.stringify(event) }));
+      },
+    });
+  });
+  let revision = 1;
+  return async (type: string, resourceId: string, conversationId: string | null = conversation.id) => {
+    await page.evaluate((event) => {
+      (window as Window & { emitUiUpdate: (event: unknown) => void }).emitUiUpdate(event);
+    }, { type, revision: revision++, resourceId, conversationId });
+  };
+}
+
+test("节点未读徽标在展开和收起侧边栏时都可见", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "侧边栏折叠仅在桌面验证");
+  const emitUpdate = await mockUiStream(page);
+  await mockControlCenter(page, { unopenedNode: true });
+  let unreadCount = 12;
+  await page.route("**/api/task-center", async (route) => {
+    await route.fulfill({ json: { data: [], unreadCount, nodeUnreadCounts: unreadCount ? { [node.id]: unreadCount } : {} } });
+  });
+  await page.goto("/");
+  const badge = page.locator(".node-unread-badge");
+  await expect(badge).toBeVisible();
+  await expect(badge).toHaveText("9+");
+  await expect(badge).toHaveAttribute("aria-label", "12 个未读会话");
+  await page.getByRole("button", { name: "折叠节点栏" }).click();
+  await expect(badge).toBeVisible();
+  await page.getByRole("button", { name: "展开节点栏" }).click();
+  await expect(badge).toBeVisible();
+  unreadCount = 0;
+  await emitUpdate("notification.updated", "all", null);
+  await expect(badge).toHaveCount(0);
+});
+
+test("当前会话通知自动已读且节点运行数随事件更新", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "通知和节点事件在桌面项目验证一次");
+  const emitUpdate = await mockUiStream(page);
+  await mockControlCenter(page);
+  let activeRuns = 0;
+  let unread = false;
+  let readRequests = 0;
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [{ ...node, activeRuns }] } });
+  });
+  await page.route("**/api/task-center", async (route) => {
+    await route.fulfill({ json: {
+      data: [{
+        id: "notification-1", notificationId: "notification-1", nodeId: node.id, nodeName: node.name,
+        conversationId: conversation.id, conversationTitle: conversation.title,
+        runId: run.id, status: "completed", progressLabel: "任务已完成",
+        replyPreview: "已完成", unread, occurredAt: now,
+      }],
+      unreadCount: unread ? 1 : 0,
+      nodeUnreadCounts: unread ? { [node.id]: 1 } : {},
+    } });
+  });
+  await page.route(`**/api/conversations/${conversation.id}/read`, async (route) => {
+    readRequests += 1;
+    const changed = unread;
+    unread = false;
+    await route.fulfill({ status: 204 });
+    if (changed) await emitUpdate("notification.updated", "notification-1");
+  });
+
+  await page.goto("/");
+  await expect(page.locator(".node-load")).toHaveText("0/3");
+  activeRuns = 1;
+  await emitUpdate("node.updated", node.id);
+  await expect(page.locator(".node-load")).toHaveText("1/3");
+  await page.locator(".conversation-card").click();
+  await expect.poll(() => readRequests).toBe(1);
+  unread = true;
+  await emitUpdate("notification.created", "notification-1");
+  await expect.poll(() => readRequests).toBe(2);
+  await expect(page.locator(".node-unread-badge")).toHaveCount(0);
+
+  await page.locator(".node-footer").getByRole("button", { name: /任务中心/ }).click();
+  unread = true;
+  await emitUpdate("notification.created", "notification-1");
+  await expect(page.getByRole("main", { name: "全局任务中心" })).toContainText("1 个未读会话");
+  expect(readRequests).toBe(2);
+  await page.locator(".node-card").click();
+  await expect.poll(() => readRequests).toBe(3);
+  await expect(page.locator(".node-unread-badge")).toHaveCount(0);
+  activeRuns = 0;
+  await emitUpdate("node.updated", node.id);
+  await expect(page.locator(".node-load")).toHaveText("0/3");
+});
+
+test("会话栏标记未读联动红点、前置和消息中心，进入后一起清除", async ({ page }, testInfo) => {
+  test.skip(!["desktop", "mobile", "compact-mobile"].includes(testInfo.project.name), "在桌面和手机验证会话操作");
+  const emitUpdate = await mockUiStream(page);
+  await mockControlCenter(page, { idleConversation: true });
+  const other = { ...conversation, id: "qa-other", title: "等待回看的会话", latestRunStatus: "completed", updatedAt: "2026-09-01T00:00:00.000Z" };
+  let unread = false;
+  let hasReminder = false;
+  let unreadRequests = 0;
+  await page.route("**/api/conversations?**", async (route) => {
+    const entries = [
+      { ...conversation, unread: false, unreadAt: null },
+      { ...other, unread, unreadAt: unread ? now : null },
+    ];
+    await route.fulfill({ json: { data: unread ? entries.reverse() : entries, total: 2, nextCursor: null } });
+  });
+  await page.route("**/api/task-center", async (route) => {
+    await route.fulfill({ json: {
+      data: hasReminder ? [{
+        id: "conversation:qa-other", notificationId: "conversation:qa-other",
+        nodeId: node.id, nodeName: node.name, conversationId: other.id, conversationTitle: other.title,
+        runId: null, status: "completed", progressLabel: "任务已完成", replyPreview: "之前的回复",
+        unread, manualUnread: unread, manualUnreadAt: unread ? now : null, attentionAt: now, occurredAt: other.updatedAt,
+      }] : [],
+      unreadCount: unread ? 1 : 0, nodeUnreadCounts: unread ? { [node.id]: 1 } : {},
+    } });
+  });
+  await page.route("**/api/conversations/qa-other/unread", async (route) => {
+    unreadRequests += 1;
+    const changed = !unread;
+    unread = true;
+    hasReminder = true;
+    await route.fulfill({ json: { changed } });
+    if (changed) await emitUpdate("notification.unread", other.id, other.id);
+  });
+  await page.route("**/api/conversations/qa-other/read", async (route) => {
+    const changed = unread;
+    unread = false;
+    await route.fulfill({ status: 204 });
+    if (changed) await emitUpdate("notification.updated", other.id, other.id);
+  });
+  await page.route(/\/api\/conversations\/qa-other(?:\?.*)?$/, async (route) => {
+    await route.fulfill({ json: { conversation: { ...other, unread, unreadAt: unread ? now : null }, runs: [], messages: [], approvals: [], attachments: [], messagePage: { hasMore: false, before: null } } });
+  });
+  await page.goto("/");
+  await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
+  if (testInfo.project.name !== "desktop") await page.getByRole("button", { name: "打开历史会话" }).click();
+  await page.getByRole("button", { name: `会话操作 ${conversation.title}`, exact: true }).click();
+  await expect(page.getByRole("menuitem", { name: "标记未读" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: `会话操作 ${other.title}`, exact: true }).click();
+  await page.getByRole("menuitem", { name: "标记未读" }).click();
+  const otherRow = page.locator(".conversation-row").filter({ hasText: other.title });
+  await expect(otherRow.locator(".conversation-unread-dot")).toBeVisible();
+  await expect(page.locator(".conversation-card").first()).toContainText(other.title);
+  await expect(page.locator(".node-unread-badge")).toHaveText("1");
+  expect(unreadRequests).toBe(1);
+  await otherRow.locator(".conversation-card").click();
+  await expect(page.locator(".chat-title strong")).toHaveText(other.title);
+  await expect(page.locator(".conversation-unread-dot")).toHaveCount(0);
+  await expect(page.locator(".node-unread-badge")).toHaveCount(0);
+  const openTasks = () => testInfo.project.name === "desktop"
+    ? page.locator(".node-footer").getByRole("button", { name: /任务中心/ })
+    : page.locator(".mobile-toolbar").getByRole("button", { name: "消息中心" });
+  await openTasks().click();
+  await expect(page.locator(".task-center-item")).toHaveCount(1);
+  await expect(page.locator(".task-center-page")).toContainText("全部已读");
+  await expect(page.getByRole("button", { name: "标为未读" })).toHaveCount(0);
+});
+
+test("已读响应立即清除红点且延迟的旧查询不能恢复未读", async ({ page }, testInfo) => {
+  test.skip(!["desktop", "mobile", "compact-mobile"].includes(testInfo.project.name), "在桌面和手机验证已读联动");
+  const emitUpdate = await mockUiStream(page);
+  await mockControlCenter(page, { unopenedNode: true, idleConversation: true });
+  let unread = true;
+  let revision = 10;
+  let delayQueries = false;
+  let pendingQueries = 0;
+  let releaseQueries!: () => void;
+  const barrier = new Promise<void>((resolve) => { releaseQueries = resolve; });
+  await page.route("**/api/conversations?**", async (route) => {
+    const snapshot = { data: [{ ...conversation, unread, unreadAt: unread ? now : null }], total: 1, nextCursor: null, revision };
+    if (delayQueries) { pendingQueries += 1; await barrier; }
+    await route.fulfill({ json: snapshot });
+  });
+  await page.route("**/api/task-center", async (route) => {
+    const snapshot = {
+      data: [{ id: "conversation:qa-conversation", conversationId: conversation.id, conversationTitle: conversation.title,
+        nodeId: node.id, nodeName: node.name, runId: run.id, status: "completed", replyPreview: "已完成",
+        unread, manualUnread: unread, manualUnreadAt: unread ? now : null, attentionAt: now, occurredAt: now }],
+      unreadCount: unread ? 1 : 0, nodeUnreadCounts: unread ? { [node.id]: 1 } : {}, revision,
+    };
+    if (delayQueries) { pendingQueries += 1; await barrier; }
+    await route.fulfill({ json: snapshot });
+  });
+  await page.route(`**/api/conversations/${conversation.id}/read`, async (route) => {
+    unread = false;
+    revision = 11;
+    // Deliberately send no SSE event: the write response alone must clear dots.
+    await route.fulfill({ json: { changed: true, conversationId: conversation.id, unread: false, unreadAt: null,
+      manualUnreadAt: null, unreadCount: 0, nodeUnreadCounts: {}, revision } });
+  });
+  await page.goto("/");
+  await expect(page.locator(".node-unread-badge")).toHaveText("1");
+  await expect(page.locator(".conversation-unread-dot")).toHaveCount(1);
+  delayQueries = true;
+  await emitUpdate("run.updated", run.id);
+  await expect.poll(() => pendingQueries).toBe(2);
+  await page.locator(".conversation-card").click();
+  await expect(page.locator(".node-unread-badge")).toHaveCount(0);
+  await expect(page.locator(".conversation-unread-dot")).toHaveCount(0);
+  const oldTasks = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/task-center");
+  const oldConversations = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/conversations");
+  releaseQueries();
+  await Promise.all([oldTasks, oldConversations]);
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.locator(".node-unread-badge")).toHaveCount(0);
+  await expect(page.locator(".conversation-unread-dot")).toHaveCount(0);
+});
+
+test("当前会话在途已读合并重复提醒并补读之后到达的新提醒", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "在途已读竞态在桌面验证一次");
+  await mockUiStream(page);
+  await mockControlCenter(page, { unopenedNode: true, idleConversation: true });
+  let readRequests = 0;
+  let releaseRead!: () => void;
+  const barrier = new Promise<void>((resolve) => { releaseRead = resolve; });
+  await page.route(`**/api/conversations/${conversation.id}/read`, async (route) => {
+    readRequests += 1;
+    const revision = readRequests === 1 ? 11 : 13;
+    if (readRequests === 1) await barrier;
+    await route.fulfill({ json: { changed: true, conversationId: conversation.id, unread: false, unreadAt: null,
+      manualUnreadAt: null, unreadCount: 0, nodeUnreadCounts: {}, revision } });
+  });
+  await page.goto("/");
+  await page.locator(".conversation-card").click();
+  await expect.poll(() => readRequests).toBe(1);
+  const emitReminder = (revision: number) => page.evaluate((event) => {
+    (window as Window & { emitUiUpdate: (event: unknown) => void }).emitUiUpdate(event);
+  }, { type: "notification.created", revision, resourceId: "reminder", conversationId: conversation.id });
+  await emitReminder(10);
+  expect(readRequests).toBe(1);
+  await emitReminder(12);
+  expect(readRequests).toBe(1);
+  releaseRead();
+  await expect.poll(() => readRequests).toBe(2);
+  await expect(page.locator(".node-unread-badge")).toHaveCount(0);
+});
+
+test("全部已读直接更新列表且已读事件提前合并进度刷新", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "刷新窗口在桌面项目验证一次");
+  const emitUpdate = await mockUiStream(page);
+  await mockControlCenter(page, { unopenedNode: true, idleConversation: true });
+  let unread = true;
+  let revision = 10;
+  let taskQueries = 0;
+  let conversationQueries = 0;
+  await page.route("**/api/conversations?**", async (route) => {
+    conversationQueries += 1;
+    await route.fulfill({ json: { data: [{ ...conversation, unread, unreadAt: unread ? now : null }], total: 1, nextCursor: null, revision } });
+  });
+  await page.route("**/api/task-center", async (route) => {
+    taskQueries += 1;
+    await route.fulfill({ json: {
+      data: [{ id: "conversation:qa-conversation", conversationId: conversation.id, conversationTitle: conversation.title,
+        nodeId: node.id, nodeName: node.name, runId: run.id, status: "completed", replyPreview: "已完成",
+        unread, manualUnread: unread, manualUnreadAt: unread ? now : null, attentionAt: now, occurredAt: now }],
+      unreadCount: unread ? 1 : 0, nodeUnreadCounts: unread ? { [node.id]: 1 } : {}, revision,
+    } });
+  });
+  await page.route("**/api/notifications/read-all", async (route) => {
+    unread = false;
+    revision = 11;
+    await route.fulfill({ json: { changed: true, conversationId: null, unread: false, unreadAt: null,
+      manualUnreadAt: null, unreadCount: 0, nodeUnreadCounts: {}, revision } });
+  });
+  await page.goto("/");
+  await page.locator(".node-footer").getByRole("button", { name: /任务中心/ }).click();
+  await expect(page.locator(".task-center-page")).toContainText("1 个未读会话");
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  const initialTasks = taskQueries;
+  const initialConversations = conversationQueries;
+  await emitUpdate("run.progress", run.id);
+  await page.getByRole("button", { name: "全部标为已读" }).click();
+  await expect(page.locator(".node-unread-badge")).toHaveCount(0);
+  await expect(page.locator(".conversation-unread-dot")).toHaveCount(0);
+  await expect(page.locator(".task-center-page")).toContainText("全部已读");
+  expect(taskQueries).toBe(initialTasks);
+  await emitUpdate("notification.updated", "all", null);
+  await page.clock.runFor(100);
+  await expect.poll(() => taskQueries).toBe(initialTasks + 1);
+  await expect.poll(() => conversationQueries).toBe(initialConversations + 1);
+  await page.clock.runFor(1600);
+  expect(taskQueries).toBe(initialTasks + 1);
+  expect(conversationQueries).toBe(initialConversations + 1);
+});
 
 test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV 预览", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "文件预览行为在桌面项目验证一次");
@@ -956,7 +1260,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
     await expect(mobileToolbar.locator("button").nth(3)).toContainText("设置");
     await expect(mobileToolbar.locator(".node-count")).toHaveCount(0);
   }
-  await expect(page.locator(".settings-version")).toContainText("v0.3.13");
+  await expect(page.locator(".settings-version")).toContainText(`v${webVersion}`);
   await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
   await expect(page.getByRole("region", { name: "工作空间管理" })).toBeVisible();
   await expect(page.locator(".workspace-card")).toContainText("Controller Center");
@@ -973,7 +1277,7 @@ test("长对话可以滚动并正确渲染代码、公式和移动布局", async
   await globalNavigation.getByRole("button", { name: /消息中心|任务中心|全局任务中心/ }).click();
   await expect(page.getByRole("main", { name: "全局任务中心" })).toBeVisible();
   await expect(page.getByText("这是最新回复的摘要，点击后可以直接返回对应会话。")).toBeVisible();
-  await expect(page.getByText("最多展示最近 200 条", { exact: false })).toBeVisible();
+  await expect(page.getByText("未读优先，最多 200 个会话", { exact: false })).toBeVisible();
   await page.getByRole("textbox", { name: "搜索全局任务" }).fill("没有这个任务");
   await expect(page.getByText("这里暂时没有任务")).toBeVisible();
   await page.getByRole("textbox", { name: "搜索全局任务" }).fill("");

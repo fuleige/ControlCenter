@@ -70,6 +70,8 @@ export interface ConversationRecord {
   status: "creating" | "ready" | "error";
   error: string | null;
   pinnedAt: string | null;
+  unread: boolean;
+  unreadAt: string | null;
   latestRunStatus: RunRecord["status"] | null;
   tokenUsage: ConversationTokenUsage | null;
   compaction: ConversationCompaction | null;
@@ -79,6 +81,8 @@ export interface ConversationRecord {
 
 export interface ConversationListCursor {
   pinned: 0 | 1;
+  unread: 0 | 1;
+  sortAt: string;
   updatedAt: string;
   id: string;
 }
@@ -139,10 +143,12 @@ export interface NotificationRecord {
   nodeId: string;
   conversationId: string;
   runId: string | null;
-  kind: "completed" | "failed" | "waiting_user";
+  kind: "completed" | "failed" | "waiting_user" | "manual";
   title: string;
   readAt: string | null;
   createdAt: string;
+  attentionAt: string;
+  manualUnreadAt: string | null;
 }
 
 export interface GlobalSettingsRecord {
@@ -218,15 +224,19 @@ export interface UiEventRecord {
 
 export interface TaskCenterRecord {
   id: string;
+  notificationId: string | null;
   nodeId: string;
   nodeName: string;
   conversationId: string;
   conversationTitle: string;
   runId: string | null;
-  status: RunRecord["status"] | NotificationRecord["kind"];
+  status: RunRecord["status"] | ConversationRecord["status"];
   progressLabel: string | null;
   replyPreview: string | null;
   unread: boolean;
+  manualUnread: boolean;
+  manualUnreadAt: string | null;
+  attentionAt: string;
   occurredAt: string;
 }
 
@@ -499,7 +509,6 @@ export class ControlDatabase {
         read_at TEXT,
         created_at TEXT NOT NULL
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS notifications_run_kind_idx ON notifications(run_id, kind) WHERE run_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS notifications_unread_idx ON notifications(read_at, created_at DESC);
       CREATE TABLE IF NOT EXISTS settings (
         scope TEXT NOT NULL,
@@ -598,6 +607,9 @@ export class ControlDatabase {
     this.ensureColumn("conversations", "pinned_at", "TEXT");
     this.ensureColumn("conversations", "token_usage_json", "TEXT");
     this.ensureColumn("conversations", "compaction_json", "TEXT");
+    this.ensureColumn("notifications", "attention_at", "TEXT");
+    this.ensureColumn("notifications", "manual_unread_at", "TEXT");
+    this.migrateConversationNotifications();
     this.ensureColumn("runs", "client_request_id", "TEXT");
     this.ensureColumn("runs", "progress_phase", "TEXT");
     this.ensureColumn("runs", "progress_label", "TEXT");
@@ -617,6 +629,31 @@ export class ControlDatabase {
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS ui_events_occurred_idx ON ui_events(occurred_at);");
     this.sqlite.prepare("UPDATE workspaces SET created_at = CASE WHEN created_at = '' THEN ? ELSE created_at END, updated_at = CASE WHEN updated_at = '' THEN ? ELSE updated_at END").run(new Date().toISOString(), new Date().toISOString());
     this.migrateLegacyMessages();
+  }
+
+  private migrateConversationNotifications(): void {
+    if (this.sqlite.prepare("SELECT 1 FROM sqlite_master WHERE name = 'notifications_conversation_idx'").get()) return;
+    this.transaction(() => {
+      // Preserve unread from every old task notification while retaining the newest event.
+      this.sqlite.exec(`
+        UPDATE notifications SET
+          attention_at = COALESCE(attention_at, created_at),
+          read_at = CASE WHEN EXISTS (
+            SELECT 1 FROM notifications old
+            WHERE old.conversation_id = notifications.conversation_id AND old.read_at IS NULL
+          ) THEN NULL ELSE read_at END;
+        DELETE FROM notifications WHERE id NOT IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (
+              PARTITION BY conversation_id ORDER BY created_at DESC, id DESC
+            ) AS position FROM notifications
+          ) WHERE position = 1
+        );
+        DROP INDEX IF EXISTS notifications_run_kind_idx;
+        CREATE UNIQUE INDEX notifications_conversation_idx ON notifications(conversation_id);
+        CREATE INDEX IF NOT EXISTS notifications_attention_idx ON notifications(read_at, attention_at DESC);
+      `);
+    });
   }
 
   private migrateLegacyMessages(): void {
@@ -827,10 +864,24 @@ export class ControlDatabase {
     return restarted;
   }
 
-  updateHeartbeat(nodeId: string, activeRuns: number, now: string): void {
+  updateHeartbeat(nodeId: string, activeRuns: number, now: string): boolean {
+    const previous = this.sqlite.prepare("SELECT active_runs FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
     this.sqlite.prepare(
       "UPDATE nodes SET active_runs = ?, status = 'online', last_seen_at = ?, updated_at = ? WHERE id = ?",
     ).run(activeRuns, now, now, nodeId);
+    return previous !== undefined && Number(previous.active_runs) !== activeRuns;
+  }
+
+  syncNodeActiveRuns(nodeId: string): boolean {
+    const row = this.sqlite.prepare(`
+      SELECT n.active_runs,
+        (SELECT COUNT(*) FROM runs r JOIN conversations c ON c.id = r.conversation_id
+         WHERE c.node_id = n.id AND r.status IN ('running', 'waiting_approval')) AS running_count
+      FROM nodes n WHERE n.id = ?
+    `).get(nodeId) as Row | undefined;
+    if (!row || Number(row.active_runs) === Number(row.running_count)) return false;
+    this.sqlite.prepare("UPDATE nodes SET active_runs = ? WHERE id = ?").run(Number(row.running_count), nodeId);
+    return true;
   }
 
   markNodeOffline(nodeId: string, now: string): void {
@@ -1004,7 +1055,7 @@ export class ControlDatabase {
     `).run(nodeId, id).changes > 0;
   }
 
-  createConversation(record: ConversationRecord): void {
+  createConversation(record: Omit<ConversationRecord, "unread" | "unreadAt">): void {
     this.sqlite.prepare(`
       INSERT INTO conversations (
         id, node_id, workspace_id, title, model, effort, client_request_id,
@@ -1030,7 +1081,10 @@ export class ControlDatabase {
   private conversationFromRow(row: Row): ConversationRecord {
     const hasEmbeddedLatestRun = Object.hasOwn(row, "latest_run_status");
     const latestRun = hasEmbeddedLatestRun ? undefined : this.sqlite.prepare(
-      "SELECT status FROM runs WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1",
+      "SELECT status FROM runs WHERE conversation_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    ).get(text(row, "id")) as Row | undefined;
+    const attention = Object.hasOwn(row, "unread") ? row : this.sqlite.prepare(
+      "SELECT 1 AS unread, attention_at AS unread_at FROM notifications WHERE conversation_id = ? AND read_at IS NULL",
     ).get(text(row, "id")) as Row | undefined;
     return {
       id: text(row, "id"),
@@ -1044,6 +1098,8 @@ export class ControlDatabase {
       status: text(row, "status") as ConversationRecord["status"],
       error: nullableText(row, "error"),
       pinnedAt: nullableText(row, "pinned_at"),
+      unread: Number(attention?.unread ?? 0) === 1,
+      unreadAt: attention ? nullableText(attention, "unread_at") : null,
       latestRunStatus: hasEmbeddedLatestRun
         ? nullableText(row, "latest_run_status") as RunRecord["status"] | null
         : latestRun ? text(latestRun, "status") as RunRecord["status"] : null,
@@ -1187,29 +1243,24 @@ export class ControlDatabase {
 
     const pagePredicates = [...predicates];
     const pageParameters = [...baseParameters];
+    const pinnedOrder = "(CASE WHEN c.pinned_at IS NULL THEN 0 ELSE 1 END)";
+    const unreadOrder = "(CASE WHEN x.id IS NOT NULL AND x.read_at IS NULL THEN 1 ELSE 0 END)";
+    const timeOrder = `(CASE WHEN ${unreadOrder} = 1 THEN x.attention_at ELSE c.updated_at END)`;
     if (options.cursor) {
-      pagePredicates.push(`(
-        (CASE WHEN c.pinned_at IS NULL THEN 0 ELSE 1 END) < ?
-        OR ((CASE WHEN c.pinned_at IS NULL THEN 0 ELSE 1 END) = ? AND c.updated_at < ?)
-        OR ((CASE WHEN c.pinned_at IS NULL THEN 0 ELSE 1 END) = ? AND c.updated_at = ? AND c.id < ?)
-      )`);
-      pageParameters.push(
-        options.cursor.pinned,
-        options.cursor.pinned,
-        options.cursor.updatedAt,
-        options.cursor.pinned,
-        options.cursor.updatedAt,
-        options.cursor.id,
-      );
+      pagePredicates.push(`(${pinnedOrder}, ${unreadOrder}, ${timeOrder}, c.id) < (?, ?, ?, ?)`);
+      pageParameters.push(options.cursor.pinned, options.cursor.unread, options.cursor.sortAt, options.cursor.id);
     }
     const pageWhere = pagePredicates.length ? `WHERE ${pagePredicates.join(" AND ")}` : "";
     const rows = this.sqlite.prepare(`
-      SELECT c.*,
+      SELECT c.*, ${unreadOrder} AS unread,
+        CASE WHEN ${unreadOrder} = 1 THEN x.attention_at END AS unread_at,
+        ${timeOrder} AS sort_at,
         (SELECT r.status FROM runs r WHERE r.conversation_id = c.id ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS latest_run_status
       FROM conversations c
       JOIN nodes n ON n.id = c.node_id
+      LEFT JOIN notifications x ON x.conversation_id = c.id
       ${pageWhere}
-      ORDER BY (CASE WHEN c.pinned_at IS NULL THEN 0 ELSE 1 END) DESC, c.updated_at DESC, c.id DESC
+      ORDER BY ${pinnedOrder} DESC, ${unreadOrder} DESC, ${timeOrder} DESC, c.id DESC
       LIMIT ?
     `).all(...pageParameters, options.limit + 1) as Row[];
     const hasMore = rows.length > options.limit;
@@ -1220,6 +1271,8 @@ export class ControlDatabase {
       ...(total === undefined ? {} : { total }),
       nextCursor: hasMore && last ? {
         pinned: nullableText(last, "pinned_at") ? 1 : 0,
+        unread: Number(last.unread) === 1 ? 1 : 0,
+        sortAt: text(last, "sort_at"),
         updatedAt: text(last, "updated_at"),
         id: text(last, "id"),
       } : null,
@@ -1814,7 +1867,10 @@ export class ControlDatabase {
         "UPDATE runs SET status = 'running', progress_phase = 'working', progress_label = '正在继续任务', progress_updated_at = ? WHERE id = ? AND status = 'waiting_approval'",
       ).run(now, approval.runId);
       this.sqlite.prepare(
-        "DELETE FROM notifications WHERE run_id = ? AND kind = 'waiting_user'",
+        "DELETE FROM notifications WHERE run_id = ? AND kind = 'waiting_user' AND manual_unread_at IS NULL",
+      ).run(approval.runId);
+      this.sqlite.prepare(
+        "UPDATE notifications SET kind = 'manual', title = '待回看' WHERE run_id = ? AND kind = 'waiting_user' AND manual_unread_at IS NOT NULL",
       ).run(approval.runId);
     }
   }
@@ -1899,110 +1955,136 @@ export class ControlDatabase {
     }
   }
 
-  createNotification(input: Omit<NotificationRecord, "id" | "readAt"> & { id?: string }): NotificationRecord {
-    const id = input.id ?? `${input.runId ?? input.conversationId}:${input.kind}`;
+  createNotification(input: Omit<NotificationRecord, "id" | "readAt" | "attentionAt" | "manualUnreadAt"> & { id?: string }): NotificationRecord {
+    const id = input.id ?? `conversation:${input.conversationId}`;
     this.sqlite.prepare(`
-      INSERT INTO notifications (id, node_id, conversation_id, run_id, kind, title, read_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-      ON CONFLICT(id) DO UPDATE SET title = excluded.title, read_at = NULL, created_at = excluded.created_at
-    `).run(id, input.nodeId, input.conversationId, input.runId, input.kind, input.title, input.createdAt);
-    return { id, nodeId: input.nodeId, conversationId: input.conversationId, runId: input.runId, kind: input.kind, title: input.title, readAt: null, createdAt: input.createdAt };
+      INSERT INTO notifications (id, node_id, conversation_id, run_id, kind, title, read_at, created_at, attention_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+      ON CONFLICT(conversation_id) DO UPDATE SET
+        run_id = excluded.run_id, kind = excluded.kind, title = excluded.title,
+        read_at = NULL, created_at = excluded.created_at,
+        attention_at = MAX(notifications.attention_at, excluded.attention_at)
+      WHERE excluded.created_at >= notifications.created_at
+    `).run(id, input.nodeId, input.conversationId, input.runId, input.kind, input.title, input.createdAt, input.createdAt);
+    return this.notificationFromRow(this.sqlite.prepare("SELECT * FROM notifications WHERE conversation_id = ?").get(input.conversationId) as Row);
+  }
+
+  private notificationFromRow(row: Row): NotificationRecord {
+    return {
+      id: text(row, "id"), nodeId: text(row, "node_id"), conversationId: text(row, "conversation_id"),
+      runId: nullableText(row, "run_id"), kind: text(row, "kind") as NotificationRecord["kind"],
+      title: text(row, "title"), readAt: nullableText(row, "read_at"), createdAt: text(row, "created_at"),
+      attentionAt: text(row, "attention_at"), manualUnreadAt: nullableText(row, "manual_unread_at"),
+    };
   }
 
   listNotifications(unreadOnly = false): NotificationRecord[] {
     const rows = this.sqlite.prepare(`
-      SELECT * FROM notifications ${unreadOnly ? "WHERE read_at IS NULL" : ""} ORDER BY created_at DESC
+      SELECT * FROM notifications ${unreadOnly ? "WHERE read_at IS NULL" : ""} ORDER BY attention_at DESC
     `).all() as Row[];
-    return rows.map((row) => ({
-      id: text(row, "id"),
-      nodeId: text(row, "node_id"),
-      conversationId: text(row, "conversation_id"),
-      runId: nullableText(row, "run_id"),
-      kind: text(row, "kind") as NotificationRecord["kind"],
-      title: text(row, "title"),
-      readAt: nullableText(row, "read_at"),
-      createdAt: text(row, "created_at"),
-    }));
+    return rows.map((row) => this.notificationFromRow(row));
+  }
+
+  unreadConversationCounts(): { unreadCount: number; nodeUnreadCounts: Record<string, number> } {
+    const rows = this.sqlite.prepare(
+      "SELECT node_id, COUNT(*) AS count FROM notifications WHERE read_at IS NULL GROUP BY node_id",
+    ).all() as Row[];
+    return {
+      unreadCount: rows.reduce((total, row) => total + Number(row.count), 0),
+      nodeUnreadCounts: Object.fromEntries(rows.map((row) => [text(row, "node_id"), Number(row.count)])),
+    };
+  }
+
+  conversationAttentionState(conversationId: string | null) {
+    const row = conversationId
+      ? this.sqlite.prepare("SELECT read_at, attention_at, manual_unread_at FROM notifications WHERE conversation_id = ?").get(conversationId) as Row | undefined
+      : undefined;
+    const unread = Boolean(row && row.read_at === null);
+    return {
+      conversationId,
+      unread,
+      unreadAt: unread && row ? text(row, "attention_at") : null,
+      manualUnreadAt: unread && row ? nullableText(row, "manual_unread_at") : null,
+      ...this.unreadConversationCounts(),
+      revision: this.currentUiRevision(),
+    };
   }
 
   markConversationNotificationsRead(conversationId: string, now: string): number {
     return Number(this.sqlite.prepare(
-      "UPDATE notifications SET read_at = ? WHERE conversation_id = ? AND read_at IS NULL",
+      "UPDATE notifications SET read_at = ?, manual_unread_at = NULL WHERE conversation_id = ? AND read_at IS NULL",
     ).run(now, conversationId).changes);
   }
 
+  markConversationUnread(conversationId: string, now: string): boolean | null {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) return null;
+    if (conversation.unread) return false;
+    this.sqlite.prepare(`
+      INSERT INTO notifications (id, node_id, conversation_id, run_id, kind, title, read_at, created_at, attention_at, manual_unread_at)
+      VALUES (?, ?, ?, NULL, 'manual', '待回看', NULL, ?, ?, ?)
+      ON CONFLICT(conversation_id) DO UPDATE SET read_at = NULL, attention_at = excluded.attention_at,
+        manual_unread_at = excluded.manual_unread_at
+    `).run(`conversation:${conversationId}`, conversation.nodeId, conversationId, conversation.updatedAt, now, now);
+    return true;
+  }
+
   markNotificationRead(id: string, now: string): boolean {
-    return this.sqlite.prepare("UPDATE notifications SET read_at = ? WHERE id = ?").run(now, id).changes > 0;
+    return this.sqlite.prepare(
+      "UPDATE notifications SET read_at = ?, manual_unread_at = NULL WHERE id = ? AND read_at IS NULL",
+    ).run(now, id).changes > 0;
+  }
+
+  notificationConversationId(id: string): string | null {
+    const row = this.sqlite.prepare("SELECT conversation_id FROM notifications WHERE id = ?").get(id) as Row | undefined;
+    return row ? text(row, "conversation_id") : null;
   }
 
   markAllNotificationsRead(now: string): number {
     return Number(this.sqlite.prepare(
-      "UPDATE notifications SET read_at = ? WHERE read_at IS NULL",
+      "UPDATE notifications SET read_at = ?, manual_unread_at = NULL WHERE read_at IS NULL",
     ).run(now).changes);
   }
 
-  listTaskCenter(limit = 200): TaskCenterRecord[] {
-    const normalizedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
-    const active = this.sqlite.prepare(`
-      SELECT r.id, r.status, r.progress_label, r.created_at, r.started_at,
-        c.id AS conversation_id, c.title AS conversation_title,
+  listTaskCenter(limit = 200, readCutoff = new Date(Date.now() - 30 * 86_400_000).toISOString()): TaskCenterRecord[] {
+    const rows = this.sqlite.prepare(`
+      SELECT c.id AS conversation_id, c.title AS conversation_title,
         n.id AS node_id, COALESCE(n.display_name, n.name) AS node_name,
-        (SELECT m.content FROM messages m
-          WHERE m.conversation_id = c.id AND m.run_id = r.id AND m.role = 'assistant'
+        x.id AS notification_id, x.manual_unread_at,
+        CASE WHEN x.id IS NOT NULL AND x.read_at IS NULL THEN 1 ELSE 0 END AS unread,
+        r.id AS run_id, COALESCE(r.status, c.status) AS status,
+        CASE WHEN r.status = 'waiting_approval' THEN (
+          SELECT a.summary FROM approvals a WHERE a.conversation_id = c.id AND a.status = 'pending'
+          ORDER BY a.requested_at DESC LIMIT 1
+        ) ELSE COALESCE(r.error, r.progress_label, c.error) END AS progress_label,
+        COALESCE(r.finished_at, r.started_at, r.created_at, c.updated_at) AS occurred_at,
+        CASE WHEN x.id IS NOT NULL AND x.read_at IS NULL THEN x.attention_at
+          ELSE COALESCE(r.progress_updated_at, r.finished_at, r.started_at, r.created_at, c.updated_at) END AS attention_at,
+        (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
+          AND (r.id IS NULL OR m.run_id = r.id)
           ORDER BY m.updated_at DESC, m.id DESC LIMIT 1) AS latest_reply
-      FROM runs r
-      JOIN conversations c ON c.id = r.conversation_id
+      FROM conversations c
       JOIN nodes n ON n.id = c.node_id
-      WHERE r.status IN ('queued', 'dispatching', 'running', 'waiting_approval', 'recovering')
-      ORDER BY COALESCE(r.started_at, r.created_at) DESC
-    `).all() as Row[];
-    const notifications = this.sqlite.prepare(`
-      SELECT x.*, c.title AS conversation_title,
-        n.id AS node_id_value, COALESCE(n.display_name, n.name) AS node_name,
-        (SELECT m.content FROM messages m
-          WHERE m.conversation_id = c.id AND m.role = 'assistant'
-            AND (x.run_id IS NULL OR m.run_id = x.run_id)
-          ORDER BY m.updated_at DESC, m.id DESC LIMIT 1) AS latest_reply
-      FROM notifications x
-      JOIN conversations c ON c.id = x.conversation_id
-      JOIN nodes n ON n.id = x.node_id
-      ORDER BY x.created_at DESC
+      LEFT JOIN notifications x ON x.conversation_id = c.id
+      LEFT JOIN runs r ON r.id = (
+        SELECT latest.id FROM runs latest WHERE latest.conversation_id = c.id
+        ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+      )
+      WHERE x.id IS NOT NULL OR r.status IN ('queued', 'dispatching', 'running', 'waiting_approval', 'recovering')
+        OR COALESCE(r.finished_at, r.created_at) >= ?
+      ORDER BY unread DESC, attention_at DESC, c.id DESC
       LIMIT ?
-    `).all(normalizedLimit) as Row[];
-    const notificationRecords = notifications.map((row): TaskCenterRecord => ({
-      id: text(row, "id"),
-      nodeId: text(row, "node_id_value"),
-      nodeName: text(row, "node_name"),
-      conversationId: text(row, "conversation_id"),
-      conversationTitle: text(row, "conversation_title"),
-      runId: nullableText(row, "run_id"),
-      status: text(row, "kind") as NotificationRecord["kind"],
-      progressLabel: text(row, "title"),
-      replyPreview: notificationPreview(nullableText(row, "latest_reply")),
-      unread: row.read_at === null,
-      occurredAt: text(row, "created_at"),
+    `).all(readCutoff, Math.max(1, Math.min(500, Math.trunc(limit)))) as Row[];
+    return rows.map((row) => ({
+      id: `conversation:${text(row, "conversation_id")}`, notificationId: nullableText(row, "notification_id"),
+      nodeId: text(row, "node_id"), nodeName: text(row, "node_name"),
+      conversationId: text(row, "conversation_id"), conversationTitle: text(row, "conversation_title"),
+      runId: nullableText(row, "run_id"), status: text(row, "status") as TaskCenterRecord["status"],
+      progressLabel: nullableText(row, "progress_label"), replyPreview: notificationPreview(nullableText(row, "latest_reply")),
+      unread: Number(row.unread) === 1, manualUnread: row.manual_unread_at !== null,
+      manualUnreadAt: nullableText(row, "manual_unread_at"),
+      occurredAt: text(row, "occurred_at"), attentionAt: text(row, "attention_at"),
     }));
-    const activeRunIds = new Set(active.map((row) => text(row, "id")));
-    const activeRecords = active.map((row): TaskCenterRecord => {
-      const notification = notificationRecords.find((entry) => entry.runId === text(row, "id"));
-      return {
-        id: `active:${text(row, "id")}`,
-        nodeId: text(row, "node_id"),
-        nodeName: text(row, "node_name"),
-        conversationId: text(row, "conversation_id"),
-        conversationTitle: text(row, "conversation_title"),
-        runId: text(row, "id"),
-        status: text(row, "status") as RunRecord["status"],
-        progressLabel: nullableText(row, "progress_label"),
-        replyPreview: notificationPreview(nullableText(row, "latest_reply")),
-        unread: notification?.unread ?? false,
-        occurredAt: nullableText(row, "started_at") ?? text(row, "created_at"),
-      };
-    });
-    return [
-      ...activeRecords,
-      ...notificationRecords.filter((entry) => !entry.runId || !activeRunIds.has(entry.runId)),
-    ].slice(0, normalizedLimit);
   }
 
   getGlobalSettings(): GlobalSettingsRecord {
@@ -2296,21 +2378,24 @@ export class ControlDatabase {
   }
 
   currentUiRevision(): number {
-    const row = this.sqlite.prepare("SELECT COALESCE(MAX(revision), 0) AS revision FROM ui_events").get() as Row;
+    // AUTOINCREMENT survives event retention and process restarts; MAX(retained rows) does not.
+    const row = this.sqlite.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'ui_events'), 0) AS revision").get() as Row;
     return Number(row.revision);
   }
 
   cleanupNotifications(readCutoff: string, unreadCutoff: string, maximumStored = 2000): number {
     const expired = this.sqlite.prepare(`
       DELETE FROM notifications
-      WHERE (read_at IS NOT NULL AND created_at < ?)
-        OR created_at < ?
+      WHERE manual_unread_at IS NULL AND (
+        (read_at IS NOT NULL AND MAX(read_at, attention_at) < ?)
+        OR (read_at IS NULL AND attention_at < ?)
+      )
     `).run(readCutoff, unreadCutoff);
     const overflow = this.sqlite.prepare(`
       DELETE FROM notifications
       WHERE read_at IS NOT NULL AND id IN (
         SELECT id FROM notifications
-        ORDER BY created_at DESC
+        ORDER BY attention_at DESC
         LIMIT -1 OFFSET ?
       )
     `).run(Math.max(1, Math.trunc(maximumStored)));

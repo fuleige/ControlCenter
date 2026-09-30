@@ -155,11 +155,13 @@ function decodeConversationCursor(value: string | undefined): ConversationListCu
   try {
     const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<ConversationListCursor>;
     if ((decoded.pinned !== 0 && decoded.pinned !== 1)
+      || (decoded.unread !== undefined && decoded.unread !== 0 && decoded.unread !== 1)
+      || (decoded.sortAt !== undefined && (typeof decoded.sortAt !== "string" || !Number.isFinite(Date.parse(decoded.sortAt))))
       || typeof decoded.updatedAt !== "string"
       || !Number.isFinite(Date.parse(decoded.updatedAt))
       || typeof decoded.id !== "string"
       || !decoded.id) return null;
-    return { pinned: decoded.pinned, updatedAt: decoded.updatedAt, id: decoded.id };
+    return { pinned: decoded.pinned, unread: decoded.unread ?? 0, sortAt: decoded.sortAt ?? decoded.updatedAt, updatedAt: decoded.updatedAt, id: decoded.id };
   } catch {
     return null;
   }
@@ -527,10 +529,11 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
     case "run.started":
       database.startRun(payload);
       publish("run.updated", payload.runId, payload.conversationId);
+      if (database.syncNodeActiveRuns(nodeId)) publish("node.updated", nodeId);
       break;
     case "run.progress":
       database.updateRunProgress(payload);
-      publish("run.updated", payload.runId, payload.conversationId);
+      publish("run.progress", payload.runId, payload.conversationId);
       break;
     case "message.snapshot":
       if (database.upsertMessageSnapshot(payload)) publishMessageUpdate(payload.messageId, payload.conversationId, payload.complete);
@@ -551,6 +554,7 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
       if (payload.status === "completed") notifyRun(payload.runId, "completed", "任务已完成", payload.finishedAt);
       if (payload.status === "failed") notifyRun(payload.runId, "failed", payload.error ?? "任务执行失败", payload.finishedAt);
       publish("run.updated", payload.runId, payload.conversationId);
+      if (database.syncNodeActiveRuns(nodeId)) publish("node.updated", nodeId);
       shouldDispatchPending = true;
       break;
     case "interaction.requested":
@@ -569,6 +573,7 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
         notifyRun(failedRunId, "failed", "节点重启后无法确认原任务状态", payload.reportedAt);
         publish("run.updated", failedRunId, database.getRun(failedRunId)?.conversationId);
       }
+      if (database.syncNodeActiveRuns(nodeId)) publish("node.updated", nodeId);
       for (const conversationId of database.reconcileNodeCompactions(
         nodeId,
         (payload.activeCompactions ?? []).map((compaction) => compaction.compactionId),
@@ -582,6 +587,7 @@ function processDurableMessage(nodeId: string, message: AgentDurableMessage): vo
       database.applyAgentError(payload, receivedAt);
       if (payload.runId) notifyRun(payload.runId, "failed", payload.message, receivedAt);
       publish("agent.error", payload.runId ?? payload.conversationId, payload.conversationId);
+      if (payload.runId && database.syncNodeActiveRuns(nodeId)) publish("node.updated", nodeId);
       if (payload.compactionId && payload.conversationId) {
         publish("conversation.compaction", payload.compactionId, payload.conversationId);
       }
@@ -807,7 +813,7 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
 
       if (!nodeId) throw new Error("Missing node identity");
       if (message.type === "agent.heartbeat") {
-        database.updateHeartbeat(nodeId, message.activeRuns, now());
+        if (database.updateHeartbeat(nodeId, message.activeRuns, now())) publish("node.updated", nodeId);
       } else if (message.type === "agent.commandAck") {
         const command = database.getCommand(message.commandId);
         if (!command || command.nodeId !== nodeId) {
@@ -1009,7 +1015,7 @@ app.get<{ Querystring: { nodeId?: string; q?: string; status?: string; limit?: s
     includeTotal: request.query.includeTotal !== "false",
     ...(cursor ? { cursor } : {}),
   });
-  return { data: page.data, total: page.total, nextCursor: encodeConversationCursor(page.nextCursor) };
+  return { data: page.data, total: page.total, nextCursor: encodeConversationCursor(page.nextCursor), revision: database.currentUiRevision() };
 });
 
 app.patch<{ Params: { id: string }; Body: { title?: string; pinned?: boolean } }>("/api/conversations/:id", async (request, reply) => {
@@ -1771,32 +1777,60 @@ app.patch<{ Body: { defaultModel?: string | null; defaultEffort?: ReasoningEffor
 
 app.get("/api/task-center", async () => ({
   data: database.listTaskCenter(taskCenterPolicy.limit),
-  unreadCount: database.listNotifications(true).length,
+  ...database.unreadConversationCounts(),
+  revision: database.currentUiRevision(),
   policy: taskCenterPolicy,
 }));
 
-app.post("/api/notifications/read-all", async (_request, reply) => {
-  if (database.markAllNotificationsRead(now()) > 0) publish("notification.updated", "all");
-  return reply.code(204).send();
+app.post("/api/notifications/read-all", async () => {
+  const changed = database.markAllNotificationsRead(now()) > 0;
+  if (changed) publish("notification.updated", "all");
+  return { changed, ...database.conversationAttentionState(null) };
 });
 
 app.post<{ Params: { id: string } }>("/api/notifications/:id/read", async (request, reply) => {
-  if (!database.markNotificationRead(request.params.id, now())) return reply.code(404).send({ error: "通知不存在或已被清理" });
-  publish("notification.updated", request.params.id);
-  return reply.code(204).send();
+  const conversationId = database.notificationConversationId(request.params.id);
+  if (!conversationId) return reply.code(404).send({ error: "通知不存在或已被清理" });
+  const changed = database.markNotificationRead(request.params.id, now());
+  if (changed) publish("notification.updated", request.params.id, conversationId);
+  return { changed, ...database.conversationAttentionState(conversationId) };
+});
+
+app.post<{ Params: { id: string } }>("/api/notifications/:id/unread", async (request, reply) => {
+  const conversationId = database.notificationConversationId(request.params.id);
+  if (!conversationId) return reply.code(404).send({ error: "通知不存在或已被清理" });
+  if (conversationIsVisible(conversationId)) return reply.code(409).send({ error: "会话正在查看，不能标记未读" });
+  const changed = database.markConversationUnread(conversationId, now());
+  if (changed) publish("notification.unread", request.params.id, conversationId);
+  return { changed, ...database.conversationAttentionState(conversationId) };
+});
+
+app.post<{ Params: { id: string } }>("/api/conversations/:id/unread", async (request, reply) => {
+  if (!database.getConversation(request.params.id)) return reply.code(404).send({ error: "会话不存在或已被删除" });
+  if (conversationIsVisible(request.params.id)) return reply.code(409).send({ error: "会话正在查看，不能标记未读" });
+  const changed = database.markConversationUnread(request.params.id, now());
+  if (changed) publish("notification.unread", request.params.id, request.params.id);
+  return { changed, ...database.conversationAttentionState(request.params.id) };
 });
 
 app.post<{ Params: { id: string } }>("/api/conversations/:id/read", async (request, reply) => {
   if (!database.getConversation(request.params.id)) return reply.code(404).send({ error: "会话不存在或已被删除" });
-  if (database.markConversationNotificationsRead(request.params.id, now()) > 0) publish("notification.updated", request.params.id, request.params.id);
-  return reply.code(204).send();
+  const changed = database.markConversationNotificationsRead(request.params.id, now()) > 0;
+  if (changed) publish("notification.updated", request.params.id, request.params.id);
+  return { changed, ...database.conversationAttentionState(request.params.id) };
 });
 
 app.post<{ Body: { sessionId?: string; conversationId?: string | null; visible?: boolean } }>("/api/ui/presence", async (request, reply) => {
   const sessionId = request.body?.sessionId?.trim();
   if (!sessionId || sessionId.length > 128) return reply.code(400).send({ error: "浏览器会话 ID 无效" });
   const conversationId = typeof request.body.conversationId === "string" ? request.body.conversationId : null;
+  const previous = uiPresence.get(sessionId);
   uiPresence.set(sessionId, { conversationId, visible: request.body.visible === true, seenAt: Date.now() });
+  if (request.body.visible === true && conversationId
+    && (!previous?.visible || previous.conversationId !== conversationId || previous.seenAt < Date.now() - 60_000)
+    && database.markConversationNotificationsRead(conversationId, now()) > 0) {
+    publish("notification.updated", conversationId, conversationId);
+  }
   return reply.code(204).send();
 });
 
@@ -1981,10 +2015,11 @@ function cleanupExpiringResources(): void {
 }
 
 function cleanupRetainedRecords(): void {
-  database.cleanupNotifications(
+  const removedNotifications = database.cleanupNotifications(
     new Date(Date.now() - taskCenterPolicy.readRetentionDays * 24 * 60 * 60 * 1000).toISOString(),
     new Date(Date.now() - taskCenterPolicy.unreadRetentionDays * 24 * 60 * 60 * 1000).toISOString(),
   );
+  if (removedNotifications > 0) publish("notification.updated", "cleanup");
   database.cleanupUiEvents(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
   const secretCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   database.cleanupAdminSessions(secretCutoff);

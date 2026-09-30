@@ -3,6 +3,7 @@ import type {
   AgentPackageInfo,
   AttachmentRecord,
   Conversation,
+  ConversationAttentionUpdate,
   ConversationCompaction,
   ConversationDetail,
   ConversationOpenedFile,
@@ -250,7 +251,7 @@ export async function listConversations(options: {
   limit?: number;
   cursor?: string;
   includeTotal?: boolean;
-} = {}): Promise<{ data: Conversation[]; total: number; nextCursor: string | null }> {
+} = {}): Promise<{ data: Conversation[]; total: number; nextCursor: string | null; revision: number }> {
   const parameters = new URLSearchParams();
   if (options.nodeId) parameters.set("nodeId", options.nodeId);
   if (options.query?.trim()) parameters.set("q", options.query.trim());
@@ -259,11 +260,12 @@ export async function listConversations(options: {
   if (options.cursor) parameters.set("cursor", options.cursor);
   if (options.includeTotal === false) parameters.set("includeTotal", "false");
   const suffix = parameters.size ? `?${parameters}` : "";
-  const result = await api<{ data: Conversation[]; total?: number; nextCursor?: string | null }>(`/api/conversations${suffix}`);
+  const result = await api<{ data: Conversation[]; total?: number; nextCursor?: string | null; revision?: number }>(`/api/conversations${suffix}`);
   return {
     data: result.data,
     total: result.total ?? result.data.length,
     nextCursor: result.nextCursor ?? null,
+    revision: result.revision ?? 0,
   };
 }
 
@@ -508,21 +510,28 @@ export async function downloadAgentPackage(fileName: string): Promise<void> {
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }
 
-export async function getTaskCenter(): Promise<{ entries: TaskCenterEntry[]; unreadCount: number; policy: TaskCenterPolicy }> {
-  const result = await api<{ data: TaskCenterEntry[]; unreadCount: number; policy?: TaskCenterPolicy }>("/api/task-center");
+export async function getTaskCenter(): Promise<{ entries: TaskCenterEntry[]; unreadCount: number; nodeUnreadCounts: Record<string, number>; policy: TaskCenterPolicy; revision: number }> {
+  const result = await api<{ data: TaskCenterEntry[]; unreadCount: number; nodeUnreadCounts?: Record<string, number>; policy?: TaskCenterPolicy; revision?: number }>("/api/task-center");
   return {
     entries: result.data,
     unreadCount: result.unreadCount,
+    nodeUnreadCounts: result.nodeUnreadCounts ?? {},
+    revision: result.revision ?? 0,
     policy: result.policy ?? { limit: 200, replyPreviewCharacters: 120, readRetentionDays: 30, unreadRetentionDays: 90 },
   };
 }
 
-export async function markConversationRead(conversationId: string): Promise<void> {
-  await api<void>(`/api/conversations/${conversationId}/read`, { method: "POST" });
+export async function markConversationRead(conversationId: string): Promise<ConversationAttentionUpdate | null> {
+  return (await api<ConversationAttentionUpdate | undefined>(`/api/conversations/${encodeURIComponent(conversationId)}/read`, { method: "POST" })) ?? null;
 }
 
-export async function markAllNotificationsRead(): Promise<void> {
-  await api<void>("/api/notifications/read-all", { method: "POST" });
+export async function markConversationUnread(conversationId: string): Promise<ConversationAttentionUpdate | null> {
+  const result = await api<ConversationAttentionUpdate>(`/api/conversations/${encodeURIComponent(conversationId)}/unread`, { method: "POST" });
+  return typeof result?.revision === "number" ? result : null;
+}
+
+export async function markAllNotificationsRead(): Promise<ConversationAttentionUpdate | null> {
+  return (await api<ConversationAttentionUpdate | undefined>("/api/notifications/read-all", { method: "POST" })) ?? null;
 }
 
 export async function dismissRunError(runId: string): Promise<void> {

@@ -45,6 +45,17 @@ export interface NodeRecord {
   models: ModelDescriptor[];
 }
 
+export interface ConversationAttentionUpdate {
+  changed: boolean;
+  conversationId: string | null; // null means all conversations were read.
+  unread: boolean;
+  unreadAt: string | null;
+  manualUnreadAt: string | null;
+  unreadCount: number;
+  nodeUnreadCounts: Record<string, number>;
+  revision: number;
+}
+
 export interface Conversation {
   id: string;
   nodeId: string;
@@ -57,6 +68,8 @@ export interface Conversation {
   status: "creating" | "ready" | "error";
   error: string | null;
   pinnedAt: string | null;
+  unread: boolean;
+  unreadAt: string | null;
   latestRunStatus: Run["status"] | null;
   tokenUsage: ConversationTokenUsage | null;
   compaction?: ConversationCompaction | null;
@@ -210,15 +223,19 @@ export interface AgentPackageInfo {
 
 export interface TaskCenterEntry {
   id: string;
+  notificationId: string | null;
   nodeId: string;
   nodeName: string;
   conversationId: string;
   conversationTitle: string;
   runId: string | null;
-  status: Run["status"] | "completed" | "failed" | "waiting_user";
+  status: Run["status"] | "waiting_user" | Conversation["status"];
   progressLabel: string | null;
   replyPreview: string | null;
   unread: boolean;
+  manualUnread: boolean;
+  manualUnreadAt: string | null;
+  attentionAt: string;
   occurredAt: string;
 }
 

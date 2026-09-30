@@ -161,6 +161,11 @@ describe("ControlDatabase", () => {
       startedAt: at,
     });
     expect(database.getRun("run-1")?.status).toBe("running");
+    expect(database.listTaskCenter()[0]).toMatchObject({ id: "conversation:conversation-1", notificationId: null, unread: false });
+    expect(database.syncNodeActiveRuns("node-1")).toBe(true);
+    expect(database.listNodes()[0]?.activeRuns).toBe(1);
+    expect(database.syncNodeActiveRuns("node-1")).toBe(false);
+    expect(database.updateHeartbeat("node-1", 1, at)).toBe(false);
     expect(database.hasActiveRunInWorkspace("node-1", "repo")).toBe(true);
     expect(database.hasActiveRunInWorkspace("node-1", "repo-2")).toBe(false);
     expect(database.canDispatchQueuedRun("node-1", "conversation-1")).toBe(false);
@@ -260,6 +265,7 @@ describe("ControlDatabase", () => {
     expect(database.getRun("run-1")?.status).toBe("recovering");
     expect(database.reconcileNodeRuns("node-1", ["run-1"], at)).toEqual([]);
     expect(database.getRun("run-1")?.status).toBe("running");
+    expect(database.updateHeartbeat("node-1", 1, at)).toBe(true);
 
     database.createAttachment({
       id: "attachment-1",
@@ -301,6 +307,7 @@ describe("ControlDatabase", () => {
     expect(database.getRun("run-1")?.status).toBe("waiting_approval");
     database.createNotification({ nodeId: "node-1", conversationId: "conversation-1", runId: "run-1", kind: "waiting_user", title: "等待你的操作", createdAt: at });
     expect(database.listNotifications(true).some((notification) => notification.kind === "waiting_user")).toBe(true);
+    expect(database.listTaskCenter()[0]).toMatchObject({ id: "conversation:conversation-1", notificationId: "conversation:conversation-1", unread: true });
     database.resolveApproval("approval-1", { decision: "accept" }, at);
     expect(database.getApproval("approval-1")?.status).toBe("resolved");
     expect(database.listNotifications().some((notification) => notification.kind === "waiting_user")).toBe(false);
@@ -311,11 +318,15 @@ describe("ControlDatabase", () => {
     expect(database.listTaskCenter(1)).toHaveLength(1);
     expect(database.markAllNotificationsRead("2026-09-09T10:01:00.000Z")).toBe(1);
     expect(database.listNotifications(true)).toHaveLength(0);
-    database.createNotification({ id: "expired-read", nodeId: "node-1", conversationId: "conversation-1", runId: null, kind: "failed", title: "旧已读", createdAt: "2026-01-01T00:00:00.000Z" });
-    database.markNotificationRead("expired-read", "2026-01-02T00:00:00.000Z");
-    database.createNotification({ id: "expired-unread", nodeId: "node-1", conversationId: "conversation-1", runId: null, kind: "failed", title: "旧未读", createdAt: "2026-01-01T00:00:00.000Z" });
-    expect(database.cleanupNotifications("2026-08-01T00:00:00.000Z", "2026-06-01T00:00:00.000Z")).toBe(2);
-    expect(database.listNotifications().some((notification) => notification.id.startsWith("expired-"))).toBe(false);
+    expect(database.listTaskCenter()[0]?.notificationId).toBe("conversation:conversation-1");
+    expect(database.notificationConversationId("conversation:conversation-1")).toBe("conversation-1");
+    expect(database.notificationConversationId("missing")).toBeNull();
+    expect(database.markConversationUnread("missing", at)).toBeNull();
+    expect(database.markConversationUnread("conversation-1", at)).toBe(true);
+    expect(database.markConversationUnread("conversation-1", at)).toBe(false);
+    expect(database.listNotifications(true)).toHaveLength(1);
+    expect(database.markConversationNotificationsRead("conversation-1", at)).toBe(1);
+    expect(database.listNotifications(true)).toHaveLength(0);
     database.finishRun({
       type: "run.finished",
       conversationId: "conversation-1",
@@ -325,6 +336,10 @@ describe("ControlDatabase", () => {
       status: "completed",
       finishedAt: at,
     });
+    expect(database.syncNodeActiveRuns("node-1")).toBe(true);
+    expect(database.listNodes()[0]?.activeRuns).toBe(0);
+    expect(database.updateHeartbeat("node-1", 1, at)).toBe(true);
+    expect(database.updateHeartbeat("node-1", 1, at)).toBe(false);
     expect(database.hasActiveRunInWorkspace("node-1", "repo")).toBe(false);
     expect(database.canDispatchQueuedRun("node-1", "conversation-1")).toBe(true);
 
