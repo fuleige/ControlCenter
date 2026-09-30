@@ -18,7 +18,8 @@ import {
   type ReasoningEffort,
 } from "@controller-center/protocol";
 import { loadConfig } from "./config.js";
-import { findAgentPackage } from "./agent-package.js";
+import { findAgentPackage, listAgentPackages } from "./agent-package.js";
+import { NodeTools, NodeToolError } from "./node-tools.js";
 import { AgentConnections } from "./connections.js";
 import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type MessageListCursor, type WorkspaceRecord } from "./database.js";
 import { UiEventBus } from "./event-bus.js";
@@ -93,7 +94,7 @@ app.setErrorHandler((error, request, reply) => {
   if (statusCode >= 500) request.log.error({ err: error, requestId: request.id }, "Unhandled control-plane request error");
   else request.log.warn({ err: error, requestId: request.id }, "Rejected control-plane request");
   return reply.code(statusCode).send({
-    error: statusCode >= 500 ? "控制中心内部错误" : error instanceof Error ? error.message : String(error),
+    error: statusCode >= 500 && !(error instanceof NodeToolError) ? "控制中心内部错误" : error instanceof Error ? error.message : String(error),
     requestId: request.id,
   });
 });
@@ -280,6 +281,18 @@ app.addHook("onRequest", async (request, reply) => {
   if (requestHasValidAdminToken(request) || authenticatedSession(request, true)) return;
   return reply.code(401).send({ error: "登录状态已失效" });
 });
+
+const nodeTools = new NodeTools(app, {
+  directory: path.join(config.dataDirectory, "node-files"), sqlite: database.sqlite, connections,
+  publicOrigin: config.publicOrigin,
+  allowedOrigins: [...new Set([config.publicOrigin, ...config.corsOrigin.split(",").map((value) => value.trim()).filter((value) => value && value !== "*")])],
+  session: authenticatedSession,
+  quotaBytes: Number(process.env.NODE_FILES_QUOTA_BYTES) || 8 * 1024 ** 3,
+  reserveBytes: Number(process.env.NODE_FILES_DISK_RESERVE_BYTES) || 512 * 1024 ** 2,
+  terminalLimit: Number(process.env.NODE_TERMINAL_LIMIT) || 8,
+  fileLimit: Number(process.env.NODE_FILE_CONCURRENCY) || 2,
+});
+connections.onDisconnect = (nodeId) => nodeTools.nodeDisconnected(nodeId);
 
 function enrollmentStatus(record: { expiresAt: string; usedAt: string | null; revokedAt: string | null }): "pending" | "used" | "revoked" | "expired" {
   if (record.usedAt) return "used";
@@ -642,17 +655,20 @@ app.post<{ Body: { token?: string } }>("/api/auth/login", async (request, reply)
 
 app.post("/api/auth/logout", async (request, reply) => {
   const session = authenticatedSession(request);
-  if (session) database.revokeAdminSession(session.id, now());
+  if (session) { database.revokeAdminSession(session.id, now()); await nodeTools.revokeSession(session.id); }
   reply.header("Set-Cookie", sessionCookie("", 0));
   return reply.code(204).send();
 });
 
-app.get("/api/agent-package", async (_request, reply) => {
+app.get<{ Querystring: { target?: string } }>("/api/agent-package", async (request, reply) => {
   reply.header("Cache-Control", "no-store");
-  const descriptor = findAgentPackage(config.agentArtifactDirectory, agentPackageVersion);
+  const packages = listAgentPackages(config.agentArtifactDirectory, agentPackageVersion);
+  const descriptor = request.query.target ? findAgentPackage(config.agentArtifactDirectory, agentPackageVersion, request.query.target) : packages[0] ?? null;
   return {
+    packages: packages.map(({ filePath: _filePath, ...item }) => ({ ...item, available: true })),
     package: descriptor ? {
       available: true,
+      target: descriptor.target,
       version: descriptor.version,
       fileName: descriptor.fileName,
       size: descriptor.size,
@@ -669,8 +685,9 @@ app.get("/api/agent-package", async (_request, reply) => {
   };
 });
 
-app.get("/api/agent-package/download", async (_request, reply) => {
-  const descriptor = findAgentPackage(config.agentArtifactDirectory, agentPackageVersion);
+app.get<{ Querystring: { target?: string } }>("/api/agent-package/download", async (request, reply) => {
+  const packages = listAgentPackages(config.agentArtifactDirectory, agentPackageVersion);
+  const descriptor = request.query.target ? findAgentPackage(config.agentArtifactDirectory, agentPackageVersion, request.query.target) : packages[0] ?? null;
   if (!descriptor) return reply.code(404).send({ error: `Agent v${agentPackageVersion} 客户端安装包尚未生成` });
   reply.header("Cache-Control", "private, no-cache");
   reply.header("Content-Type", "application/gzip");
@@ -793,6 +810,7 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
           ? message.node.capabilities.filter((capability): capability is string => typeof capability === "string")
           : [];
         connections.set(nodeId, message.bootId, socket, capabilities);
+        nodeTools.nodeConnected(nodeId);
         connections.send(nodeId, {
           type: "control.welcome",
           protocolVersion: CONTROL_PROTOCOL_VERSION,
@@ -812,7 +830,10 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
       }
 
       if (!nodeId) throw new Error("Missing node identity");
-      if (message.type === "agent.heartbeat") {
+      if (!connections.isCurrent(nodeId, socket)) return;
+      if (message.type === "agent.nodeTool") {
+        nodeTools.handleAgent(nodeId, message);
+      } else if (message.type === "agent.heartbeat") {
         if (database.updateHeartbeat(nodeId, message.activeRuns, now())) publish("node.updated", nodeId);
       } else if (message.type === "agent.commandAck") {
         const command = database.getCommand(message.commandId);
@@ -2048,6 +2069,7 @@ async function shutdown(signal: string): Promise<void> {
   clearInterval(retentionCleanupTimer);
   for (const pending of pendingMessageUiEvents.values()) clearTimeout(pending.timer);
   pendingMessageUiEvents.clear();
+  await nodeTools.close();
   connections.closeAll();
   for (const stream of uiStreams) stream.end();
   uiStreams.clear();

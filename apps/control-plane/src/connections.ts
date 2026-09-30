@@ -29,6 +29,9 @@ interface PendingWorkspaceFileRead {
 }
 
 export class AgentConnections {
+  onDisconnect: ((nodeId: string) => void) | null = null;
+
+  isCurrent(nodeId: string, socket: WebSocket): boolean { return this.connections.get(nodeId)?.socket === socket; }
   private readonly connections = new Map<string, AgentConnection>();
   private readonly workspaceValidations = new Map<string, PendingWorkspaceValidation>();
   private readonly workspaceFileReads = new Map<string, PendingWorkspaceFileRead>();
@@ -54,6 +57,7 @@ export class AgentConnections {
   set(nodeId: string, bootId: string, socket: WebSocket, capabilities: readonly string[] = []): void {
     const previous = this.connections.get(nodeId);
     if (previous && previous.socket !== socket) {
+      this.onDisconnect?.(nodeId);
       this.rejectWorkspaceValidations(nodeId, "节点连接已被新的会话替换");
       this.rejectWorkspaceFileReads(nodeId, "节点连接已被新的会话替换");
       previous.socket.close(4001, "Replaced by a newer session");
@@ -65,6 +69,7 @@ export class AgentConnections {
     const connection = this.connections.get(nodeId);
     if (!connection || connection.socket !== socket) return false;
     this.connections.delete(nodeId);
+    this.onDisconnect?.(nodeId);
     this.rejectWorkspaceValidations(nodeId, "节点已离线");
     this.rejectWorkspaceFileReads(nodeId, "节点已离线");
     return true;
@@ -86,6 +91,7 @@ export class AgentConnections {
     const connection = this.connections.get(nodeId);
     if (!connection) return;
     this.connections.delete(nodeId);
+    this.onDisconnect?.(nodeId);
     this.rejectWorkspaceValidations(nodeId, "节点连接已关闭");
     this.rejectWorkspaceFileReads(nodeId, "节点连接已关闭");
     connection.socket.close(code, reason);
@@ -94,6 +100,7 @@ export class AgentConnections {
   closeAll(): void {
     for (const [nodeId, connection] of this.connections) {
       this.connections.delete(nodeId);
+      this.onDisconnect?.(nodeId);
       this.rejectWorkspaceValidations(nodeId, "控制中心正在关闭");
       this.rejectWorkspaceFileReads(nodeId, "控制中心正在关闭");
       connection.socket.terminate();

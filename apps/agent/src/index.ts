@@ -6,6 +6,8 @@ import os from "node:os";
 import WebSocket from "ws";
 import {
   CONTROL_PROTOCOL_VERSION,
+  TERMINAL_PTY_CAPABILITY,
+  NODE_FILES_CAPABILITY,
   WORKSPACE_FILE_READ_CAPABILITY,
   isRecord,
   parseControlMessage,
@@ -34,12 +36,14 @@ import {
   type AppServerRequest,
   type RpcRequestId,
 } from "./app-server-client.js";
+import { NodeTerminals } from "./node-terminals.js";
+import { NodeFiles } from "./node-files.js";
 import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 import { readWorkspaceFile } from "./workspace-files.js";
 
-const AGENT_VERSION = "0.3.13";
+const AGENT_VERSION = "0.3.15";
 
 interface ActiveRun {
   conversationId: string;
@@ -110,6 +114,14 @@ const tokenUsageBackfillQueue = new Map<string, string>();
 const tokenUsageBackfillLoads = new Map<string, Promise<void>>();
 const workspaceRegistry = new Map<string, WorkspaceDescriptor>(config.workspaces.map((workspace) => [workspace.id, workspace]));
 let socket: WebSocket | null = null;
+let toolGeneration = "";
+const defaultDirectory = config.workspaces.find((workspace) => workspace.isDefault)!.path;
+const emitNodeTool = (event: import("@controller-center/protocol").NodeToolEvent, generation: string): boolean => {
+  if (generation !== toolGeneration || !socket || socket.bufferedAmount > 512 * 1024) return false;
+  return send({ type: "agent.nodeTool", generation, event });
+};
+const nodeTerminals = new NodeTerminals(defaultDirectory, emitNodeTool, Number(process.env.NODE_TERMINAL_LIMIT) || 8);
+let nodeFiles: NodeFiles | null = null;
 let heartbeatTimer: NodeJS.Timeout | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let reconnectStabilityTimer: NodeJS.Timeout | null = null;
@@ -1092,7 +1104,7 @@ function connect(): void {
         maxConcurrentRuns: config.maxConcurrentRuns,
         workspaces: config.workspaces,
         models: availableModels,
-        capabilities: [WORKSPACE_FILE_READ_CAPABILITY],
+        capabilities: [WORKSPACE_FILE_READ_CAPABILITY, ...(nodeTerminals.available ? [TERMINAL_PTY_CAPABILITY] : []), ...(nodeFiles ? [NODE_FILES_CAPABILITY] : [])],
       },
     });
   });
@@ -1100,7 +1112,14 @@ function connect(): void {
   nextSocket.on("message", (data) => {
     try {
       const message = parseControlMessage(data.toString());
-      if (message.type === "control.welcome") {
+      if (message.type === "control.nodeTool") {
+        if (message.command.action === "reset") {
+          nodeTerminals.reset(); nodeFiles?.reset(); toolGeneration = message.generation;
+        } else if (message.generation === toolGeneration) {
+          if (message.command.action.startsWith("terminal.")) nodeTerminals.handle(message.command as Extract<import("@controller-center/protocol").NodeToolCommand, { action: `terminal.${string}` }>, toolGeneration);
+          else if (message.command.action.startsWith("files.")) void nodeFiles?.handle(message.command as Extract<import("@controller-center/protocol").NodeToolCommand, { action: `files.${string}` }>, toolGeneration);
+        }
+      } else if (message.type === "control.welcome") {
         if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
         reconnectStabilityTimer = setTimeout(() => {
           reconnectAttempt = 0;
@@ -1178,7 +1197,7 @@ function connect(): void {
   });
 
   nextSocket.on("close", (code, reason) => {
-    if (socket === nextSocket) socket = null;
+    if (socket === nextSocket) { nodeTerminals.reset(); nodeFiles?.reset(); toolGeneration = ""; socket = null; }
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     heartbeatTimer = null;
     if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
@@ -1209,13 +1228,22 @@ function shutdown(): void {
   if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
   if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
   socket?.close(1000, "Agent shutting down");
+  nodeTerminals.dispose();
+  nodeFiles?.dispose();
   appServer.close();
   void outboundNetwork.destroy();
   state.close();
 }
 
-process.on("SIGINT", () => { shutdown(); process.exit(0); });
-process.on("SIGTERM", () => { shutdown(); process.exit(0); });
+function shutdownAndExit(): void {
+  if (shuttingDown) return;
+  shutdown();
+  // PTY foreground cleanup includes bounded ps checks and a delayed SIGKILL.
+  // Keep both service-stop and interactive-stop paths alive long enough to finish.
+  setTimeout(() => process.exit(0), 4_000);
+}
+process.on("SIGINT", shutdownAndExit);
+process.on("SIGTERM", shutdownAndExit);
 
 console.log(`[agent] node ${config.nodeName} (${config.nodeId})`);
 console.log(`[agent] workspaces: ${config.workspaces.map((workspace) => `${workspace.name}=${workspace.path}`).join(", ")}`);
@@ -1225,6 +1253,11 @@ if (config.codexProxyOnly) {
 }
 
 async function bootstrap(): Promise<void> {
+  await nodeTerminals.initialize();
+  if (process.platform === "linux" || process.platform === "darwin") {
+    try { nodeFiles = new NodeFiles(config.dataDirectory, defaultDirectory, outboundNetwork, config.controlUrl, emitNodeTool, Number(process.env.NODE_FILE_CONCURRENCY) || 2); }
+    catch (error) { console.warn("[agent] node files unavailable:", error instanceof Error ? error.message : "初始化失败"); }
+  }
   cleanupAttachmentCache();
   attachmentCleanupTimer = setInterval(cleanupAttachmentCache, 60 * 60 * 1000);
   try {

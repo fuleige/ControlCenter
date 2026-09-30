@@ -1,3 +1,5 @@
+export * from './node-tools.js';
+import type { AgentNodeToolMessage, ControlNodeToolMessage } from './node-tools.js';
 export const CONTROL_PROTOCOL_VERSION = 5 as const;
 export const WORKSPACE_FILE_READ_CAPABILITY = "workspace_file_read_v1" as const;
 
@@ -300,6 +302,7 @@ export interface AgentDurableMessage {
 }
 
 export type AgentToControlMessage =
+  | AgentNodeToolMessage
   | AgentHelloMessage
   | AgentHeartbeatMessage
   | AgentCommandAckMessage
@@ -440,6 +443,7 @@ export interface ControlWorkspaceSyncMessage {
 }
 
 export type ControlToAgentMessage =
+  | ControlNodeToolMessage
   | ControlCommandMessage
   | ControlWelcomeMessage
   | ControlDeliveryAckMessage
@@ -458,6 +462,7 @@ export function parseAgentMessage(input: string): AgentToControlMessage {
     throw new Error("Invalid agent message envelope");
   }
   if (
+    value.type !== "agent.nodeTool" &&
     value.type !== "agent.hello" &&
     value.type !== "agent.heartbeat" &&
     value.type !== "agent.commandAck" &&
@@ -476,6 +481,7 @@ export function parseControlMessage(input: string): ControlToAgentMessage {
     throw new Error("Invalid control message envelope");
   }
   if (
+    value.type !== "control.nodeTool" &&
     value.type !== "control.command" &&
     value.type !== "control.welcome" &&
     value.type !== "control.deliveryAck" &&

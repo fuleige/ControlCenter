@@ -8,8 +8,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/control-plane && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs && npm run build -w @controller-center/web",
-    "package:agent": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs",
+    "build": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/node-files && npm run build -w @controller-center/control-plane && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs && npm run build -w @controller-center/web",
+    "package:agent": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/node-files && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "dev:server": "npm run dev -w @controller-center/control-plane",
@@ -28,5 +28,8 @@
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vitest": "^5.0.0"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true
   }
 }

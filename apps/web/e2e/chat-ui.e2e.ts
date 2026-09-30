@@ -493,6 +493,9 @@ test("节点未读徽标在展开和收起侧边栏时都可见", async ({ page 
   test.skip(testInfo.project.name !== "desktop", "侧边栏折叠仅在桌面验证");
   const emitUpdate = await mockUiStream(page);
   await mockControlCenter(page, { unopenedNode: true });
+  await page.route(`**/api/node-tools/nodes/${node.id}/info`, async (route) => {
+    await route.fulfill({ json: { online: true, terminal: true, files: true } });
+  });
   let unreadCount = 12;
   await page.route("**/api/task-center", async (route) => {
     await route.fulfill({ json: { data: [], unreadCount, nodeUnreadCounts: unreadCount ? { [node.id]: unreadCount } : {} } });
@@ -502,10 +505,23 @@ test("节点未读徽标在展开和收起侧边栏时都可见", async ({ page 
   await expect(badge).toBeVisible();
   await expect(badge).toHaveText("9+");
   await expect(badge).toHaveAttribute("aria-label", "12 个未读会话");
+  await expect(page.getByRole("button", { name: "新开终端", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "节点文件", exact: true })).toBeVisible();
+  const terminalButton = page.getByRole("button", { name: "新开终端", exact: true });
+  const filesButton = page.getByRole("button", { name: "节点文件", exact: true });
+  await expect(terminalButton).toBeEnabled(); await expect(filesButton).toBeEnabled();
+  const terminalBounds = await terminalButton.boundingBox(); const filesBounds = await filesButton.boundingBox();
+  expect(Math.abs(terminalBounds!.width - filesBounds!.width)).toBeLessThan(1);
+  expect(terminalBounds!.y).toBe(filesBounds!.y); expect(terminalBounds!.height).toBe(filesBounds!.height);
+  await page.screenshot({ path: "test-results/node-tool-buttons.png" });
   await page.getByRole("button", { name: "折叠节点栏" }).click();
   await expect(badge).toBeVisible();
+  await expect(page.getByRole("button", { name: "新开终端", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "节点文件", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "展开节点栏" }).click();
   await expect(badge).toBeVisible();
+  await expect(page.getByRole("button", { name: "新开终端", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "节点文件", exact: true })).toBeVisible();
   unreadCount = 0;
   await emitUpdate("notification.updated", "all", null);
   await expect(badge).toHaveCount(0);
@@ -1906,7 +1922,7 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
-  await expect(page.getByText("v0.3.13 · 566 KB · Linux / macOS")).toBeVisible();
+  await expect(page.getByText("v0.3.13 · 566 KB · 旧版通用包")).toBeVisible();
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载客户端" }).click();
   await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.13.tar.gz");

@@ -1,8 +1,8 @@
 # Controller Center
 
-一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据始终留在节点本地。工作区文件默认不上传，只有管理员在对话中明确点击文件链接时，所选文件才会经控制中心短时只读转发用于预览。
+一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据始终留在节点本地。工作区文件默认不上传；对话文件预览和节点文件传输只处理管理员明确选择的文件，并按各自的临时任务规则经控制中心转发。
 
-产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。Agent 可用参数、环境变量、优先级和组合示例见 [Agent 客户端命令与配置](docs/agent-cli.md)。代码按这些边界实施。
+产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。节点工具方案和验证记录见 [节点终端与文件管理设计](docs/node-tools-design.md)。Agent 可用参数、环境变量、优先级和组合示例见 [Agent 客户端命令与配置](docs/agent-cli.md)。代码按这些边界实施。
 
 ## 组成
 
@@ -61,7 +61,7 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 
 ## 环境要求
 
-- Node.js 24 或更新版本。
+- Node.js 24.x（Agent 原生 PTY 安装包的验证基线）。
 - Agent 节点已安装并登录 `codex` CLI。
 - 控制中心到 Agent 不需要入站网络；Agent 只需能访问中心的 WSS 地址。
 
@@ -76,7 +76,7 @@ npm install
 npm run build
 ```
 
-完整构建会同时生成 `artifacts/controller-center-agent-v<版本>.tar.gz`。只需重新构建 Agent 安装包时可执行：
+完整构建会同时生成 `artifacts/controller-center-agent-v<版本>-<系统架构>.tar.gz`。只需重新构建 Agent 安装包时可执行：
 
 ```bash
 npm run package:agent
@@ -168,10 +168,10 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 
 ### Agent
 
-Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可直接下载当前版本的完整客户端安装包；该包已经包含编译结果和生产依赖，无需在节点上执行 `npm install` 或 TypeScript 编译。
+Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可选择并下载匹配系统/CPU 架构/libc 的客户端安装包；该包已经包含编译结果、生产依赖和 PTY 原生模块，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.13.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.15-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -222,7 +222,11 @@ npm run agent:enroll -- --server https://control.example.com --codex-proxy-only
 | `AGENT_ARTIFACT_DIR` | `<启动命令所在目录>/artifacts` | 供已登录管理员下载的 Agent 安装包目录；文件名必须与当前 Agent 版本一致 |
 | `PUBLIC_ORIGIN` | 与 `CORS_ORIGIN` 相同 | 浏览器访问的公开 Origin；HTTPS 时启用 Secure 会话 Cookie |
 | `TRUST_PROXY` | `false` | 控制面仅位于可信反向代理之后时设为 `true`，用于正确识别登录限流来源 IP |
-| `CORS_ORIGIN` | `http://localhost:5173` | 允许的 Web Origin，逗号分隔 |
+| `CORS_ORIGIN` | `http://localhost:5173` | 允许的 Web Origin，逗号分隔；节点工具 WebSocket 要求明确列出的 Origin |
+| `NODE_FILES_QUOTA_BYTES` | `8589934592` | 节点文件专用暂存总配额（8 GiB），创建任务时预留 |
+| `NODE_FILES_DISK_RESERVE_BYTES` | `536870912` | 文件暂存必须保留的磁盘余量（512 MiB） |
+| `NODE_TERMINAL_LIMIT` | `8` | 单节点同时打开的 PTY 上限，Agent 也可设置 |
+| `NODE_FILE_CONCURRENCY` | `2` | 单节点正在传输/校验的文件任务上限，Agent 也可设置 |
 
 Agent：
 
@@ -267,8 +271,8 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 - `GET /api/approvals?status=pending`
 - `POST /api/approvals/:id/resolve`
 - `GET/PATCH /api/settings`
-- `GET /api/agent-package`（当前 Agent 安装包版本、大小和 SHA-256）
-- `GET /api/agent-package/download`（登录后下载当前版本安装包）
+- `GET /api/agent-package`（当前 Agent 各平台安装包版本、大小和 SHA-256）
+- `GET /api/agent-package/download?target=linux-x64-glibc`（登录后下载指定目标安装包）
 - `GET/POST /api/enrollment-tokens`（管理员创建与查看注册状态）
 - `DELETE /api/enrollment-tokens/:id`（撤销尚未使用的注册 Token）
 - `GET /api/task-center`（每个会话一条，返回全量未读会话数、`nodeUnreadCounts` 和 `revision`）
@@ -281,6 +285,12 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 - `GET /api/stream?after=<revision>`（可重放 SSE）
 - `GET /readyz`
 
+## 节点终端与文件管理
+
+选择在线节点后，可通过“新开终端”和“节点文件”打开独立标签页。终端为真实 PTY，可正常使用 Vim/tmux 等已安装程序；每次新开，关闭或断线后结束，不提供历史恢复。文件管理提供目录浏览、批量上传/下载，单文件最大 1 GiB，整批同名覆盖一次确认；最终下载进度在 Chrome 下载栏查看。完整生命周期与错误提示见 [设计及验证记录](docs/node-tools-design.md)。
+
+需要新的 Web、Control Plane 和 Agent v0.3.14 才能使用全部功能；旧 Agent 继续支持原有聊天，工具入口显示升级提示。
+
 ## 安全边界
 
 - Web 管理员可以登记 Agent 运行用户有权访问的任意本地目录；这等同于授予后续 Codex 会话在该目录中工作的能力。
@@ -292,6 +302,6 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 - 默认工作空间只能由 Agent 的进程启动目录决定，不能通过 Web 改名、迁移、停用或删除。
 - Agent 默认使用 `workspaceWrite` sandbox 并关闭网络访问；只有在本机启动命令显式传入 `--yolo` 时才切换为无审批、无沙箱的全权限模式，Web 会持续标识该状态。
 - 默认情况下 Agent 自身网络与 Codex 都遵循代理环境变量及 `NO_PROXY`；显式传入 `--codex-proxy-only` 后，Agent 自身连接强制直连，代理变量只由 Codex 子进程继承。
-- 不提供绕过 Codex 的远程 Shell API。
+- 节点终端和文件管理使用 Agent 的系统用户权限，管理员登录后即可操作；Codex 的审批和 sandbox 配置只约束 Codex 任务，不约束节点工具。
 - OpenAI/ChatGPT 凭据始终由节点本地的 Codex 管理。
 - Git commit、push 和其他远端写操作仍须在任务中得到明确授权。

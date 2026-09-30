@@ -1,5 +1,7 @@
 import {
   Children,
+  lazy,
+  Suspense,
   isValidElement,
   useCallback,
   useEffect,
@@ -12,6 +14,9 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
+import { NodeToolButtons } from "./NodeToolButtons";
+const NodeToolsPage = lazy(() => import("./NodeToolsPage"));
+import "./node-tools.css";
 import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
@@ -1725,7 +1730,7 @@ function NodePanel({
         {nodes.map((node) => {
           const nodeAttention = nodeUnreadCounts[node.id] ?? 0;
           return (
-          <div className="node-entry" key={node.id}>
+          <div className={`node-entry ${!collapsed && selectedId === node.id ? "node-entry-with-tools" : ""}`} key={node.id}>
             <div className="node-row">
               <button className={`node-card ${selectedId === node.id ? "selected" : ""}`} onClick={() => onSelect(node)}>
                 <span className={`node-identity ${node.permissionMode === "danger-full-access" ? "full-access" : ""}`} title={`${node.name}${node.permissionMode === "danger-full-access" ? " · 全权限" : ""}`}>{nodeShortLabel(node.name)}</span>
@@ -1750,6 +1755,7 @@ function NodePanel({
                 <PencilIcon />
               </button>
             </div>
+            {!collapsed && selectedId === node.id && <NodeToolButtons nodeId={node.id} online={node.status === "online"} />}
             {editingId === node.id && (
               <form className="node-rename" onSubmit={(event) => void saveName(event, node)}>
                 <div className="node-rename-head">
@@ -2359,6 +2365,8 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   const [confirmNodeId, setConfirmNodeId] = useState<string | null>(null);
   const [clock, setClock] = useState(Date.now());
   const [agentPackage, setAgentPackage] = useState<AgentPackageInfo | null>(null);
+  const [packageTarget, setPackageTarget] = useState<string>("");
+  const selectedPackage = agentPackage?.packages?.find((item) => item.target === packageTarget) ?? agentPackage;
   const [packageLoading, setPackageLoading] = useState(true);
   const [packageDownloading, setPackageDownloading] = useState(false);
   const [packageError, setPackageError] = useState<string | null>(null);
@@ -2416,11 +2424,11 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   }, []);
 
   async function downloadPackage(): Promise<void> {
-    if (!agentPackage?.available || !agentPackage.fileName) return;
+    if (!selectedPackage?.available || !selectedPackage.fileName) return;
     setPackageDownloading(true);
     setPackageError(null);
     try {
-      await downloadAgentPackage(agentPackage.fileName);
+      await downloadAgentPackage(selectedPackage.fileName, selectedPackage.target);
     } catch (reason) {
       setPackageError(formatErrorMessage(reason, "下载 Agent 安装包"));
     } finally {
@@ -2473,15 +2481,18 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   return <section className="enrollment-settings">
     <div className="settings-copy"><h3>节点接入</h3><p>生成一次性注册 Token，让新 Agent 建立自己的长期身份。有效期 10 分钟，倒计时结束后自动删除清理。</p></div>
     <div className="agent-package-card">
-      <div>
+      <div className="agent-package-details">
         <strong>Agent 客户端安装包</strong>
         {packageLoading
           ? <span>正在读取安装包信息…</span>
           : agentPackage?.available
-            ? <><span>v{agentPackage.version} · {agentPackage.size !== null ? formatFileSize(agentPackage.size) : "大小未知"} · Linux / macOS</span><code title={agentPackage.sha256 ?? undefined}>SHA-256 {agentPackage.sha256}</code></>
+            ? <><span>v{selectedPackage!.version} · {selectedPackage!.size !== null ? formatFileSize(selectedPackage!.size!) : "大小未知"} · {selectedPackage!.target ?? "旧版通用包"}</span><code title={selectedPackage?.sha256 ?? undefined}>SHA-256 {selectedPackage?.sha256}</code></>
             : <span>v{agentPackage?.version ?? __APP_VERSION__} 安装包尚未构建，请在服务端执行 npm run package:agent。</span>}
       </div>
-      <button type="button" className="primary-button" disabled={packageLoading || packageDownloading || !agentPackage?.available} onClick={() => void downloadPackage()}>{packageDownloading ? "下载中…" : "下载客户端"}</button>
+      <div className="agent-package-controls">
+        {Boolean(agentPackage?.packages?.length) && <label><span>安装目标</span><select aria-label="Agent 安装目标" value={packageTarget || agentPackage?.target || ""} onChange={(event) => setPackageTarget(event.target.value)}>{agentPackage?.packages?.map((item) => <option key={item.target} value={item.target}>{item.target?.replace("darwin", "macOS").replace("linux", "Linux")}</option>)}</select></label>}
+        <button type="button" className="primary-button" disabled={packageLoading || packageDownloading || !selectedPackage?.available} onClick={() => void downloadPackage()}>{packageDownloading ? "下载中…" : "下载客户端"}</button>
+      </div>
     </div>
     <div className="enrollment-create-card">
       <div><strong>注册新节点</strong><span>在目标机器准备好控制中心 HTTPS 地址，然后粘贴这里生成的 Token。</span></div>
@@ -2493,7 +2504,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
       {nodes.map((node) => <article key={node.id}>
         <div><strong>{node.name}</strong><small>{node.accessMode === "enrolled" ? "独立凭证" : node.accessMode === "revoked" ? "接入已撤销" : "旧共享凭证"} · {node.status === "online" ? "在线" : "离线"}{node.permissionMode === "danger-full-access" ? " · 全权限" : ""}</small></div>
         {confirmNodeId === node.id ? <div className="enrollment-node-confirm"><span>撤销后 Agent 会立即断开</span><button type="button" onClick={() => setConfirmNodeId(null)}>取消</button><button type="button" className="danger-text" disabled={busy} onClick={() => void revokeAccess(node)}>确认撤销</button></div>
-          : <button type="button" disabled={busy || node.accessMode !== "enrolled"} onClick={() => setConfirmNodeId(node.id)}>撤销接入</button>}
+          : <button type="button" className="danger-text" disabled={busy || node.accessMode !== "enrolled"} onClick={() => setConfirmNodeId(node.id)}>撤销接入</button>}
       </article>)}
     </div>}
     <div className="enrollment-history">
@@ -2517,7 +2528,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
               setCopiedId(entry.id);
               window.setTimeout(() => setCopiedId((current) => current === entry.id ? null : current), 1_500);
             }).catch((reason) => setError(formatErrorMessage(reason, "复制注册 Token")))}>{copiedId === entry.id ? "已复制" : "复制"}</button>}
-            {entry.status === "pending" && <button type="button" disabled={busy} onClick={() => void revoke(entry)}>撤销</button>}
+            {entry.status === "pending" && <button type="button" className="danger-text" disabled={busy} onClick={() => void revoke(entry)}>撤销</button>}
           </div>
         </article>;
       })}
@@ -2584,17 +2595,19 @@ function SettingsPanel({
     <section className="settings-panel" role="dialog" aria-modal="true" aria-label="设置">
       <header><div><span>Controller Center</span><h2>设置</h2></div><button type="button" onClick={onClose} aria-label="关闭设置">×</button></header>
       <div className="settings-layout">
-        <nav>
-          <button type="button" className={section === "defaults" ? "active" : ""} onClick={() => setSection("defaults")}>对话默认值</button>
-          <button type="button" className={section === "workspaces" ? "active" : ""} onClick={() => setSection("workspaces")}>工作空间</button>
-          <button type="button" className={section === "enrollment" ? "active" : ""} onClick={() => setSection("enrollment")}>节点接入</button>
-          <button type="button" className="settings-logout" disabled={busy} onClick={() => void logout()}>退出登录</button>
+        <nav aria-label="设置分类">
+          <button type="button" className={section === "defaults" ? "active" : ""} aria-current={section === "defaults" ? "page" : undefined} onClick={() => setSection("defaults")}><SettingsIcon /><span>对话默认值</span></button>
+          <button type="button" className={section === "workspaces" ? "active" : ""} aria-current={section === "workspaces" ? "page" : undefined} onClick={() => setSection("workspaces")}><FilesIcon /><span>工作空间</span></button>
+          <button type="button" className={section === "enrollment" ? "active" : ""} aria-current={section === "enrollment" ? "page" : undefined} onClick={() => setSection("enrollment")}><NodesIcon /><span>节点接入</span></button>
+          <button type="button" className="settings-logout" disabled={busy} onClick={() => void logout()}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 3H4v14h4M12 6l4 4-4 4M7 10h9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg><span>退出登录</span></button>
           <div className="settings-version"><span>Controller Center</span><strong>v{__APP_VERSION__}</strong></div>
         </nav>
         {section === "defaults" ? <form className="settings-form" onSubmit={(event) => void save(event)}>
           <div className="settings-copy"><h3>对话默认值</h3><p>创建新会话时优先使用这些选项。节点不支持所选模型时，将自动使用该节点的本机默认模型。</p></div>
-          <label><span>默认模型</span><select value={model} onChange={(event) => setModel(event.target.value)}><option value="">各节点本机默认</option>{models.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
-          <label><span>默认思考强度</span><select value={effort} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}><option value="">模型默认</option>{Object.entries(effortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <div className="settings-default-fields">
+            <label><span><strong>默认模型</strong><small>用于新建会话，已有会话保持原设置。</small></span><select aria-label="默认模型" value={model} onChange={(event) => setModel(event.target.value)}><option value="">各节点本机默认</option>{models.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
+            <label><span><strong>默认思考强度</strong><small>跟随模型默认值，或指定思考强度。</small></span><select aria-label="默认思考强度" value={effort} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}><option value="">模型默认</option>{Object.entries(effortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          </div>
           {error && <p className="form-error">{error}</p>}
           <div className="settings-actions"><button type="button" onClick={onClose}>取消</button><button className="primary-button" disabled={busy}>{busy ? "保存中…" : "保存设置"}</button></div>
         </form> : section === "workspaces"
@@ -4781,6 +4794,11 @@ export function App() {
       onRetry={() => void checkSession()}
       onAuthenticated={() => setState("authenticated")}
     />;
+  }
+  const nodeToolRoute = /^\/nodes\/([^/]+)\/(terminal|files)\/?$/u.exec(window.location.pathname);
+  if (nodeToolRoute) {
+    try { return <Suspense fallback={<main className="auth-loading">正在加载节点工具…</main>}><NodeToolsPage nodeId={decodeURIComponent(nodeToolRoute[1]!)} mode={nodeToolRoute[2] as "terminal" | "files"} /></Suspense>; }
+    catch { return <main>节点工具地址无效</main>; }
   }
   if (/^\/workspace-files\/opening\/?$/u.test(window.location.pathname)) return <WorkspaceFileOpeningPage />;
   const workspaceFileRoute = /^\/workspace-files\/([^/]+)\/?$/u.exec(window.location.pathname);

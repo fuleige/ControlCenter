@@ -50,6 +50,7 @@ chmod 0640 "$log_file"
 
 cd "$repository_root"
 npm run build -w @controller-center/protocol
+npm run build -w @controller-center/node-files
 npm run build -w @controller-center/control-plane
 
 control_pid=""

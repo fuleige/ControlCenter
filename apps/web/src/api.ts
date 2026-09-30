@@ -75,7 +75,12 @@ function responseRequestId(response: Response, body?: { requestId?: unknown }): 
 
 async function responseBody<T>(response: Response, method: string, path: string): Promise<ApiResponseBody<T>> {
   if (response.status === 204) return undefined as unknown as T & { error?: string };
-  const text = await response.text();
+  const text = await response.text().catch((cause) => {
+    throw new ApiError("读取控制中心响应时连接中断", {
+      kind: "network", status: response.status, method, path,
+      requestId: responseRequestId(response), cause,
+    });
+  });
   if (!text) {
     if (!response.ok) return undefined as unknown as ApiResponseBody<T>;
     throw new ApiError("控制中心返回了空响应", {
@@ -122,7 +127,7 @@ function apiErrorMessage(body: { error?: unknown } | undefined, status: number):
   return typeof body?.error === "string" && body.error.trim() ? body.error.trim() : fallbackHttpMessage(status);
 }
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const method = requestMethod(init);
@@ -471,11 +476,12 @@ export async function revokeEnrollmentToken(id: string): Promise<void> {
 }
 
 export async function getAgentPackageInfo(): Promise<AgentPackageInfo> {
-  return (await api<{ package: AgentPackageInfo }>("/api/agent-package")).package;
+  const result = await api<{ package: AgentPackageInfo; packages?: AgentPackageInfo[] }>("/api/agent-package");
+  return { ...result.package, packages: result.packages ?? [] };
 }
 
-export async function downloadAgentPackage(fileName: string): Promise<void> {
-  const path = "/api/agent-package/download";
+export async function downloadAgentPackage(fileName: string, target?: string): Promise<void> {
+  const path = `/api/agent-package/download${target ? `?target=${encodeURIComponent(target)}` : ""}`;
   const method = "GET";
   let response: Response;
   try {

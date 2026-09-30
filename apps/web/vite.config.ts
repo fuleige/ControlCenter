@@ -39,6 +39,7 @@ function controlProxy(target: string, websocket = false): ProxyOptions {
         if (controlProxyOrigin && request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
       });
       proxy.on("proxyReqWs", (proxyRequest, request) => {
+        if (request.headers.cookie) proxyRequest.setHeader("Cookie", upstreamCookieHeader(request.headers.cookie));
         if (controlProxyOrigin && request.headers.origin) proxyRequest.setHeader("Origin", controlProxyOrigin);
       });
       proxy.on("proxyRes", (proxyResponse) => {
@@ -75,9 +76,11 @@ export default defineConfig({
     strictPort: true,
     allowedHosts,
     proxy: {
+      "/api/node-tools": controlProxy(controlPlaneUrl, true),
       "/api": controlProxy(controlPlaneUrl),
       "/agent/connect": controlProxy(controlPlaneWebSocketUrl, true),
       "/agent/enroll": controlProxy(controlPlaneUrl),
+      "/agent/node-files": controlProxy(controlPlaneUrl),
       "/agent/attachments": controlProxy(controlPlaneUrl),
       "/healthz": controlProxy(controlPlaneUrl),
       "/readyz": controlProxy(controlPlaneUrl),

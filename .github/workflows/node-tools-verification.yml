@@ -1,0 +1,30 @@
+name: Verify node tools and build Agent packages
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w @controller-center/protocol && npm run build -w @controller-center/node-files
+      - run: npm run typecheck
+      - run: npm test
+      - run: NODE_TOOLS_LARGE_TEST=1 npm run test -w @controller-center/control-plane -- src/node-tools.test.ts -t 'exactly 1 GiB'
+      - run: npm run package:agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.runner }}
+          path: artifacts/*.tar.gz
+          if-no-files-found: error

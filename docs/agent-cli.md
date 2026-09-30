@@ -1,15 +1,15 @@
 # Agent 客户端命令与配置
 
-本文档对应 Agent `v0.3.13`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
+本文档对应 Agent `v0.3.15`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
 
 `AGENT_DATA_DIR` 不是必填项，省略时使用当前用户的 `~/.controller-center-agent`。它保存节点 ID、注册凭证、可靠队列和附件缓存，必须在注册与后续启动之间保持不变。它不决定 Codex 工作空间：Agent 的启动目录才是默认工作空间。正式使用不建议把状态默认放到当前目录，否则从不同项目启动时可能产生不同节点身份；隔离测试时可以显式指定当前目录下的绝对路径，例如先执行 `export AGENT_DATA_DIR="$PWD/test-data"`。
 
 ## 获取和安装
 
-登录 Controller Center Web，进入“设置 → 节点接入”，可下载当前独立发布的 Linux/macOS Agent。安装包已经包含编译结果和生产依赖，目标机器只需安装满足版本要求的 Node.js，不需要再次执行 `npm install` 或编译源码。
+登录 Controller Center Web，进入“设置 → 节点接入”，可下载当前独立发布的 Linux/macOS Agent。在下载页选择匹配系统、CPU 架构和 Linux libc 的安装包；只展示已构建的目标。安装包已经包含编译结果、生产依赖和 PTY 原生模块，目标机器需要 Node.js 24.x，不需要再次执行 `npm install` 或编译源码。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.13.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.15-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -17,7 +17,7 @@ sudo mv "$cc_agent_directory" /opt/controller-center-agent
 /opt/controller-center-agent/agent.sh start
 ```
 
-源码仓库执行 `npm run build` 时会自动生成 `artifacts/controller-center-agent-v<版本>.tar.gz`；只构建客户端包可执行 `npm run package:agent`。下载页同时展示 SHA-256，可在节点上用 `sha256sum`（Linux）或 `shasum -a 256`（macOS）核对。
+源码仓库执行 `npm run build` 时会自动生成 `artifacts/controller-center-agent-v<版本>-<系统架构>.tar.gz`；只构建客户端包可执行 `npm run package:agent`。构建只生成当前构建机目标的包，并在打包后实际启动 PTY 与调整尺寸。macOS 包必须在 macOS 上构建、验证，再放入服务端 `artifacts/`；Linux 包也需要匹配 libc。`BUILD-INFO.json` 记录构建目标、Node.js 与 glibc 版本。下载页同时展示 SHA-256，可在节点上用 `sha256sum`（Linux）或 `shasum -a 256`（macOS）核对。
 
 仅 Web 或 Control Plane 版本升级时，Agent 无需重新打包或重启。发布包含协议变化的新 Agent 时，应先部署并重启 Control Plane，再更新 Agent。若 Agent 显示 `4400 Protocol mismatch`，说明双方协议不兼容；节点注册凭据无需重建。
 
@@ -181,3 +181,12 @@ ExecStart=/usr/bin/node /opt/controller-center-agent/dist/index.js --yolo --code
 - 修改参数后执行 `systemctl daemon-reload` 并重启 Agent 服务。
 
 完整文件见 `deploy/systemd/controller-center-agent.service`，环境变量模板见 `deploy/agent.env.example`。
+## 节点终端与文件工具
+
+Agent v0.3.14 增加真实 PTY 与节点文件能力，旧 Agent 的聊天功能继续兼容协议 v5。Web 的“新开终端”和“节点文件”分别打开独立标签页。Shell 与文件操作使用 Agent 进程的系统用户，文件路径可以越出 Codex 工作空间；Codex 的 `--safe` / `--yolo` 不改变这些工具的权限。
+
+终端每次新开，不恢复历史；关闭、刷新、连接断开或 Agent 退出后回收 PTY。文件单个最大 1 GiB；页面仍打开时允许分片重试，关闭/刷新页面后结束未完成任务。最终下载由 Chrome 下载栏管理。上传临时文件的清理登记保存在 `AGENT_DATA_DIR/node-upload-cleanup.json`，不要在传输中手动删除登记文件。
+
+可选资源参数：`NODE_TERMINAL_LIMIT=8`、`NODE_FILE_CONCURRENCY=2`；建议与控制面的配置保持一致。原生 PTY 加载失败时只停用终端能力，其他 Agent 功能继续运行。
+
+Agent v0.3.15 补充清理登记写入失败后的保护与定时重试：存储异常不会因为后台清理而退出 Agent，存储恢复后自动补写登记。

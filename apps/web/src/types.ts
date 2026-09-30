@@ -213,6 +213,8 @@ export interface EnrollmentToken {
 }
 
 export interface AgentPackageInfo {
+  target?: string;
+  packages?: AgentPackageInfo[];
   available: boolean;
   version: string;
   fileName: string | null;

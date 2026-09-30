@@ -55,6 +55,15 @@ describe("API errors", () => {
     }
   });
 
+  it("classifies a lost response body as a retryable network error", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"offset":')); controller.error(new TypeError("Connection closed")); },
+    }), { headers: { "X-Request-Id": "lost-ack" } })));
+    await expect(listNodes()).rejects.toMatchObject({
+      kind: "network", status: 200, requestId: "lost-ack", method: "GET", path: "/api/nodes",
+    });
+  });
+
   it("preserves workspace concurrency conflict codes for confirmation flows", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       error: "工作空间已有正在运行或排队的任务",
