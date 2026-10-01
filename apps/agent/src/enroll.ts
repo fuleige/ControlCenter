@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { agentDataDirectory, loadOrCreateNodeId, type SavedAgentConnection } from "./config.js";
+import { requireAgentPackageRuntime } from "./package-runtime.js";
 import {
   CODEX_PROXY_ONLY_ARGUMENT,
   codexProxyOnlyFromArgv,
@@ -82,6 +83,7 @@ function persistConnection(dataDirectory: string, connection: SavedAgentConnecti
 }
 
 async function main(): Promise<void> {
+  requireAgentPackageRuntime();
   const codexProxyOnly = codexProxyOnlyFromArgv(process.argv.slice(2));
   const server = option("--server") ?? process.env.CONTROL_CENTER_URL;
   if (!server) throw new Error("缺少控制中心地址，请使用 --server https://control.example.com");

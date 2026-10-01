@@ -8,7 +8,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-15]
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64-glibc
+          - runner: macos-15
+            target: darwin-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -23,8 +27,16 @@ jobs:
       - run: npm test
       - run: NODE_TOOLS_LARGE_TEST=1 npm run test -w @controller-center/control-plane -- src/node-tools.test.ts -t 'exactly 1 GiB'
       - run: npm run package:agent
+        env:
+          AGENT_PACKAGE_EXPECTED_TARGET: ${{ matrix.target }}
+      - name: Verify the standalone installation
+        run: |
+          agent_version=$(node -p "require('./apps/agent/package.json').version")
+          node scripts/verify-agent-package.mjs "artifacts/controller-center-agent-v${agent_version}-${AGENT_PACKAGE_EXPECTED_TARGET}.tar.gz"
+        env:
+          AGENT_PACKAGE_EXPECTED_TARGET: ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-${{ matrix.runner }}
-          path: artifacts/*.tar.gz
+          name: agent-${{ matrix.target }}
+          path: artifacts/*-${{ matrix.target }}.tar.gz
           if-no-files-found: error

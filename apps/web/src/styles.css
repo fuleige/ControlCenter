@@ -1668,6 +1668,7 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 .agent-package-controls label { flex: 1; min-width: 0; display: grid; gap: 8px; }
 .agent-package-controls label span { color: #475467; font-size: 12px; font-weight: 550; }
 .settings-panel .agent-package-controls button { min-height: 40px; }
+.agent-package-notice { margin: 0; padding: 11px 13px; border: 1px solid #ead8b8; border-radius: 8px; background: #fffbf2; color: #8a6527; font-size: 12px; line-height: 1.7; }
 .enrollment-create-card { padding: 20px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border: 1px solid var(--border); border-radius: 12px; background: #fff; }
 .enrollment-create-card > div { min-width: 0; display: grid; gap: 5px; }
 .enrollment-create-card strong { color: #26364d; font-size: 13px; font-weight: 600; }

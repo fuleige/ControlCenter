@@ -28,6 +28,9 @@ if (!['linux', 'darwin'].includes(process.platform) || !['x64', 'arm64'].include
 }
 const libc = process.platform === 'linux' ? (process.report.getReport().header.glibcVersionRuntime ? 'glibc' : 'musl') : null;
 const target = [process.platform, process.arch, libc].filter(Boolean).join('-');
+if (process.env.AGENT_PACKAGE_EXPECTED_TARGET && process.env.AGENT_PACKAGE_EXPECTED_TARGET !== target) {
+  throw new Error(`Build target mismatch: expected ${process.env.AGENT_PACKAGE_EXPECTED_TARGET}, actual ${target}`);
+}
 const releaseName = `${baseReleaseName}-${target}`;
 const artifactName = `${releaseName}.tar.gz`;
 const artifactDirectory = path.resolve(process.env.AGENT_PACKAGE_OUTPUT_DIR || path.join(repositoryRoot, "artifacts"));

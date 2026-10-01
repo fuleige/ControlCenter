@@ -1862,6 +1862,53 @@ test("未认证访问会进入 Token 登录且登录后不在浏览器保存原�
   expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain("cca_test-admin-token");
 });
 
+test("安装包要求明确选择系统且 macOS 下载不会回退到 Linux", async ({ page }) => {
+  await mockControlCenter(page);
+  const linux = {
+    available: true, version: "0.3.16", target: "linux-x64-glibc", size: 100,
+    fileName: "controller-center-agent-v0.3.16-linux-x64-glibc.tar.gz", sha256: "test", builtAt: now,
+  };
+  const macOS = { ...linux, target: "darwin-arm64", fileName: "controller-center-agent-v0.3.16-darwin-arm64.tar.gz" };
+  let hasMacOS = false;
+  const requestedTargets: string[] = [];
+  await page.route("**/api/agent-package**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname.endsWith("/download")) {
+      const target = url.searchParams.get("target") ?? "";
+      requestedTargets.push(target);
+      const fileName = target === macOS.target ? macOS.fileName : linux.fileName;
+      await route.fulfill({ contentType: "application/gzip", headers: { "Content-Disposition": `attachment; filename="${fileName}"` }, body: "test-agent-package" });
+    } else await route.fulfill({ json: { package: linux, packages: hasMacOS ? [linux, macOS] : [linux] } });
+  });
+  await page.goto("/");
+  const openSettings = () => page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
+  await openSettings();
+  await page.getByRole("button", { name: "节点接入", exact: true }).click();
+  const target = page.getByRole("combobox", { name: "Agent 安装目标" });
+  const downloadButton = page.getByRole("button", { name: "下载客户端", exact: true });
+  await expect(target).toHaveValue("");
+  await expect(downloadButton).toBeDisabled();
+  await expect(page.getByText(/目前仅提供 Linux 安装包/)).toBeVisible();
+  await target.selectOption(linux.target);
+  await expect(downloadButton).toBeEnabled();
+  let download = page.waitForEvent("download");
+  await downloadButton.click();
+  expect((await download).suggestedFilename()).toBe(linux.fileName);
+
+  await page.getByRole("button", { name: "关闭设置" }).click();
+  hasMacOS = true;
+  await openSettings();
+  await page.getByRole("button", { name: "节点接入", exact: true }).click();
+  await expect(downloadButton).toBeDisabled();
+  await target.selectOption(macOS.target);
+  await expect(page.getByText(macOS.fileName, { exact: true })).toBeVisible();
+  await expect(page.getByText(/目前仅提供 Linux 安装包/)).toHaveCount(0);
+  download = page.waitForEvent("download");
+  await downloadButton.click();
+  expect((await download).suggestedFilename()).toBe(macOS.fileName);
+  expect(requestedTargets).toEqual([linux.target, macOS.target]);
+});
+
 test("设置页在列表展示注册 Token、状态和到期倒计时", async ({ page }) => {
   const registrationToken = "cce_00000000-0000-4000-8000-000000000001.test-registration-secret-value";
   let created = false;

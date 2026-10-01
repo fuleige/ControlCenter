@@ -1,6 +1,6 @@
 # 节点终端与文件管理设计
 
-> 状态：已实现并完成 Linux/Chromium 验证，已完成本机部署与实际网页检查；macOS 待实际环境验收
+> 状态：已实现并完成 Linux/Chromium 验证、部署与实际网页检查；macOS ARM64 v0.3.15 测试包经用户实机反馈可用，v0.3.16 原生 CI 尚未执行
 > 日期：2026-10-01
 > 范围：Controller Center Web、Control Plane、Linux/macOS Agent
 
@@ -261,3 +261,25 @@ macOS 实机与安装包验收门槛仍按第 13 节执行；未将 Linux 检查
 后续按用户要求清理本机测试节点：正常停止 Agent 及其子进程，撤销长期接入凭证，删除该节点的控制中心记录、工作空间登记与消息投递记录，再删除专用安装、状态、测试工作目录和旧安装备份。原有三个节点与控制中心备份保持完整；验收完成后不再保留在线测试节点。
 
 同轮调整设置页的三个分区：统一按钮、原生下拉框、输入框的字号、尺寸和焦点状态；分类导航增加图标与明确的选中状态，对话默认值改为分组表单，节点安装包的信息与操作分行排列。内容区独立滚动，工作空间操作、注册 Token 和撤销确认沿用原有交互。Web 构建、设置页和工作空间操作的桌面回归、390 px 与 320 px 移动布局回归通过，并在实际入口复核 1100×520 短窗口及移动尺寸。仅部署 Web，没有为这轮设置界面改动重新构建 Agent 或重启 Control Plane。
+
+## 17. macOS 原生模块缺失排查与安装防误用
+
+2026-10-01 用户在 macOS ARM64 上报告 `Failed to load native module: pty.node`，日志中的安装目录为 `controller-center-agent-v0.3.15-linux-x64-glibc`。服务端实际只生成了 Linux x64/glibc 包；该包会裁掉其他系统的原生文件。因此 Agent 的聊天与文件功能可以运行，但无法在 macOS 加载 PTY。此前下载页自动取第一个包，未明确强调当前缺少 macOS 包，属于打包交付与入口提示的遗漏。
+
+下载页改为必须显式选择目标系统和架构，显示易读的目标名称与准确的文件名；仅有 Linux 包时明确提示 macOS 暂不可下载。所选目标不存在时不回退到默认 Linux 包。Agent 独立升级至 v0.3.16，在注册及启动前校验 `BUILD-INFO.json` 的目标与 Node.js 24.x 要求；错误安装先给出匹配目标提示，再停止，避免创建新的节点身份或凭证。源码运行与旧纯 JavaScript 包维持原有入口。
+
+针对已误装 v0.3.15 的 Mac，可以停止 Agent，在原安装目录执行 `npm ci --omit=dev --ignore-scripts`，恢复锁文件固定的 `node-pty@1.1.0` 原始依赖及其 macOS 预编译模块，并给 `prebuilds/darwin-arm64/spawn-helper`（Intel 对应 `darwin-x64`）补执行权限。随后必须在 Mac 实际启动 PTY 验证，再保持原工作目录和 `AGENT_DATA_DIR` 启动。这是旧安装的临时修复；正式发布仍须在 Mac 上构建和验收匹配的安装包。
+
+本机通过 Agent 与 Web 类型检查、30 项 Agent 测试、3 项下载选择测试，以及实际浏览器的显式选择、Linux/macOS 下载目标隔离和旧下载入口回归。Linux v0.3.16 包通过真实 PTY 构建检查，并将独立包的目标临时改为不匹配值，验证注册与启动均在创建状态之前拒绝运行。浏览器测试中的 macOS 文件是接口夹具；当前尚未生成或验收实际 macOS 安装包，也未远程重启用户的 Mac Agent。
+
+继续复核时补齐安装包验证脚本 `scripts/verify-agent-package.mjs`，在解压后的实际包中验证真实 TTY、窗口尺寸、两个终端互不影响以及注册/启动的目标校验。Linux v0.3.16 包验证通过；验证只创建临时 Shell，不注册或保留测试节点。手动 CI 改为显式指定 Linux x64/glibc、Mac ARM64、Mac x64 的运行环境与预期目标，产物验证成功后才上传到对应目标的 artifact。已核对 GitHub 当前支持的 `macos-15`（ARM64）与 `macos-15-intel`（x64）标签；构建机实际目标不符合预期时，打包脚本会提前终止。当前仓库没有已执行的 Actions 记录，因此仍无经过验证的 macOS 产物。
+
+### 按用户要求先提供 ARM64 测试下载
+
+用户随后明确要求先在前端提供可下载的 Mac 包，由用户实机测试，并将范围收窄为 ARM64。新增 `scripts/build-agent-macos-preview.mjs`，复用现网 v0.3.15 Linux 包中的原始 JavaScript 和锁定生产依赖，检查原包版本及 node-pty 的固定版本、npm integrity 一致，再替换为官方 darwin-arm64 预编译模块。移除优先加载的 Linux build 目录和其他系统预编译目录，检查两个 Mac 文件的 Mach-O ARM64 头、补齐 spawn-helper 执行权限，并在 README、BUILD-INFO 中注明实机验证待完成。该包保留 v0.3.15 代码，不包含 v0.3.16 新增的启动目标校验，不把新代码伪装成旧版本。
+
+产物为 `artifacts/controller-center-agent-v0.3.15-darwin-arm64.tar.gz`。现网 Control Plane 缓存的 Agent 发布版本仍为 v0.3.15，但每次下载查询都会扫描 artifacts；因此新增对应版本的 ARM 包即可供现有页面发现，无需重启 Control Plane 或其他 Agent。下载页现有平台选择支持该目标，Intel 包不生成，后续原生 CI 也收窄为 Linux x64 与 Mac ARM64。Mac 运行结果仍以用户实机测试为准。
+
+当前会话的网络隔离导致本机控制中心及公网域名无法访问；已用现有 Control Plane 编译后的发现代码检查实际产物，得到 Linux x64/glibc 与 macOS ARM64 两个目标，但没有将这个检查当作线上浏览器已经验收。
+
+用户随后反馈 macOS ARM64 测试“好像没啥问题”，并要求提交此版本。记录为 v0.3.15 ARM64 测试包的用户实机反馈，产物 SHA-256 为 `2ca0a89391ed7f7c73b9c635f8c23090e8592a8fec26a9a574d0ae19392d1b5d`；保留已测试的安装包，不重新生成或改变其校验值。这一反馈不代表新增启动校验的 v0.3.16 Mac 包或未执行的原生 CI 已完成验收。

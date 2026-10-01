@@ -1,15 +1,15 @@
 # Agent 客户端命令与配置
 
-本文档对应 Agent `v0.3.15`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
+本文档对应 Agent `v0.3.16`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
 
 `AGENT_DATA_DIR` 不是必填项，省略时使用当前用户的 `~/.controller-center-agent`。它保存节点 ID、注册凭证、可靠队列和附件缓存，必须在注册与后续启动之间保持不变。它不决定 Codex 工作空间：Agent 的启动目录才是默认工作空间。正式使用不建议把状态默认放到当前目录，否则从不同项目启动时可能产生不同节点身份；隔离测试时可以显式指定当前目录下的绝对路径，例如先执行 `export AGENT_DATA_DIR="$PWD/test-data"`。
 
 ## 获取和安装
 
-登录 Controller Center Web，进入“设置 → 节点接入”，可下载当前独立发布的 Linux/macOS Agent。在下载页选择匹配系统、CPU 架构和 Linux libc 的安装包；只展示已构建的目标。安装包已经包含编译结果、生产依赖和 PTY 原生模块，目标机器需要 Node.js 24.x，不需要再次执行 `npm install` 或编译源码。
+登录 Controller Center Web，进入“设置 → 节点接入”，选择目标机器的系统、CPU 架构和 Linux libc，再下载对应安装包；页面不会自动选中第一个包，只展示已构建的目标。当服务端仅有 Linux 包时，会明确提示 macOS 包暂不可下载。安装包已经包含编译结果、生产依赖和 PTY 原生模块，目标机器需要 Node.js 24.x，不需要再次执行 `npm install` 或编译源码。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.15-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.16-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -17,7 +17,36 @@ sudo mv "$cc_agent_directory" /opt/controller-center-agent
 /opt/controller-center-agent/agent.sh start
 ```
 
-源码仓库执行 `npm run build` 时会自动生成 `artifacts/controller-center-agent-v<版本>-<系统架构>.tar.gz`；只构建客户端包可执行 `npm run package:agent`。构建只生成当前构建机目标的包，并在打包后实际启动 PTY 与调整尺寸。macOS 包必须在 macOS 上构建、验证，再放入服务端 `artifacts/`；Linux 包也需要匹配 libc。`BUILD-INFO.json` 记录构建目标、Node.js 与 glibc 版本。下载页同时展示 SHA-256，可在节点上用 `sha256sum`（Linux）或 `shasum -a 256`（macOS）核对。
+源码仓库执行 `npm run build` 时会自动生成 `artifacts/controller-center-agent-v<版本>-<系统架构>.tar.gz`；只构建客户端包可执行 `npm run package:agent`。常规构建只生成当前构建机目标的包，并在打包后实际启动 PTY 与调整尺寸。正式 macOS 发布需在 macOS 验证；Linux 包也需要匹配 libc。`BUILD-INFO.json` 记录构建目标、Node.js 与 glibc 版本。下载页同时展示 SHA-256，可在节点上用 `sha256sum`（Linux）或 `shasum -a 256`（macOS）核对。
+
+根据用户先下载再实机测试的要求，当前下载目录额外提供 `controller-center-agent-v0.3.15-darwin-arm64.tar.gz` 测试包，不提供 Intel 包。它沿用现网 Agent v0.3.15 的 JavaScript 和锁定依赖，替换为官方 `node-pty@1.1.0` macOS ARM64 预编译文件，并删除 Linux 原生构建、修正 helper 执行权限。没有将 v0.3.16 代码标为 v0.3.15；v0.3.16 的启动目标校验不包含在这个旧版本测试包中。测试包的 README 和 BUILD-INFO 标明 Mac 实机验证待完成。此包需要 ARM64 Node.js 24.x，升级已注册节点时保留原工作目录与 `AGENT_DATA_DIR`，无需重新注册。
+
+用户已反馈该 ARM64 包实机测试暂无异常；保留原产物及其 SHA-256，不为修改说明而重新打包。包内待测试标记描述生成时状态，最新验证反馈见节点工具设计文档第 17 节。v0.3.16 的 Mac 原生 CI 仍需执行。
+
+复现当前 ARM64 测试包可执行以下命令，不重新安装依赖或在 Linux 运行 Mac 二进制：
+
+```bash
+node scripts/build-agent-macos-preview.mjs artifacts/controller-center-agent-v0.3.15-linux-x64-glibc.tar.gz
+```
+
+macOS 上运行 ARM64 Node.js 时需要 `darwin-arm64` 包，Intel 或 Rosetta 下的 x64 Node.js 需要 `darwin-x64` 包；以 `node -p 'process.platform + "-" + process.arch'` 输出为准。Linux 包不能直接用于 macOS。Agent v0.3.16 在首次注册和启动前检查安装包构建目标及 Node.js 主版本，不匹配时明确提示并停止，避免错误注册或启动后才发现终端缺失。此检查不会读取或修改注册凭证。
+
+如需要在 Mac 构建独立包，在对应源码目录及 Node.js 24.x 环境执行：
+
+```bash
+npm ci
+npm run package:agent
+```
+
+构建完成并通过实际 PTY 检查后，将 `artifacts/controller-center-agent-v0.3.16-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
+
+将安装包放入下载目录前，在同一台构建机验证实际压缩包：
+
+```bash
+node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.16-darwin-arm64.tar.gz
+```
+
+此验证针对 v0.3.16 及后续版本：会解压到独立临时目录，检查版本与目标一致性，实际打开两个终端、验证 TTY 和窗口尺寸、关闭一个终端后确认另一个仍可交互，并确认错误目标会在创建节点状态前停止。验证不会注册测试节点或读取已有节点凭证。源码仓库提供手动触发的 `node-tools-verification.yml`，分别在 Linux x64 与 Mac ARM64 上构建、验证并保存对应目标的产物。旧版 v0.3.15 ARM64 测试包由用户在 Mac 通过网页实际打开终端及操作文件验收，不使用依赖新版启动校验模块的验证脚本。
 
 仅 Web 或 Control Plane 版本升级时，Agent 无需重新打包或重启。发布包含协议变化的新 Agent 时，应先部署并重启 Control Plane，再更新 Agent。若 Agent 显示 `4400 Protocol mismatch`，说明双方协议不兼容；节点注册凭据无需重建。
 

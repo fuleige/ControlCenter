@@ -42,8 +42,11 @@ import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 import { readWorkspaceFile } from "./workspace-files.js";
+import { requireAgentPackageRuntime } from "./package-runtime.js";
 
-const AGENT_VERSION = "0.3.15";
+requireAgentPackageRuntime();
+
+const AGENT_VERSION = "0.3.16";
 
 interface ActiveRun {
   conversationId: string;

@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { NodeToolButtons } from "./NodeToolButtons";
+import { agentPackageTargetLabel, selectAgentPackage } from "./agent-package-ui";
 const NodeToolsPage = lazy(() => import("./NodeToolsPage"));
 import "./node-tools.css";
 import { createPortal } from "react-dom";
@@ -2366,7 +2367,9 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   const [clock, setClock] = useState(Date.now());
   const [agentPackage, setAgentPackage] = useState<AgentPackageInfo | null>(null);
   const [packageTarget, setPackageTarget] = useState<string>("");
-  const selectedPackage = agentPackage?.packages?.find((item) => item.target === packageTarget) ?? agentPackage;
+  const availablePackages = agentPackage?.packages?.length ? agentPackage.packages : agentPackage?.target ? [agentPackage] : [];
+  const selectedPackage = selectAgentPackage(agentPackage, packageTarget);
+  const onlyLinuxPackages = availablePackages.length > 0 && availablePackages.every((item) => item.target?.startsWith("linux-"));
   const [packageLoading, setPackageLoading] = useState(true);
   const [packageDownloading, setPackageDownloading] = useState(false);
   const [packageError, setPackageError] = useState<string | null>(null);
@@ -2485,14 +2488,17 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
         <strong>Agent 客户端安装包</strong>
         {packageLoading
           ? <span>正在读取安装包信息…</span>
-          : agentPackage?.available
-            ? <><span>v{selectedPackage!.version} · {selectedPackage!.size !== null ? formatFileSize(selectedPackage!.size!) : "大小未知"} · {selectedPackage!.target ?? "旧版通用包"}</span><code title={selectedPackage?.sha256 ?? undefined}>SHA-256 {selectedPackage?.sha256}</code></>
-            : <span>v{agentPackage?.version ?? __APP_VERSION__} 安装包尚未构建，请在服务端执行 npm run package:agent。</span>}
+          : selectedPackage?.available
+            ? <><span>v{selectedPackage.version} · {selectedPackage.size !== null ? formatFileSize(selectedPackage.size) : "大小未知"} · {selectedPackage.target ? agentPackageTargetLabel(selectedPackage.target) : "旧版通用包"}</span><code title={selectedPackage.fileName ?? undefined}>{selectedPackage.fileName}</code><code title={selectedPackage.sha256 ?? undefined}>SHA-256 {selectedPackage.sha256}</code></>
+            : availablePackages.length > 0
+              ? <span>请先选择目标机器的系统和架构。安装包不能跨系统或架构使用。</span>
+              : <span>Agent v{agentPackage?.version ?? __APP_VERSION__} 安装包暂不可下载。</span>}
       </div>
       <div className="agent-package-controls">
-        {Boolean(agentPackage?.packages?.length) && <label><span>安装目标</span><select aria-label="Agent 安装目标" value={packageTarget || agentPackage?.target || ""} onChange={(event) => setPackageTarget(event.target.value)}>{agentPackage?.packages?.map((item) => <option key={item.target} value={item.target}>{item.target?.replace("darwin", "macOS").replace("linux", "Linux")}</option>)}</select></label>}
+        {availablePackages.length > 0 && <label><span>安装目标</span><select aria-label="Agent 安装目标" value={packageTarget} disabled={packageDownloading} onChange={(event) => { setPackageTarget(event.target.value); setPackageError(null); }}><option value="" disabled>请选择目标节点的系统和架构</option>{availablePackages.map((item) => <option key={item.target} value={item.target}>{agentPackageTargetLabel(item.target!)}</option>)}</select></label>}
         <button type="button" className="primary-button" disabled={packageLoading || packageDownloading || !selectedPackage?.available} onClick={() => void downloadPackage()}>{packageDownloading ? "下载中…" : "下载客户端"}</button>
       </div>
+      {onlyLinuxPackages && <p className="agent-package-notice" role="status">目前仅提供 Linux 安装包，macOS 安装包暂不可下载。请勿在 macOS 上使用 Linux 包。</p>}
     </div>
     <div className="enrollment-create-card">
       <div><strong>注册新节点</strong><span>在目标机器准备好控制中心 HTTPS 地址，然后粘贴这里生成的 Token。</span></div>

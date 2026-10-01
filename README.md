@@ -25,7 +25,7 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 
 - Web 使用随机管理员 Token 登录，服务端建立 HttpOnly 会话；管理员原始 Token 不进入前端构建、Local Storage 或 URL。
 - Web 可生成 10 分钟有效的节点注册 Token；有效期内可在列表查看、复制和确认注册状态，到期自动删除；Agent 首次注册后使用与固定节点 ID 绑定的独立长期凭证。
-- “设置 → 节点接入”可下载当前独立发布的 Linux/macOS Agent 安装包，并展示 Agent 版本、文件大小与 SHA-256；下载接口沿用管理员登录态，不公开匿名静态地址。
+- “设置 → 节点接入”按系统和架构展示已准备的 Agent 安装包，选择后可下载，并查看 Agent 版本、文件大小与 SHA-256；当前下载目录包含已验收的 Linux x64/glibc 包，以及用户实机测试反馈可用的 macOS ARM64 包，不能跨系统使用。下载接口沿用管理员登录态，不公开匿名静态地址。
 - Agent 注册、心跳、断线检测和自动重连；迁移期间仍兼容旧共享 Token。
 - Agent 可在启动时显式传入 `--yolo`，以关闭 Codex 审批和沙箱；节点会把当前权限模式上报给中心，Web 在节点名称旁持续显示“全权限”。
 - Agent 统一读取 Linux/macOS CLI 常用的代理环境变量；可通过 `--codex-proxy-only` 让控制中心注册、控制通道和附件下载强制直连，同时只让 Codex 子进程继承系统代理。
@@ -171,7 +171,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可选择并下载匹配系统/CPU 架构/libc 的客户端安装包；该包已经包含编译结果、生产依赖和 PTY 原生模块，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.15-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.16-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
