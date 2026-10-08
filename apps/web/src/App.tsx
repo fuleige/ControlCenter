@@ -3029,6 +3029,7 @@ function ChatPanel({
   const [deletingFileId, setDeletingFileId] = useState<string | null>(null);
   const timelineElement = useRef<HTMLDivElement>(null);
   const promptElement = useRef<HTMLTextAreaElement>(null);
+  const promptComposing = useRef(false);
   const fileInputElement = useRef<HTMLInputElement>(null);
   const followStreamingOutput = useRef(true);
   const timelinePositioned = useRef(false);
@@ -3142,7 +3143,6 @@ function ChatPanel({
     setWorkspaceId(initialWorkspace);
     setModel(initialModel);
     setEffort(resolvedEffort);
-    setPrompt(storedValue(composerStorageKey) ?? "");
     setMessageRequestId(newDraftRequestId());
     setUploads((current) => {
       for (const upload of current) if (upload.previewUrl) URL.revokeObjectURL(upload.previewUrl);
@@ -3164,8 +3164,9 @@ function ChatPanel({
   }, [showCompactConfirm, compactSubmitting]);
 
   useEffect(() => {
-    storeValue(composerStorageKey, prompt || null);
-  }, [composerStorageKey, prompt]);
+    if (!node || !isDraft && !detail) return;
+    setPrompt(storedValue(composerStorageKey) ?? "");
+  }, [composerStorageKey, isDraft]);
 
   useEffect(() => {
     if (isDraft) storeValue(draftWorkspaceStorageKey, workspaceId || null);
@@ -3392,8 +3393,20 @@ function ChatPanel({
     });
   }
 
+  function updatePrompt(value: string): void {
+    storeValue(composerStorageKey, value || null);
+    setPrompt(value);
+  }
+
+  function clearSentPrompt(): void {
+    // The panel may unmount as soon as a conversation starts. Clear storage
+    // synchronously, preserving any newer draft edited while sending.
+    if (storedValue(composerStorageKey) === prompt) storeValue(composerStorageKey, null);
+    setPrompt((current) => current === prompt ? "" : current);
+  }
+
   async function sendMessage(allowWorkspaceConcurrency = false): Promise<void> {
-    if (!node || !workspaceId || !prompt.trim() || activeRun && !activeRun.remoteTurnId || uploads.some((upload) => upload.status !== "ready")) return;
+    if (busy || !node || !workspaceId || !prompt.trim() || activeRun && !activeRun.remoteTurnId || uploads.some((upload) => upload.status !== "ready")) return;
     setBusy(true);
     setError(null);
     try {
@@ -3409,7 +3422,7 @@ function ChatPanel({
           ...(attachmentIds.length ? { attachmentIds } : {}),
           ...(allowWorkspaceConcurrency ? { allowWorkspaceConcurrency: true } : {}),
         });
-        setPrompt("");
+        clearSentPrompt();
         clearUploads();
         onConversationStarted(result.conversation, result.run, draftRequestId);
       } else if (activeRun?.remoteTurnId && ["running", "waiting_approval"].includes(activeRun.status)) {
@@ -3417,7 +3430,7 @@ function ChatPanel({
           clientRequestId: messageRequestId,
           ...(attachmentIds.length ? { attachmentIds } : {}),
         });
-        setPrompt("");
+        clearSentPrompt();
         clearUploads();
         setMessageRequestId(newDraftRequestId());
       } else {
@@ -3428,7 +3441,7 @@ function ChatPanel({
           ...(attachmentIds.length ? { attachmentIds } : {}),
           ...(allowWorkspaceConcurrency ? { allowWorkspaceConcurrency: true } : {}),
         });
-        setPrompt("");
+        clearSentPrompt();
         clearUploads();
         setMessageRequestId(newDraftRequestId());
       }
@@ -3713,7 +3726,9 @@ function ChatPanel({
         <textarea
           ref={promptElement}
           value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
+          onChange={(event) => updatePrompt(event.target.value)}
+          onCompositionStart={() => { promptComposing.current = true; }}
+          onCompositionEnd={() => { promptComposing.current = false; }}
           placeholder={compactionActive ? "正在压缩上下文…" : activeRun ? "向正在执行的任务追加指令…" : "描述你希望 Codex 完成的任务…"}
           rows={2}
           disabled={!canCompose}
@@ -3722,6 +3737,7 @@ function ChatPanel({
             if (images.length > 0) addFiles(images);
           }}
           onKeyDown={(event) => {
+            if (promptComposing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();

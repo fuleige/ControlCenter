@@ -1672,6 +1672,132 @@ test("后台刷新显示真实错误上下文，支持关闭并在重试成功�
   await expect.poll(() => conversationRequests).toBeGreaterThanOrEqual(4);
 });
 
+async function openNewChat(page: Page): Promise<void> {
+  const historyButton = page.locator(".conversations-pane").getByRole("button", { name: "新建会话" });
+  if (await historyButton.isVisible()) await historyButton.click();
+  else await page.locator(".mobile-chat-topbar").getByRole("button", { name: "新建会话" }).click();
+}
+
+test("首条消息发送成功后新建会话不会恢复已发送的草稿", async ({ page }) => {
+  const submissions: Array<{ prompt: string }> = [];
+  await mockControlCenter(page, { unopenedNode: true });
+  await page.route("**/api/conversations/start", async (route) => {
+    submissions.push(route.request().postDataJSON() as { prompt: string });
+    await route.fulfill({ json: { conversation, run, deduplicated: false } });
+  });
+
+  await page.goto("/");
+  await openNewChat(page);
+  const composer = page.locator(".composer textarea");
+  await composer.fill("发送后不应重新出现的中文任务");
+  await page.getByRole("button", { name: "发送" }).click();
+  await expect(page.locator(".chat-title strong")).toHaveText(conversation.title);
+  expect(submissions).toEqual([expect.objectContaining({ prompt: "发送后不应重新出现的中文任务" })]);
+  expect(await page.evaluate(() => localStorage.getItem("controller-center:composer:qa-node:new"))).toBeNull();
+
+  await openNewChat(page);
+  await expect(page.getByRole("heading", { name: "开始一个新会话" })).toBeVisible();
+  await expect(composer).toHaveValue("");
+});
+
+test("加载和切换会话时保留各自未发送的输入草稿", async ({ page }) => {
+  await mockControlCenter(page, { idleConversation: true });
+  await page.addInitScript(() => {
+    localStorage.setItem("controller-center:composer:qa-node:new", "尚未发送的新会话草稿");
+    localStorage.setItem("controller-center:composer:qa-node:qa-conversation", "历史会话里的未发送草稿");
+  });
+
+  await page.goto("/");
+  const composer = page.locator(".composer textarea");
+  await expect(composer).toHaveValue("历史会话里的未发送草稿");
+  await openNewChat(page);
+  await expect(composer).toHaveValue("尚未发送的新会话草稿");
+  await composer.fill("继续编辑的新会话草稿");
+
+  const historyButton = page.locator(".mobile-chat-topbar").getByRole("button", { name: "打开历史会话" });
+  if (await historyButton.isVisible()) await historyButton.click();
+  await page.locator(".conversation-card").filter({ hasText: conversation.title }).click();
+  await expect(composer).toHaveValue("历史会话里的未发送草稿");
+  expect(await page.evaluate(() => localStorage.getItem("controller-center:composer:qa-node:new"))).toBe("继续编辑的新会话草稿");
+
+  await openNewChat(page);
+  await expect(composer).toHaveValue("继续编辑的新会话草稿");
+});
+
+test("输入法选词回车不发送且普通回车发送完整中文消息", async ({ page }) => {
+  const submissions: Array<{ prompt: string }> = [];
+  await mockControlCenter(page, { idleConversation: true });
+  await page.route(`**/api/conversations/${conversation.id}/runs`, async (route) => {
+    submissions.push(route.request().postDataJSON() as { prompt: string });
+    await route.fulfill({ json: { run } });
+  });
+
+  await page.goto("/");
+  const composer = page.locator(".composer textarea");
+  await composer.fill("输入法选词中的任务");
+  await composer.dispatchEvent("compositionstart");
+  expect(await composer.evaluate((element) => element.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", bubbles: true, cancelable: true,
+  })))).toBe(true);
+  await composer.dispatchEvent("compositionend");
+  for (const properties of [{ isComposing: true }, { keyCode: 229 }]) {
+    expect(await composer.evaluate((element, properties) => element.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Enter", bubbles: true, cancelable: true, ...properties,
+    })), properties)).toBe(true);
+  }
+  await composer.press("Shift+Enter");
+  expect(submissions).toHaveLength(0);
+
+  await composer.fill("已经完成选词的中文任务");
+  await composer.press("Enter");
+  await expect(composer).toHaveValue("");
+  expect(submissions).toEqual([expect.objectContaining({ prompt: "已经完成选词的中文任务" })]);
+  expect(await page.evaluate(() => localStorage.getItem("controller-center:composer:qa-node:qa-conversation"))).toBeNull();
+});
+
+for (const idleConversation of [true, false]) {
+  test(`${idleConversation ? "发送消息" : "追加指令"}失败保留草稿且成功时只清除已发送内容`, async ({ page }) => {
+    let submissionCount = 0;
+    let releaseResponse!: () => void;
+    const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+    await mockControlCenter(page, { idleConversation });
+    const endpoint = idleConversation ? `conversations/${conversation.id}/runs` : `runs/${run.id}/steer`;
+    await page.route(`**/api/${endpoint}`, async (route) => {
+      submissionCount += 1;
+      if (submissionCount === 1) {
+        await route.fulfill({ status: 503, json: { error: "发送暂时失败" } });
+      } else {
+        if (submissionCount === 2) await responseGate;
+        await route.fulfill({ json: { run } });
+      }
+    });
+
+    await page.goto("/");
+    const composer = page.locator(".composer textarea");
+    const sendButton = page.locator(".send-button");
+    await composer.fill("失败后可以重试的消息");
+    await sendButton.click();
+    await expect(page.locator(".composer-error")).toContainText("发送暂时失败");
+    await expect(composer).toHaveValue("失败后可以重试的消息");
+    expect(await page.evaluate(() => localStorage.getItem("controller-center:composer:qa-node:qa-conversation"))).toBe("失败后可以重试的消息");
+
+    await sendButton.click();
+    await expect.poll(() => submissionCount).toBe(2);
+    await composer.fill("等待发送结果时输入的新草稿");
+    await composer.press("Enter");
+    expect(submissionCount).toBe(2);
+    releaseResponse();
+    await expect(sendButton).toBeEnabled();
+    await expect(composer).toHaveValue("等待发送结果时输入的新草稿");
+    expect(await page.evaluate(() => localStorage.getItem("controller-center:composer:qa-node:qa-conversation"))).toBe("等待发送结果时输入的新草稿");
+
+    await sendButton.click();
+    await expect(composer).toHaveValue("");
+    expect(submissionCount).toBe(3);
+    expect(await page.evaluate(() => localStorage.getItem("controller-center:composer:qa-node:qa-conversation"))).toBeNull();
+  });
+}
+
 test("同工作区已有任务时确认后才并发启动", async ({ page }, testInfo) => {
   const createdConversation = {
     ...conversation,
