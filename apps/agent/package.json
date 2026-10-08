@@ -1,6 +1,6 @@
 {
   "name": "@controller-center/agent",
-  "version": "0.3.16",
+  "version": "0.3.18",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -16,13 +16,14 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@controller-center/node-files": "*",
     "@controller-center/protocol": "*",
     "https-proxy-agent": "^9.1.0",
+    "node-datachannel": "0.33.4",
     "node-pty": "1.1.0",
     "proxy-from-env": "^2.1.0",
     "undici": "^8.10.2",
-    "ws": "^8.18.3",
-    "@controller-center/node-files": "*"
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/proxy-from-env": "^1.0.4",

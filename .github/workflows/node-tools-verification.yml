@@ -26,6 +26,11 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: NODE_TOOLS_LARGE_TEST=1 npm run test -w @controller-center/control-plane -- src/node-tools.test.ts -t 'exactly 1 GiB'
+      - run: npm run build -w @controller-center/web
+      - run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+      - run: npm run test:e2e -w @controller-center/web -- --config playwright.node-tools.config.ts
+      - run: NODE_TOOLS_DIRECT_LARGE_TEST=1 npm run test:e2e -w @controller-center/web -- --config playwright.node-tools.config.ts --grep '1 GiB'
       - run: npm run package:agent
         env:
           AGENT_PACKAGE_EXPECTED_TARGET: ${{ matrix.target }}

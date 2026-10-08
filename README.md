@@ -1,6 +1,6 @@
 # Controller Center
 
-一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据始终留在节点本地。工作区文件默认不上传；对话文件预览和节点文件传输只处理管理员明确选择的文件，并按各自的临时任务规则经控制中心转发。
+一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据始终留在节点本地。工作区文件默认不上传；文件预览和传输只处理管理员明确选择的文件，节点文件上传、下载可使用 WebRTC 直连或控制中心中转。
 
 产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。节点工具方案和验证记录见 [节点终端与文件管理设计](docs/node-tools-design.md)。Agent 可用参数、环境变量、优先级和组合示例见 [Agent 客户端命令与配置](docs/agent-cli.md)。代码按这些边界实施。
 
@@ -81,6 +81,8 @@ npm run build
 ```bash
 npm run package:agent
 ```
+
+新包通过构建检查并成功生成后，会自动清理同一输出目录中的其他版本安装包和源码归档，只保留当前 Agent 版本的各系统/架构包；构建失败时保留原包。也可执行 `npm run clean:agent-packages` 清理已有历史包。设置 `AGENT_PACKAGE_OUTPUT_DIR` 时只处理指定目录。
 
 终端一，启动控制中心：
 
@@ -171,7 +173,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可选择并下载匹配系统/CPU 架构/libc 的客户端安装包；该包已经包含编译结果、生产依赖和 PTY 原生模块，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.16-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.18-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -227,6 +229,7 @@ npm run agent:enroll -- --server https://control.example.com --codex-proxy-only
 | `NODE_FILES_DISK_RESERVE_BYTES` | `536870912` | 文件暂存必须保留的磁盘余量（512 MiB） |
 | `NODE_TERMINAL_LIMIT` | `8` | 单节点同时打开的 PTY 上限，Agent 也可设置 |
 | `NODE_FILE_CONCURRENCY` | `2` | 单节点正在传输/校验的文件任务上限，Agent 也可设置 |
+| `NODE_FILES_STUN_URLS` | Cloudflare、Twilio、Google 三个地址 | 逗号分隔的 STUN 候选地址；未设置使用默认列表，显式留空只交换主机候选，首版不使用 TURN |
 
 Agent：
 
@@ -287,9 +290,11 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 
 ## 节点终端与文件管理
 
-选择在线节点后，可通过“新开终端”和“节点文件”打开独立标签页。终端为真实 PTY，可正常使用 Vim/tmux 等已安装程序；每次新开，关闭或断线后结束，不提供历史恢复。文件管理提供目录浏览、批量上传/下载，单文件最大 1 GiB，整批同名覆盖一次确认；最终下载进度在 Chrome 下载栏查看。完整生命周期与错误提示见 [设计及验证记录](docs/node-tools-design.md)。
+选择在线节点后，可通过“新开终端”和“节点文件”打开独立标签页。终端为真实 PTY，可正常使用 Vim/tmux 等已安装程序；每次新开，关闭或断线后结束，不提供历史恢复。文件管理提供目录浏览、批量上传/下载，单文件最大 1 GiB，整批同名覆盖一次确认。
 
-需要新的 Web、Control Plane 和 Agent v0.3.14 才能使用全部功能；旧 Agent 继续支持原有聊天，工具入口显示升级提示。
+2026-10-08 已实现 WebRTC 直连上传/下载、开页检测和独立的传输方式选择，并更新生产 Web 与 Control Plane；节点 Agent 独立升级。Agent v0.3.17 起声明 `node_files_direct_v1`，旧 Agent 继续中转。可用时默认直连，已选直连任务失败后须用户确认才创建中转新任务并从头传输。直连下载在网页流式保存；初始选择中转仍交给 Chrome 原生下载。STUN 默认候选为 `stun:stun.cloudflare.com:3478`、`stun:global.stun.twilio.com:3478`、`stun:stun.l.google.com:19302`；可通过 `NODE_FILES_STUN_URLS` 覆盖，显式留空关闭 STUN。文件页显示可展开的诊断详情，失败时展开，并向浏览器控制台输出地址错误和连接阶段；单个 STUN 错误不直接判定整个直连不可用。当前客户端为 v0.3.18，修正旧 v0.3.17 安装包把发送排队误判为断连的问题；测试直连需升级对应 Agent 并验证两端实际网络。完整生命周期、验证边界与生产发布记录见 [节点工具设计](docs/node-tools-design.md)。
+
+已实现的终端与中转文件工具需要对应 Web、Control Plane 以及 Agent v0.3.14 或更新版本；缺少工具 capability 的旧 Agent 继续支持原有聊天，工具入口显示升级提示。后续仅缺少直连能力的 Agent 保留中转入口。
 
 ## 安全边界
 

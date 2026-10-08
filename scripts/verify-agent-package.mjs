@@ -30,9 +30,11 @@ try {
   accessSync(path.join(directory, "agent.sh"), constants.X_OK);
   run(process.execPath, ["--input-type=module", "-e", String.raw`
     import { randomUUID } from 'node:crypto';
-    import { assertAgentPackageRuntime } from './dist/package-runtime.js';
+    import { agentPackageVersion, assertAgentPackageRuntime } from './dist/package-runtime.js';
+    import { readFileSync } from 'node:fs';
     import { NodeTerminals } from './dist/node-terminals.js';
     assertAgentPackageRuntime();
+    if (agentPackageVersion() !== JSON.parse(readFileSync('./package.json', 'utf8')).version) throw new Error('Packaged Agent reports the wrong release version');
     const events = [];
     const manager = new NodeTerminals(process.cwd(), event => { events.push(event); return true; });
     const output = id => events.filter(event => event.action === 'terminal.output' && event.id === id).map(event => event.data).join('');
@@ -57,6 +59,49 @@ try {
       await waitFor(() => /(?:^|[\r\n])__PACKAGE_SECOND__\r?\n/.test(output(two)), 'The second terminal did not survive');
       console.log('Packaged Agent: real TTY, resize, two terminals and independent close passed');
     } finally { manager.dispose(); }
+  `], directory);
+  run(process.execPath, ["--input-type=module", "-e", String.raw`
+    import * as rtc from 'node-datachannel';
+    import { DirectWire } from '@controller-center/protocol';
+    import { nativeFileChannelAdapter } from './dist/direct-files.js';
+    rtc.preload();
+    const first = new rtc.PeerConnection('package-direct-one', {iceServers:[], maxMessageSize:16384});
+    const second = new rtc.PeerConnection('package-direct-two', {iceServers:[], maxMessageSize:16384});
+    first.onLocalDescription((sdp,type) => second.setRemoteDescription(sdp,type));
+    second.onLocalDescription((sdp,type) => first.setRemoteDescription(sdp,type));
+    first.onLocalCandidate((candidate,mid) => second.addRemoteCandidate(candidate,mid));
+    second.onLocalCandidate((candidate,mid) => first.addRemoteCandidate(candidate,mid));
+    const expected = Buffer.alloc(1024 * 1024, 0x5a);
+    let queued = 0; const wires = [];
+    const queuedAdapter = channel => nativeFileChannelAdapter({
+      sendMessage: value => { channel.sendMessage(value); queued++; return false; },
+      sendMessageBinary: value => { channel.sendMessageBinary(value); queued++; return false; },
+      bufferedAmount: () => channel.bufferedAmount(), maxMessageSize: () => channel.maxMessageSize(),
+      isOpen: () => channel.isOpen(), close: () => channel.close(),
+    });
+    const receive = (channel, wire) => channel.onMessage(data => wire.receive(typeof data === 'string' ? data : new Uint8Array(data)));
+    second.onDataChannel(channel => {
+      const wire = new DirectWire(queuedAdapter(channel), async (_value, bytes) => {
+        if (!bytes || !Buffer.from(bytes).equals(expected)) throw new Error('Packaged DataChannel corrupt payload');
+        return { offset: bytes.length };
+      });
+      wires.push(wire); receive(channel, wire);
+    });
+    try {
+      await new Promise((resolve,reject) => {
+        const timer=setTimeout(() => reject(new Error('Packaged DataChannel queued transfer failed')),10000);
+        const channel=first.createDataChannel('package-check');
+        const wire = new DirectWire(queuedAdapter(channel), async () => ({})); wires.push(wire); receive(channel, wire);
+        channel.onOpen(() => {
+          void wire.request({ kind: 'chunk', offset: 0 }, AbortSignal.timeout(8000), expected).then(result => {
+            clearTimeout(timer);
+            if (result.offset !== expected.length || queued < 66) reject(new Error('Packaged queued send acknowledgement failed'));
+            else resolve();
+          }).catch(error => { clearTimeout(timer); reject(error); });
+        });
+      });
+      console.log('Packaged Agent: native WebRTC handshake and 1 MiB queued-send acknowledgement passed');
+    } finally { for (const wire of wires) wire.close(); first.close(); second.close(); rtc.cleanup(); }
   `], directory);
 
   // Exercise both entry points with incompatible metadata before any registration,

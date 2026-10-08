@@ -8,6 +8,7 @@ import {
   CONTROL_PROTOCOL_VERSION,
   TERMINAL_PTY_CAPABILITY,
   NODE_FILES_CAPABILITY,
+  NODE_FILES_DIRECT_CAPABILITY,
   WORKSPACE_FILE_READ_CAPABILITY,
   isRecord,
   parseControlMessage,
@@ -42,11 +43,11 @@ import { loadConfig } from "./config.js";
 import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbound-network.js";
 import { AgentStateStore } from "./state-store.js";
 import { readWorkspaceFile } from "./workspace-files.js";
-import { requireAgentPackageRuntime } from "./package-runtime.js";
+import { agentPackageVersion, requireAgentPackageRuntime } from "./package-runtime.js";
 
 requireAgentPackageRuntime();
 
-const AGENT_VERSION = "0.3.16";
+const AGENT_VERSION = agentPackageVersion();
 
 interface ActiveRun {
   conversationId: string;
@@ -1107,7 +1108,7 @@ function connect(): void {
         maxConcurrentRuns: config.maxConcurrentRuns,
         workspaces: config.workspaces,
         models: availableModels,
-        capabilities: [WORKSPACE_FILE_READ_CAPABILITY, ...(nodeTerminals.available ? [TERMINAL_PTY_CAPABILITY] : []), ...(nodeFiles ? [NODE_FILES_CAPABILITY] : [])],
+        capabilities: [WORKSPACE_FILE_READ_CAPABILITY, ...(nodeTerminals.available ? [TERMINAL_PTY_CAPABILITY] : []), ...(nodeFiles ? [NODE_FILES_CAPABILITY] : []), ...(nodeFiles?.direct.available ? [NODE_FILES_DIRECT_CAPABILITY] : [])],
       },
     });
   });
@@ -1260,6 +1261,7 @@ async function bootstrap(): Promise<void> {
   if (process.platform === "linux" || process.platform === "darwin") {
     try { nodeFiles = new NodeFiles(config.dataDirectory, defaultDirectory, outboundNetwork, config.controlUrl, emitNodeTool, Number(process.env.NODE_FILE_CONCURRENCY) || 2); }
     catch (error) { console.warn("[agent] node files unavailable:", error instanceof Error ? error.message : "初始化失败"); }
+    await nodeFiles?.direct.initialize();
   }
   cleanupAttachmentCache();
   attachmentCleanupTimer = setInterval(cleanupAttachmentCache, 60 * 60 * 1000);

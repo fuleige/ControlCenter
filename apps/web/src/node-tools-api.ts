@@ -1,11 +1,11 @@
-import type { NodeDirectory, NodeFileTaskView, NodeUploadTarget } from '@controller-center/protocol';
+import type { NodeDirectory, NodeFileTaskView, NodeUploadTarget, NodeFileSignal, NodeFileTransport } from '@controller-center/protocol';
 import { API_URL, ApiError, api } from './api';
 export interface ToolInfo { online: boolean; terminal: boolean; files: boolean }
 export const toolInfo = (nodeId: string) => api<ToolInfo>(`/api/node-tools/nodes/${encodeURIComponent(nodeId)}/info`, { signal: AbortSignal.timeout(30_000) });
 export function socketUrl(endpoint: string): string {
   const url = new URL(`${API_URL}${endpoint}`, window.location.href); url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'; return url.toString();
 }
-export const createFilePage = (nodeId: string) => api<{ pageId: string }>(`/api/node-tools/nodes/${encodeURIComponent(nodeId)}/pages`, { method: 'POST', signal: AbortSignal.timeout(30_000) });
+export const createFilePage = (nodeId: string) => api<{ pageId: string; direct: boolean; stunUrls: string[] }>(`/api/node-tools/nodes/${encodeURIComponent(nodeId)}/pages`, { method: 'POST', signal: AbortSignal.timeout(30_000) });
 export class FilePageApi {
   private readonly controller = new AbortController();
   constructor(readonly id: string) {}
@@ -17,8 +17,12 @@ export class FilePageApi {
   list(path: string, cursor = 0) { return this.request<{ directory: NodeDirectory }>(`/api/node-tools/files/list?path=${encodeURIComponent(path)}&cursor=${cursor}`); }
   preflight(directory: string, files: File[]) { return this.request<{ planId: string; targets: NodeUploadTarget[] }>('/api/node-tools/files/preflight',
     { method: 'POST', body: JSON.stringify({ directory, files: files.map(({ name, size }) => ({ name, size })) }) }); }
-  upload(planId: string, index: number, overwrite: boolean, signal?: AbortSignal) { return this.request<{ task: NodeFileTaskView }>('/api/node-tools/files/uploads', { method: 'POST', signal, body: JSON.stringify({ planId, index, overwrite }) }); }
-  download(path: string, requestId: string, signal?: AbortSignal) { return this.request<{ task: NodeFileTaskView }>('/api/node-tools/files/downloads', { method: 'POST', signal, body: JSON.stringify({ path, requestId }) }); }
+  upload(planId: string, index: number, overwrite: boolean, signal?: AbortSignal, transport: NodeFileTransport = 'relay') { return this.request<{ task: NodeFileTaskView; token?: string }>('/api/node-tools/files/uploads', { method: 'POST', signal, body: JSON.stringify({ planId, index, overwrite, transport }) }); }
+  download(path: string, requestId: string, signal?: AbortSignal, transport: NodeFileTransport = 'relay') { return this.request<{ task: NodeFileTaskView; token?: string }>('/api/node-tools/files/downloads', { method: 'POST', signal, body: JSON.stringify({ path, requestId, transport }) }); }
+  directSignal(connectionId: string, signal: NodeFileSignal, abortSignal?: AbortSignal) { return this.request<{ token: string }>('/api/node-tools/files/direct/signal', { method: 'POST', signal: abortSignal, body: JSON.stringify({ connectionId, signal }) }); }
+  directStatus(signal?: AbortSignal) { return this.request<{ ready: boolean; connectionId: string | null }>('/api/node-tools/files/direct', { signal }); }
+  resume(id: string, signal: AbortSignal) { return this.request<{ task: NodeFileTaskView }>(`/api/node-tools/tasks/${id}/resume`, { method: 'POST', signal }); }
+  saved(id: string, sha256: string, signal: AbortSignal) { return this.request<{ task: NodeFileTaskView }>(`/api/node-tools/tasks/${id}/saved`, { method: 'POST', signal, body: JSON.stringify({ sha256 }) }); }
   task(id: string, signal?: AbortSignal) { return this.request<{ task: NodeFileTaskView }>(`/api/node-tools/tasks/${id}`, { signal }); }
   chunk(id: string, offset: number, bytes: Uint8Array, hash: string, signal: AbortSignal) { return this.request<{ offset: number }>(`/api/node-tools/tasks/${id}/chunks/${offset}`,
     { method: 'PUT', body: bytes as BodyInit, signal, headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-SHA256': hash } }); }

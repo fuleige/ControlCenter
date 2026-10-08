@@ -6,3 +6,4 @@
 - 未修改 `apps/agent` 的运行代码，且未改变 Agent/Control Plane 协议兼容性时，不升级 `apps/agent/package.json`，不重新生成 Agent 安装包，也不重启已运行的 Agent。
 - 只有 Agent 运行代码、安装内容或协议兼容性确有变化，或者用户明确要求时，才执行 `npm run package:agent` 并安排 Agent 升级。
 - Web 变更只部署 Web；Control Plane 变更只部署并按需重启 Control Plane，避免把无关组件纳入发布范围。
+- 每次成功生成新的 Agent 安装包后，清理同一输出目录中其他版本的安装包与源码归档，只保留当前 Agent 版本的各系统/架构产物。构建失败时保留原有安装包，不清理其他目录或运行中的 Agent。

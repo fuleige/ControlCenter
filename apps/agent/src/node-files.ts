@@ -4,17 +4,19 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import {
-  NODE_FILE_CHUNK_BYTES, NODE_TOOL_LEASE_MS, type NodeDownloadSource, type NodeToolCommand, type NodeToolEvent,
+  NODE_FILE_CHUNK_BYTES, NODE_TOOL_LEASE_MS, DirectConnectionError, type NodeDownloadSource, type NodeToolCommand, type NodeToolEvent,
   type NodeUploadTarget, type NodeFileIdentity,
 } from '@controller-center/protocol';
-import { fileName, filePath, fileSize, hashFile, identity, readChunk, readableError, sameIdentity, sha256, validHash } from '@controller-center/node-files';
+import { fileName, filePath, fileSize, hashFile, identity, readChunk, readableError, sameIdentity, sha256, validHash, writeChunk } from '@controller-center/node-files';
 import type { OutboundNetwork } from './outbound-network.js';
+import { AgentDirectFiles, type DirectAgentTask } from './direct-files.js';
 
 type FileCommand = Extract<NodeToolCommand, { action: `files.${string}` }>;
-interface Transfer { controller: AbortController; expires: number; generation: string; path: string; committing: boolean }
+interface Transfer { controller: AbortController; expires: number; generation: string; path: string; committing: boolean; direct?: DirectAgentTask }
 interface CleanupEntry { path: string; dev?: number; ino?: number }
 
 export class NodeFiles {
+  readonly direct: AgentDirectFiles;
   private readonly transfers = new Map<string, Transfer>();
   private readonly cancelled = new Set<string>();
   private readonly registryPath: string;
@@ -24,6 +26,7 @@ export class NodeFiles {
   constructor(private readonly dataDirectory: string, private readonly cwd: string,
     private readonly network: OutboundNetwork, private readonly controlUrl: string,
     private readonly emit: (event: NodeToolEvent, generation: string) => boolean, private readonly limit = 2) {
+    this.direct = new AgentDirectFiles(emit);
     this.registryPath = path.join(dataDirectory, 'node-upload-cleanup.json');
     if (existsSync(this.registryPath)) {
       const value: unknown = JSON.parse(readFileSync(this.registryPath, 'utf8'));
@@ -63,6 +66,10 @@ export class NodeFiles {
     }
   }
   async handle(command: FileCommand, generation: string): Promise<void> {
+    if (command.action === 'files.direct.signal') { this.direct.signal(command, generation); return; }
+    if (command.action === 'files.direct.close') { this.direct.close(command.pageId); return; }
+    if (command.action === 'files.direct.lease') { this.direct.lease(command.pageId); return; }
+    if (command.action === 'files.direct.resume') { this.direct.resume(command, generation); return; }
     if (command.action === 'files.cancel') { this.cancel(command.id); return; }
     if (command.action === 'files.lease') {
       if (!Array.isArray(command.ids) || command.ids.length > 100) return;
@@ -85,24 +92,27 @@ export class NodeFiles {
     if (!/^[a-f0-9-]{36}$/i.test(id) || this.transfers.has(id) || this.cancelled.has(id)) return;
     try {
       if (this.transfers.size >= this.limit) throw new Error('节点同时进行的文件任务过多，请稍后再试');
-      this.transferUrl(command.url);
-      const targetPath = command.action === 'files.upload' ? command.target.path : command.source.path;
+      if ('url' in command) this.transferUrl(command.url);
+      const uploading = command.action === 'files.upload' || command.action === 'files.direct.upload';
+      const targetPath = uploading ? command.target.path : command.source.path;
       filePath(targetPath);
-      if (command.action === 'files.upload' && [...this.transfers.values()].some((current) => current.path === targetPath)) throw new Error('此目标文件正在上传');
+      if (uploading && [...this.transfers.values()].some((current) => current.path === targetPath)) throw new Error('此目标文件正在上传');
       const transfer: Transfer = { controller: new AbortController(), expires: Date.now() + NODE_TOOL_LEASE_MS, generation, path: targetPath, committing: false };
       this.transfers.set(id, transfer);
       try {
-        if (command.action === 'files.upload') await this.upload(command, transfer);
+        if (command.action === 'files.direct.upload' || command.action === 'files.direct.download') { transfer.direct = this.direct.register(command, generation); await transfer.direct.ready(transfer.controller.signal); }
+        if (command.action === 'files.upload' || command.action === 'files.direct.upload') await this.upload(command, transfer);
         else await this.download(command, transfer);
       } catch (error) {
-        if (transfer.committing) throw new Error(`提交结果不确定，请检查目标文件；${readableError(error)}`, { cause: error });
-        throw error;
+        const reason = transfer.committing ? new Error(`提交结果不确定，请检查目标文件；${readableError(error)}`, { cause: error })
+          : error instanceof DirectConnectionError ? error : new Error(readableError(error), { cause: error });
+        this.direct.finish(id, reason); throw reason;
       } finally {
-        this.transfers.delete(id); this.cleanupRegistered();
+        this.direct.finish(id); this.transfers.delete(id); this.cleanupRegistered();
       }
     } catch (error) {
-      this.emit({ action: 'files.error', id, error: readableError(error) }, generation);
-    }
+      this.emit({ action: 'files.error', id, error: readableError(error), kind: error instanceof DirectConnectionError ? 'connection' : 'business' }, generation);
+    } finally { this.emit({ action: 'files.stopped', id }, generation); }
   }
   private transferUrl(value: string): void {
     const allowed = new URL(this.controlUrl); allowed.protocol = allowed.protocol === 'wss:' ? 'https:' : 'http:';
@@ -186,10 +196,11 @@ export class NodeFiles {
     if (!response.ok) throw Object.assign(new Error(value.error || `文件传输请求失败 (${response.status})`), { permanent: response.status >= 400 && response.status < 500 && response.status !== 409 });
     return value;
   }
-  private async upload(command: Extract<FileCommand, { action: 'files.upload' }>, transfer: Transfer): Promise<void> {
-    const { id, target, token, url } = command;
+  private async upload(command: Extract<FileCommand, { action: 'files.upload' | 'files.direct.upload' }>, transfer: Transfer): Promise<void> {
+    const { id, target, token } = command;
+    const url = 'url' in command ? command.url : '';
     const size = fileSize(target.size);
-    if (!validHash(command.sha256)) throw new Error('上传校验值无效');
+    if ('sha256' in command && !validHash(command.sha256)) throw new Error('上传校验值无效');
     const directory = path.dirname(target.path);
     if (await realpath(directory) !== directory || fileName(target.name) !== path.basename(target.path)) throw new Error('目标目录已变化');
     if (!sameIdentity(await this.currentTarget(target.path), target.existing)) throw new Error('目标文件在确认后已变化，请重新上传');
@@ -200,7 +211,19 @@ export class NodeFiles {
     try {
       handle = await open(tempPath, 'wx+', 0o600); created = true;
       const initial = await handle.stat(); this.registry[id] = { path: tempPath, dev: initial.dev, ino: initial.ino }; this.saveRegistry();
-      for (let offset = 0; offset < size;) {
+      let finish: Awaited<ReturnType<DirectAgentTask['receive']>> | null = null;
+      if (transfer.direct) {
+        while (!finish) {
+          transfer.controller.signal.throwIfAborted();
+          const incoming = await transfer.direct.receive(transfer.controller.signal);
+          if (incoming.value.kind === 'finish') { if (transfer.direct.offset !== size) throw new Error('上传文件尚未完整接收'); finish = incoming; break; }
+          if (incoming.value.kind !== 'chunk' || !incoming.bytes || typeof incoming.value.offset !== 'number' || typeof incoming.value.sha256 !== 'string') throw new Error('直连上传分片格式无效');
+          if (incoming.value.offset % NODE_FILE_CHUNK_BYTES !== 0 || incoming.bytes.length !== Math.min(NODE_FILE_CHUNK_BYTES, size - incoming.value.offset)) throw new Error('直连上传分片边界无效');
+          transfer.direct.offset = await writeChunk(handle, transfer.direct.offset, incoming.value.offset, size, Buffer.from(incoming.bytes), incoming.value.sha256);
+          this.emit({ action: 'files.progress', id, offset: transfer.direct.offset, phase: 'transferring' }, transfer.generation);
+          incoming.resolve({ offset: transfer.direct.offset });
+        }
+      } else for (let offset = 0; offset < size;) {
         transfer.controller.signal.throwIfAborted();
         const end = Math.min(offset + NODE_FILE_CHUNK_BYTES, size) - 1;
         const response = await this.retry(async () => {
@@ -230,7 +253,8 @@ export class NodeFiles {
       }
       this.emit({ action: 'files.progress', id, offset: size, phase: 'verifying' }, transfer.generation);
       const hash = await hashFile(handle, size, transfer.controller.signal);
-      if (hash !== command.sha256) throw new Error('节点文件整体校验失败');
+      const expected = finish ? finish.value.sha256 : 'sha256' in command ? command.sha256 : null;
+      if ((finish && finish.value.kind !== 'finish') || hash !== expected) throw new Error('节点文件整体校验失败');
       transfer.controller.signal.throwIfAborted();
       if (await realpath(directory) !== directory || !sameIdentity(await this.currentTarget(target.path), target.existing)) throw new Error('目标文件在确认后已变化，请重新上传');
       if (target.existing) {
@@ -247,6 +271,7 @@ export class NodeFiles {
       try { await parent.sync(); } finally { await parent.close(); }
       delete this.registry[id]; this.saveRegistry();
       this.emit({ action: 'files.complete', id, sha256: hash }, transfer.generation);
+      finish?.resolve({ sha256: hash, committed: true });
     } finally {
       await handle?.close().catch(() => undefined);
       // Registry removal is deferred until transfer ownership ends; failed deletes
@@ -254,8 +279,9 @@ export class NodeFiles {
       if (!created) { delete this.registry[id]; this.saveRegistry(); }
     }
   }
-  private async download(command: Extract<FileCommand, { action: 'files.download' }>, transfer: Transfer): Promise<void> {
-    const { id, source, token, url } = command;
+  private async download(command: Extract<FileCommand, { action: 'files.download' | 'files.direct.download' }>, transfer: Transfer): Promise<void> {
+    const { id, source, token } = command;
+    const url = 'url' in command ? command.url : '';
     const size = fileSize(source.size);
     const handle = await open(filePath(source.path), constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
     try {
@@ -266,7 +292,12 @@ export class NodeFiles {
         transfer.controller.signal.throwIfAborted();
         const chunk = await readChunk(handle, offset, size);
         const checksum = sha256(chunk);
-        offset = await this.retry(async () => {
+        if (transfer.direct) {
+          const ack = await transfer.direct.send({ kind: 'chunk', offset, sha256: checksum }, transfer.controller.signal, chunk);
+          if (ack.offset !== offset + chunk.length) throw new Error('直连下载确认位置无效');
+          offset += chunk.length;
+          transfer.direct.offset = offset;
+        } else offset = await this.retry(async () => {
           // Query acknowledged offset on every retry, including a lost PUT response.
           const current = await this.responseJson(await this.request(url, token, transfer));
           if (!Number.isSafeInteger(current.offset) || current.offset! < offset || current.offset! > offset + chunk.length) throw Object.assign(new Error('暂存文件位置无效'), { permanent: true });
@@ -283,7 +314,10 @@ export class NodeFiles {
       this.emit({ action: 'files.progress', id, offset: size, phase: 'verifying' }, transfer.generation);
       const hash = await hashFile(handle, size, transfer.controller.signal);
       if (!sameIdentity(identity(await handle.stat()), source.identity) || !sameIdentity(identity(await stat(source.path)), source.identity)) throw new Error('源文件在下载期间已变化，请停止修改后重试');
-      await this.retry(async () => {
+      if (transfer.direct) {
+        const ack = await transfer.direct.send({ kind: 'finish', sha256: hash, size }, transfer.controller.signal);
+        if (ack.sha256 !== hash) throw new Error('浏览器整体校验结果不一致');
+      } else await this.retry(async () => {
         const response = await this.request(`${url}/finalize`, token, transfer,
           { method: 'POST', body: JSON.stringify({ sha256: hash }), headers: { 'Content-Type': 'application/json' } });
         await this.responseJson(response);
@@ -296,6 +330,6 @@ export class NodeFiles {
     const transfer = this.transfers.get(id);
     if (transfer && !transfer.committing) transfer.controller.abort(new Error('文件任务已取消或连接已失联'));
   }
-  reset(): void { for (const id of this.transfers.keys()) this.cancel(id); }
-  dispose(): void { clearInterval(this.timer); this.reset(); }
+  reset(): void { for (const id of this.transfers.keys()) this.cancel(id); this.direct.reset(); }
+  dispose(): void { clearInterval(this.timer); this.reset(); this.direct.dispose(); }
 }

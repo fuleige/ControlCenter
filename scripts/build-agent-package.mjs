@@ -17,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { cleanupAgentPackages } from './cleanup-agent-packages.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const agentPackage = JSON.parse(readFileSync(path.join(repositoryRoot, "apps/agent/package.json"), "utf8"));
@@ -133,13 +134,21 @@ try {
     const child=pty.spawn('/bin/sh',['-c','test -t 0'],{cols:80,rows:24}); child.resize(100,30);
     const timer=setTimeout(()=>{child.kill('SIGKILL');process.exit(1)},3000);
     child.onExit(({exitCode})=>{clearTimeout(timer);process.exit(exitCode)});`], releaseDirectory);
+  run("node", ["--input-type=module", "-e", `import * as rtc from 'node-datachannel';
+    import { nativeFileChannelAdapter } from './dist/direct-files.js';
+    const queued = nativeFileChannelAdapter({sendMessage:()=>false,sendMessageBinary:()=>false,
+      bufferedAmount:()=>0,maxMessageSize:()=>16384,isOpen:()=>true,close:()=>{}});
+    queued.send('package-check'); queued.send(new Uint8Array([1]));
+    rtc.preload(); const peer = new rtc.PeerConnection('package-load-check', {iceServers:[]});
+    peer.close(); rtc.cleanup(); console.log('Packaged WebRTC native module and queued-send handling checked');`], releaseDirectory);
   run("tar", ["-czf", temporaryArtifact, "-C", temporaryDirectory, releaseName], repositoryRoot);
   renameSync(temporaryArtifact, finalArtifact);
   chmodSync(finalArtifact, 0o644);
 
   const size = statSync(finalArtifact).size;
   const sha256 = createHash("sha256").update(readFileSync(finalArtifact)).digest("hex");
-  process.stdout.write(`Agent package: ${finalArtifact}\nSize: ${size} bytes\nSHA-256: ${sha256}\n`);
+  const cleanup = cleanupAgentPackages(artifactDirectory, version);
+  process.stdout.write(`Agent package: ${finalArtifact}\nSize: ${size} bytes\nSHA-256: ${sha256}\nRemoved previous Agent packages: ${cleanup.removed.length}\n`);
 } finally {
   if (existsSync(temporaryArtifact)) rmSync(temporaryArtifact, { force: true });
   rmSync(temporaryDirectory, { recursive: true, force: true });

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { cleanupAgentPackages } from './cleanup-agent-packages.mjs';
 
 // Reuse an existing release's JavaScript and locked production dependencies.
 // The official node-pty Darwin prebuild replaces every host native build.
@@ -14,6 +15,8 @@ const archive = path.resolve(process.argv[2]);
 const match = /^controller-center-agent-v([0-9A-Za-z.+-]+)-(linux-(?:x64|arm64)-(?:glibc|musl))\.tar\.gz$/.exec(path.basename(archive));
 if (!match) throw new Error("Expected an existing platform-specific Linux Agent archive");
 const [, version, sourceTarget] = match;
+const currentVersion = JSON.parse(readFileSync(path.join(repositoryRoot, 'apps/agent/package.json'), 'utf8')).version;
+if (version !== currentVersion) throw new Error(`Source Agent v${version} is outdated; current version is v${currentVersion}`);
 const target = "darwin-arm64";
 const sourceName = path.basename(archive).replace(/\.tar\.gz$/, "");
 const releaseName = `controller-center-agent-v${version}-${target}`;
@@ -83,7 +86,8 @@ try {
   renameSync(temporaryArtifact, finalArtifact);
   chmodSync(finalArtifact, 0o644);
   const sha256 = createHash("sha256").update(readFileSync(finalArtifact)).digest("hex");
-  process.stdout.write(`macOS ARM64 test package: ${finalArtifact}\nSize: ${statSync(finalArtifact).size} bytes\nSHA-256: ${sha256}\nNative runtime verification: pending macOS test\n`);
+  const cleanup = cleanupAgentPackages(artifactDirectory, version);
+  process.stdout.write(`macOS ARM64 test package: ${finalArtifact}\nSize: ${statSync(finalArtifact).size} bytes\nSHA-256: ${sha256}\nRemoved previous Agent packages: ${cleanup.removed.length}\nNative runtime verification: pending macOS test\n`);
 } finally {
   rmSync(temporaryArtifact, { force: true });
   rmSync(temporary, { recursive: true, force: true });

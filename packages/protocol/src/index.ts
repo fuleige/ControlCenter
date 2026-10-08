@@ -498,3 +498,4 @@ export function parseControlMessage(input: string): ControlToAgentMessage {
 export function toJsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
+export * from './direct-files.js';

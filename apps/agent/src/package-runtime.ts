@@ -5,6 +5,12 @@ interface PackageRuntime {
   nodeMajor: number;
 }
 
+export function agentPackageVersion(packagePath: string | URL = new URL("../package.json", import.meta.url)): string {
+  const info = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: unknown };
+  if (!info || typeof info.version !== "string" || !info.version.trim()) throw new Error("Agent 安装包缺少有效版本，请重新下载完整安装包");
+  return info.version;
+}
+
 function currentRuntime(): PackageRuntime {
   const report = process.report.getReport() as { header: { glibcVersionRuntime?: string } };
   const libc = process.platform === "linux" ? (report.header.glibcVersionRuntime ? "glibc" : "musl") : null;

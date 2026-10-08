@@ -1,12 +1,16 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import type { Terminal as XtermTerminal } from '@xterm/xterm';
-import { NODE_FILE_CHUNK_BYTES, NODE_FILE_MAX_BYTES, type NodeDirectory, type NodeFileTaskView, type NodeUploadTarget, type NodeToolEvent } from '@controller-center/protocol';
+import { NODE_FILE_CHUNK_BYTES, NODE_FILE_MAX_BYTES, DirectConnectionError, type NodeDirectory, type NodeFileTaskView, type NodeUploadTarget, type NodeToolEvent, type NodeFileTransport } from '@controller-center/protocol';
 import { API_URL, api, formatErrorMessage } from './api';
 import { createFilePage, FilePageApi, socketUrl, toolInfo, retryable, delay } from './node-tools-api';
-import { ToolIcon, TransferPanel, progressBytes, sizeText, type TransferRow } from './node-tools-ui';
+import { ToolIcon, TransferPanel, FileConfirmDialog, transferFinished, progressBytes, sizeText, type TransferRow } from './node-tools-ui';
 import './node-tools.css';
+import { BrowserDirectFiles, canSaveDirect, filePickers, localIdentity, saveRelayFile, type LocalFileHandle, type LocalDirectoryHandle, type LocalWritable } from './direct-files';
+import type { DirectDiagnosticReport } from './direct-diagnostics';
+import { DirectDiagnosticsPanel } from './DirectDiagnosticsPanel';
+import { FileTransferAction, type DirectAvailability } from './FileTransferAction';
 
 export default function NodeToolsPage({ nodeId, mode }: { nodeId: string; mode: 'terminal' | 'files' }) {
   const [name, setName] = useState(nodeId); const [error, setError] = useState(''); const [ready, setReady] = useState(false);
@@ -22,7 +26,7 @@ export default function NodeToolsPage({ nodeId, mode }: { nodeId: string; mode: 
     return () => { active = false; };
   }, [nodeId, mode]);
   return <main className={`node-tools-page ${mode === 'terminal' ? 'terminal-page' : 'files-page'}`}>
-    {error ? <section className="node-tools-route-message"><ToolIcon name={mode === 'terminal' ? 'terminal' : 'folder'} /><h1>{name} · {mode === 'terminal' ? '终端' : '节点文件'}</h1><p role="alert" className="node-tools-error">{error}</p><button type="button" className="node-tool-button" onClick={() => window.location.reload()}>重新打开</button></section>
+    {error ? <section className="node-tools-route-message"><ToolIcon name={mode === 'terminal' ? 'terminal' : 'folder'} /><h1>{name} · {mode === 'terminal' ? '终端' : '节点文件'}</h1><p role="alert" className="node-tools-error">{error}</p><div><button type="button" className="node-tool-button" onClick={() => window.location.assign('/')}><ToolIcon name="back" />返回控制中心</button><button type="button" className="node-tool-button node-tool-button-primary" onClick={() => window.location.reload()}>重新打开</button></div></section>
       : !ready ? <section className="node-tools-route-message"><p role="status">正在连接节点…</p></section> : mode === 'terminal' ? <TerminalPage nodeId={nodeId} name={name} /> : <FilesPage nodeId={nodeId} name={name} />}
   </main>;
 }
@@ -114,16 +118,30 @@ function TerminalPage({ nodeId, name }: { nodeId: string; name: string }) {
     {ended && <div className="node-terminal-ended-notice">终端已结束 · 已显示的输出保留，可选中复制。点击“新开终端”开始新的 Shell。</div>}</>;
 }
 type Row = TransferRow;
-interface UploadBatch { files: File[]; planId: string; targets: NodeUploadTarget[] }
+const taskError = (task: NodeFileTaskView, message: string) => task.errorKind === 'connection' ? new DirectConnectionError(task.error || message) : new Error(task.error || message);
+interface UploadBatch { files: File[]; planId: string; targets: NodeUploadTarget[]; transport: NodeFileTransport }
+interface DownloadItem { path: string; name: string; size: number; handle?: LocalFileHandle; identity?: string }
+interface DownloadBatch { items: DownloadItem[]; directory: LocalDirectoryHandle; existing: Map<string, string> }
 const doneStates = new Set(['completed', 'failed', 'cancelled']);
 const phaseText: Record<NodeFileTaskView['phase'], string> = { 'browser-upload': '正在上传到服务器', 'node-upload': '正在写入节点', 'node-download': '正在准备下载', verifying: '正在校验文件', committing: '正在提交节点文件', ready: '准备完成', completed: '已上传到节点' };
 function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
   const [client, setClient] = useState<FilePageApi | null>(null); const [connectionStatus, setConnectionStatus] = useState('正在建立文件页面…');
   const [directory, setDirectory] = useState<NodeDirectory | null>(null); const [pathInput, setPathInput] = useState(''); const [loading, setLoading] = useState(false);
+  const currentDirectory = useRef<NodeDirectory | null>(null); const refreshTimer = useRef<number | null>(null);
   const [error, setError] = useState(''); const [rows, setRows] = useState<Row[]>([]); const rowsRef = useRef<Row[]>([]);
   const [batch, setBatch] = useState<UploadBatch | null>(null); const [busy, setBusy] = useState(false); const [selected, setSelected] = useState<Set<string>>(new Set());
-  const stopPage = useRef<(() => void) | null>(null);
+  const direct = useRef<BrowserDirectFiles | null>(null); const [directReady, setDirectReady] = useState(false); const [directStatus, setDirectStatus] = useState('正在检查节点直连能力…');
+  const [directReport, setDirectReport] = useState<DirectDiagnosticReport | null>(null);
+  const [directSupported, setDirectSupported] = useState<boolean | 'failed' | null>(null);
+  const [uploadMode, setUploadMode] = useState<NodeFileTransport>('relay'); const [downloadMode, setDownloadMode] = useState<NodeFileTransport>('relay');
+  const manualMode = useRef({ upload: false, download: false });
+  const uploadChoice = useRef<NodeFileTransport>('relay');
+  const retries = useRef(new Map<string, (transport: NodeFileTransport) => Promise<void>>());
+  const retrying = useRef(new Set<string>());
+  const [fallback, setFallback] = useState<Row | null>(null); const [downloadBatch, setDownloadBatch] = useState<DownloadBatch | null>(null);
+  const [leaveConfirm, setLeaveConfirm] = useState(false);
   const alive = useRef(true); const listRevision = useRef(0); const queue = useRef(Promise.resolve()); const fileInput = useRef<HTMLInputElement>(null);
+  useEffect(() => { currentDirectory.current = directory; }, [directory]);
   const update = useCallback((key: string, changes: Partial<Row>) => {
     rowsRef.current = rowsRef.current.map((row) => {
       if (row.key !== key) return row;
@@ -148,15 +166,17 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
     const stop = () => {
       active = false; alive.current = false;
       if (reconnect !== null) window.clearTimeout(reconnect);
+      if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
       rowsRef.current.forEach((row) => row.controller.abort());
+      direct.current?.close(false); direct.current = null;
       if (socket?.readyState === WebSocket.OPEN) socket.send('{"action":"close"}'); socket?.close();
       void apiClient?.close().catch(() => undefined);
     };
-    stopPage.current = stop;
     const connect = () => {
       if (!active || !apiClient) return;
       socket = new WebSocket(socketUrl(`/api/node-tools/nodes/${encodeURIComponent(nodeId)}/pages/${apiClient.id}/connect`));
       socket.onopen = () => { if (active) { attempts = 0; setConnectionStatus('已连接'); setClient(apiClient); } };
+      socket.onmessage = ({ data }) => { try { direct.current?.receive(JSON.parse(data as string)); } catch { /* invalid signaling is ignored */ } };
       socket.onclose = () => {
         if (!active) return;
         setConnectionStatus('连接中断，正在尝试续传；超过失联期限后任务结束');
@@ -165,25 +185,66 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
       };
       socket.onerror = () => { /* close drives bounded retries */ };
     };
-    void createFilePage(nodeId).then(({ pageId }) => {
+    void createFilePage(nodeId).then(({ pageId, direct: supported, stunUrls }) => {
       apiClient = new FilePageApi(pageId);
-      if (!active) { void apiClient.close().catch(() => undefined); return; } connect();
-    }).catch((reason) => { if (active) setError(formatErrorMessage(reason, '创建文件页面')); });
+      if (!active) { void apiClient.close().catch(() => undefined); return; }
+      setDirectSupported(supported);
+      if (supported) direct.current = new BrowserDirectFiles(apiClient, stunUrls, (ready, message, report) => { if (active) { setDirectReady(ready); setDirectStatus(message); setDirectReport(report || null); } });
+      else { setDirectReady(false); setDirectStatus('此节点尚不支持直连，可使用中转'); }
+      connect();
+    }).catch((reason) => { if (active) { setDirectSupported('failed'); setError(formatErrorMessage(reason, '创建文件页面')); } });
     window.addEventListener('pagehide', stop);
     return () => { window.removeEventListener('pagehide', stop); stop(); };
   }, [nodeId]);
-  const browse = useCallback(async (target: string, cursor = 0) => {
+  useEffect(() => { if (client && direct.current) void direct.current.probe(); }, [client]);
+  useEffect(() => {
+    if (!manualMode.current.upload) { const mode = directReady ? 'direct' : 'relay'; setUploadMode(mode); uploadChoice.current = mode; }
+    if (!manualMode.current.download) setDownloadMode(directReady && canSaveDirect(selected.size > 1) ? 'direct' : 'relay');
+  }, [directReady, selected.size]);
+  const browse = useCallback(async (target: string, cursor = 0, preserveSelection = false) => {
     if (!client) return;
     const revision = ++listRevision.current; setLoading(true); setError('');
     try {
-      const result = await client.list(target, cursor);
+      const previousDirectory = currentDirectory.current;
+      let result = await client.list(target, cursor);
+      while (preserveSelection && !cursor && previousDirectory?.path === result.directory.path && result.directory.entries.length < previousDirectory.entries.length && result.directory.nextCursor !== null) {
+        if (!alive.current || revision !== listRevision.current) return;
+        const nextCursor = result.directory.nextCursor;
+        const next = await client.list(target, nextCursor);
+        if (next.directory.nextCursor !== null && next.directory.nextCursor <= nextCursor) throw new Error('目录分页位置无效，请重新读取目录');
+        result = { directory: { ...next.directory, entries: [...result.directory.entries, ...next.directory.entries] } };
+        if (!next.directory.entries.length) break;
+      }
       if (!alive.current || revision !== listRevision.current) return;
       setDirectory((old) => cursor && old?.path === result.directory.path ? { ...result.directory, entries: [...old.entries, ...result.directory.entries] } : result.directory);
-      setPathInput(result.directory.path); if (!cursor) setSelected(new Set());
+      if (!preserveSelection) setPathInput(result.directory.path);
+      if (!cursor) setSelected(old => preserveSelection ? new Set(result.directory.entries.filter(entry => old.has(entry.path)).map(entry => entry.path)) : new Set());
     } catch (reason) { if (alive.current && revision === listRevision.current) setError(formatErrorMessage(reason, '浏览目录')); }
     finally { if (alive.current && revision === listRevision.current) setLoading(false); }
   }, [client]);
   useEffect(() => { if (client) void browse(''); }, [client, browse]);
+  function scheduleDirectoryRefresh(target: string) {
+    if (currentDirectory.current?.path !== target) return;
+    if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null;
+      if (alive.current && currentDirectory.current?.path === target) void browse(target, 0, true);
+    }, 150);
+  }
+  function toggleSelected(filePath: string) {
+    setSelected(old => { const next = new Set(old); next.has(filePath) ? next.delete(filePath) : next.add(filePath); return next; });
+  }
+  function clearFinishedTransfers() {
+    const remaining = rowsRef.current.filter(row => {
+      if (!transferFinished(row)) return true;
+      retries.current.delete(row.key); return false;
+    });
+    rowsRef.current = remaining; setRows(remaining);
+  }
+  function returnToControlCenter() {
+    if (rowsRef.current.some(row => !transferFinished(row))) setLeaveConfirm(true);
+    else window.location.assign('/');
+  }
   async function retry<T>(operation: () => Promise<T>, row: Row): Promise<T> {
     for (let attempt = 0;; attempt++) {
       row.controller.signal.throwIfAborted();
@@ -210,7 +271,7 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
       catch (reason) {
         const current = rowsRef.current.find((entry) => entry.key === row.key);
         if (current?.task && client) void client.cancel(current.task.id).catch(() => undefined);
-        update(row.key, { message: row.controller.signal.aborted ? '已取消' : '失败', error: row.controller.signal.aborted ? '' : formatErrorMessage(reason, row.direction === 'upload' ? '上传' : '下载') });
+        update(row.key, { message: row.controller.signal.aborted ? '已取消' : '失败', directFailure: !row.controller.signal.aborted && row.transport === 'direct' && reason instanceof DirectConnectionError, error: row.controller.signal.aborted ? '' : formatErrorMessage(reason, row.direction === 'upload' ? '上传' : '下载') });
       }
     });
   }
@@ -219,8 +280,18 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
     const apiClient = client; setBatch(null);
     plan.files.forEach((file, index) => {
       const row = addRow(file.name, 'upload', file.size);
+      row.transport = plan.transport; update(row.key, { transport: plan.transport });
+      retries.current.set(row.key, async (transport) => { await chooseUploads([file], transport, plan.targets[index]!.path.slice(0, plan.targets[index]!.path.lastIndexOf('/')) || '/'); });
       enqueue(row, async () => {
-        const { task } = await retry(() => apiClient.upload(plan.planId, index, overwrite, row.controller.signal), row); update(row.key, { task });
+        if (plan.transport === 'direct' && !direct.current?.available) throw new DirectConnectionError();
+        const { task, token } = await retry(() => apiClient.upload(plan.planId, index, overwrite, row.controller.signal, plan.transport), row); update(row.key, { task });
+        if (plan.transport === 'direct') {
+          await direct.current!.upload(task, token!, file, row.controller.signal, (offset) => update(row.key, { task: { ...task, offset, agentOffset: offset }, message: '正在直连上传到节点' }));
+          const result = await waitForTask(apiClient, row, task.id);
+          if (result.status !== 'completed') throw taskError(result, '节点文件未成功写入');
+          update(row.key, { message: '已上传到节点' });
+          scheduleDirectoryRefresh(plan.targets[index]!.path.slice(0, plan.targets[index]!.path.lastIndexOf('/')) || '/'); return;
+        }
         const hash = sha256.create();
         for (let offset = 0; offset < file.size; offset += NODE_FILE_CHUNK_BYTES) {
           row.controller.signal.throwIfAborted();
@@ -240,12 +311,13 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
         const result = await waitForTask(apiClient, row, task.id);
         if (result.status !== 'completed') throw new Error(result.error || '节点文件未成功写入');
         update(row.key, { message: '已上传到节点' });
+        scheduleDirectoryRefresh(plan.targets[index]!.path.slice(0, plan.targets[index]!.path.lastIndexOf('/')) || '/');
       });
     });
   }
-  async function chooseUploads(files: File[]) {
+  async function chooseUploads(files: File[], transport = uploadChoice.current, targetDirectory = directory?.path) {
     if (!client || !directory || !files.length) return;
-    if (rowsRef.current.length + files.length > 200 || files.length > 100) { setError('每批最多 100 个文件；当前页面最多展示 200 项，请重新打开页面开始新批次'); return; }
+    if (rowsRef.current.length + files.length > 200 || files.length > 100) { setError('每批最多 100 个文件，当前页面最多 200 项记录；清理已结束的传输记录后可继续'); return; }
     const accepted: File[] = [];
     files.forEach((file) => {
       if (file.size > NODE_FILE_MAX_BYTES) { const row = addRow(file.name, 'upload', file.size); update(row.key, { message: '失败', error: '文件超过单文件大小限制（最大 1 GiB）' }); }
@@ -254,27 +326,125 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
     if (!accepted.length) return;
     setBusy(true); setError('');
     try {
-      const plan = await client.preflight(directory.path, accepted);
+      const plan = await client.preflight(targetDirectory!, accepted);
       if (!alive.current) return;
-      const next = { files: accepted, ...plan };
+      const next = { files: accepted, ...plan, transport };
       if (plan.targets.some((target) => target.existing)) setBatch(next); else startUploads(next, false);
     } catch (reason) { if (alive.current) setError(formatErrorMessage(reason, '上传预检')); }
     finally { if (alive.current) setBusy(false); }
   }
-  function startDownloads(paths: string[]) {
+  async function chooseDownloads(paths: string[]) {
     if (!client || !directory) return;
-    if (rowsRef.current.length + paths.length > 200) { setError('当前页面最多展示 200 项，请重新打开页面开始新批次'); return; }
+    if (rowsRef.current.length + paths.length > 200 || paths.length > 100) { setError('每批最多 100 项，当前页面最多 200 项记录；清理已结束的传输记录后可继续'); return; }
+    const transport = downloadMode;
+    const items = paths.map((filePath) => { const entry = directory.entries.find((item) => item.path === filePath); return { path: filePath, name: entry?.name || filePath, size: entry?.size || 0 }; }).filter((item) => {
+      if (item.size <= NODE_FILE_MAX_BYTES) return true;
+      const row = addRow(item.name, 'download', item.size); update(row.key, { message: '失败', error: '文件超过单文件大小限制（最大 1 GiB）' }); return false;
+    });
+    if (!items.length) return;
+    if (transport === 'relay') { startDownloads(items, transport); return; }
+    if (!direct.current?.available || !canSaveDirect(items.length > 1)) { setError('当前直连或浏览器保存能力不可用，请重新检测或选择中转'); return; }
+    try {
+      // Invoke the picker directly in the click handler, before any network await.
+      if (items.length === 1) {
+        const handle = await filePickers().showSaveFilePicker!({ suggestedName: items[0]!.name });
+        const identity = localIdentity(await handle.getFile()); startDownloads([{ ...items[0]!, handle, identity }], transport);
+      } else {
+        const localDirectory = await filePickers().showDirectoryPicker!({ mode: 'readwrite' });
+        const existing = new Map<string, string>(); const names = new Set<string>();
+        for (const item of items) {
+          if (names.has(item.name)) throw new Error('同一批次不能保存重名文件'); names.add(item.name);
+          try { const handle = await localDirectory.getFileHandle(item.name); existing.set(item.name, localIdentity(await handle.getFile())); }
+          catch (reason) { if (!(reason instanceof DOMException && reason.name === 'NotFoundError')) throw reason; }
+        }
+        const next = { items, directory: localDirectory, existing };
+        if (existing.size) setDownloadBatch(next); else startDirectoryDownloads(next);
+      }
+    } catch (reason) { if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(formatErrorMessage(reason, '选择保存位置')); }
+  }
+  function startDirectoryDownloads(plan: DownloadBatch) {
+    setDownloadBatch(null);
+    startDownloads(plan.items, 'direct', plan);
+  }
+  function startDownloads(items: DownloadItem[], transport: NodeFileTransport, localPlan?: DownloadBatch) {
+    if (!client) return;
     const apiClient = client;
-    paths.forEach((filePath) => {
-      const entry = directory.entries.find((item) => item.path === filePath); const row = addRow(entry?.name || filePath, 'download', entry?.size || 0);
-      if (entry && entry.size > NODE_FILE_MAX_BYTES) { update(row.key, { message: '失败', error: '文件超过单文件大小限制（最大 1 GB）' }); return; }
+    items.forEach((original) => {
+      const item = { ...original }; const row = addRow(item.name, 'download', item.size);
+      row.transport = transport; update(row.key, { transport });
+      retries.current.set(row.key, async (mode) => { startDownloads([item], mode, item.handle ? undefined : localPlan); });
       enqueue(row, async () => {
-        const { task } = await retry(() => apiClient.download(filePath, row.key, row.controller.signal), row); update(row.key, { task });
-        const result = await waitForTask(apiClient, row, task.id);
-        if (result.status !== 'ready') throw new Error(result.error || '下载准备失败');
-        requestDownload(row.key, result.id);
+        if (transport === 'direct' && !direct.current?.available) throw new DirectConnectionError();
+        if (localPlan) {
+          let existing: LocalFileHandle | undefined;
+          try { existing = await localPlan.directory.getFileHandle(item.name); }
+          catch (reason) { if (!(reason instanceof DOMException && reason.name === 'NotFoundError')) throw reason; }
+          const expected = localPlan.existing.get(item.name);
+          if (existing ? expected !== localIdentity(await existing.getFile()) : expected !== undefined) throw new Error('本地目标文件在确认后已变化，请重新选择保存位置');
+          item.handle = existing || await localPlan.directory.getFileHandle(item.name, { create: true });
+          item.identity = localIdentity(await item.handle.getFile());
+        }
+        let stream: LocalWritable | null = null;
+        let committed = false;
+        const work = new AbortController(); const abort = () => work.abort(row.controller.signal.reason); row.controller.signal.addEventListener('abort', abort, { once: true });
+        const workRow = { ...row, controller: work };
+        try {
+          if (item.handle) {
+            if (item.identity !== localIdentity(await item.handle.getFile())) throw new Error('本地目标文件在确认后已变化，请重新选择保存位置');
+            stream = await item.handle.createWritable({ keepExistingData: false });
+          }
+          const { task, token } = await retry(() => apiClient.download(item.path, row.key, work.signal, transport), workRow); update(row.key, { task });
+          let result: NodeFileTaskView; let checksum: string;
+          if (transport === 'direct') {
+            if (!stream) throw new Error('尚未授权保存位置');
+            const received = direct.current!.downloadTo(task, token!, stream, work.signal, (offset) => update(row.key, { task: { ...task, offset, agentOffset: offset }, message: '正在直连下载到电脑' }));
+            [checksum, result] = await Promise.all([received, waitForTask(apiClient, workRow, task.id).then((current) => { if (current.status !== 'ready') throw taskError(current, '节点最终校验失败'); return current; })]);
+            if (result.sha256 !== checksum) throw new Error('节点最终校验结果不一致');
+          } else {
+            result = await waitForTask(apiClient, workRow, task.id);
+            if (result.status !== 'ready') throw new Error(result.error || '下载准备失败');
+            if (!stream) { requestDownload(row.key, result.id); return; }
+            checksum = await saveRelayFile(apiClient, result, stream, work.signal, (offset) => update(row.key, { task: { ...result, status: 'transferring', phase: 'node-download', offset }, message: '正在通过中转保存到所选位置' }));
+          }
+          work.signal.throwIfAborted();
+          const current = (await apiClient.task(result.id, work.signal)).task;
+          if (current.status !== 'ready' || current.sha256 !== checksum) throw new Error(current.error || '下载授权已失效');
+          update(row.key, { message: '正在完成本地保存' });
+          await stream!.close(); committed = true;
+          try { item.identity = localIdentity(await item.handle!.getFile()); } catch { /* close has already committed the file */ }
+          // Once close commits the user's file, a lost status reply must not offer a duplicate transfer.
+          if (transport === 'direct') { try { result = (await apiClient.saved(result.id, checksum, work.signal)).task; } catch { result = { ...result, status: 'completed', phase: 'completed' }; } }
+          update(row.key, { task: { ...result, status: 'completed', phase: 'completed' }, message: '已保存到电脑', finishedAt: Date.now() });
+        } finally {
+          work.abort(); row.controller.signal.removeEventListener('abort', abort);
+          if (stream && !committed) await stream.abort().catch(() => undefined);
+        }
       });
     });
+  }
+  async function retryTransfer(row: Row, transport: NodeFileTransport) {
+    if (!client || retrying.current.has(row.key)) return;
+    retrying.current.add(row.key);
+    setFallback(null); update(row.key, { directFailure: false, retrying: true, message: '正在重新准备传输' });
+    try {
+      if (row.task) {
+        let task = (await client.cancel(row.task.id)).task;
+        if (!doneStates.has(task.status)) task = await waitForTask(client, { ...row, controller: new AbortController() }, task.id);
+        if (task.status === 'completed') { update(row.key, { task, message: '已上传到节点', error: '' }); return; }
+        if (task.error?.includes('提交结果不确定')) throw new Error('请先检查节点目标文件，提交结果不确定时不重新上传');
+        if (task.transport === 'direct') {
+          update(row.key, { message: '正在等待旧直连任务释放文件' }); const deadline = Date.now() + 15_000;
+          while (!task.stopped) {
+            if (Date.now() >= deadline) throw new DirectConnectionError('旧直连任务尚未停止，请稍后重试');
+            await delay(100, row.controller.signal); task = (await client.task(task.id, row.controller.signal)).task;
+          }
+        }
+      }
+      if (transport === 'direct' && !direct.current?.available) await direct.current?.probe();
+      if (transport === 'direct' && !direct.current?.available) throw new DirectConnectionError('直连仍不可用，可确认改用中转');
+      await retries.current.get(row.key)?.(transport);
+    } catch (reason) { update(row.key, { error: formatErrorMessage(reason, '重新传输'), directFailure: reason instanceof DirectConnectionError }); }
+    finally { retrying.current.delete(row.key); update(row.key, { retrying: false }); }
   }
   function requestDownload(key: string, id: string) {
     const anchor = document.createElement('a'); anchor.href = `${API_URL}/api/node-tools/tasks/${id}/content`; anchor.download = ''; anchor.style.display = 'none';
@@ -283,6 +453,7 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
   }
   async function cancelRow(row: Row) {
     row.controller.abort();
+    update(row.key, { directFailure: false });
     if (!row.task || !client) { update(row.key, { message: '已取消' }); return; }
     try {
       const { task } = await client.cancel(row.task.id);
@@ -293,29 +464,60 @@ function FilesPage({ nodeId, name }: { nodeId: string; name: string }) {
       }
     } catch (reason) { update(row.key, { error: formatErrorMessage(reason, '取消任务') }); }
   }
-  return <><header className="node-files-header"><div className="node-files-identity"><span className="node-files-app-icon"><ToolIcon name="folder" /></span><div><h1>{name} · 节点文件</h1><p>系统用户 {directory?.user || '待确认'} <span>·</span> 单文件最大 1 GiB</p></div></div><span role="status" title={connectionStatus} data-state={connectionStatus === '已连接' ? 'online' : 'connecting'} className="node-tool-connection"><i aria-hidden="true" />{connectionStatus}</span>
-    <button type="button" className="node-tool-button node-tool-button-ghost" aria-label="关闭文件页" onClick={() => { stopPage.current?.(); setClient(null); setConnectionStatus('文件页已关闭；请重新打开'); window.close(); }}><ToolIcon name="close" />关闭</button></header>
-    <form className="node-files-path" onSubmit={(event: FormEvent) => { event.preventDefault(); void browse(pathInput); }}>
-      <button type="button" className="node-tool-button node-tool-button-icon" aria-label="上级" title="上级目录" disabled={!directory || loading} onClick={() => void browse(directory!.parent)}><ToolIcon name="up" /></button>
-      <div className="node-files-path-input"><ToolIcon name="folder" /><input aria-label="节点目录路径" value={pathInput} onChange={(event) => setPathInput(event.target.value)} placeholder="输入绝对路径" /></div>
-      <button className="node-tool-button" disabled={!client || loading}><ToolIcon name="arrow" />打开</button><button type="button" className="node-tool-button node-tool-button-icon" aria-label="刷新" title="刷新目录" disabled={!directory || loading} onClick={() => void browse(directory!.path)}><ToolIcon name="refresh" /></button>
-    </form>
+  const entries = useMemo(() => [...(directory?.entries || [])].sort((a, b) => {
+    const aDirectory = a.type === 'directory' || a.linkType === 'directory';
+    const bDirectory = b.type === 'directory' || b.linkType === 'directory';
+    return Number(bDirectory) - Number(aDirectory) || a.name.localeCompare(b.name, 'zh-CN', { numeric: true });
+  }), [directory]);
+  const selectable = entries.filter(entry => entry.type === 'file' || entry.linkType === 'file');
+  const allSelected = selectable.length > 0 && selectable.every(entry => selected.has(entry.path));
+  const uploadDirect: DirectAvailability = directReady ? { state: 'available', reason: '浏览器与节点直接传输' }
+    : directSupported === false ? { state: 'unavailable', reason: '节点尚不支持直连' }
+    : directSupported === 'failed' ? { state: 'unavailable', reason: '文件页面连接失败，请重新打开' }
+    : directReport?.outcome === 'failed' ? { state: 'unavailable', reason: '连接失败，查看连接诊断' }
+    : directReport?.outcome === 'closed' ? { state: 'unavailable', reason: '连接已断开，请重新检测' }
+    : { state: 'checking', reason: '正在检查节点与网络' };
+  const downloadDirect: DirectAvailability = canSaveDirect(selected.size > 1) ? uploadDirect
+    : { state: 'unavailable', reason: selected.size > 1 && canSaveDirect(false) ? '浏览器不支持选择保存目录' : '浏览器不支持直接保存文件' };
+  return <><header className="node-files-header"><div className="node-files-identity"><span className="node-files-app-icon"><ToolIcon name="folder" /></span><div><h1>{name} · 节点文件</h1><p>远程文件管理 <span>·</span> {directory?.user || '正在连接'} <span>·</span> 单文件最大 1 GiB</p></div></div><span role="status" title={connectionStatus} data-state={connectionStatus === '已连接' ? 'online' : 'connecting'} className="node-tool-connection"><i aria-hidden="true" />{connectionStatus}</span>
+    <button type="button" className="node-tool-button node-tool-button-ghost" title="返回控制中心" onClick={returnToControlCenter}><ToolIcon name="back" />返回控制中心</button></header>
     <div className="node-files-workspace">
       <section className="node-file-browser" aria-label="节点目录">
-        <header className="node-panel-heading"><div><h2>文件</h2><span>{loading ? '正在读取目录…' : selected.size ? `已选择 ${selected.size} 项` : `${directory?.entries.length || 0} 项`}</span></div>
-          <div className="node-files-actions"><button type="button" className="node-tool-button node-tool-button-primary" disabled={!client || !directory || busy || !!batch} onClick={() => fileInput.current?.click()}><ToolIcon name="upload" />{busy ? '正在预检…' : '上传文件'}</button><button type="button" className="node-tool-button" disabled={!client || !selected.size} onClick={() => startDownloads([...selected])}><ToolIcon name="download" />下载所选文件（{selected.size}）</button></div>
+        <form className="node-files-path" onSubmit={(event: FormEvent) => { event.preventDefault(); void browse(pathInput); }}>
+          <button type="button" className="node-tool-button node-tool-button-icon" aria-label="上级" title="上级目录" disabled={!directory || loading || directory.path === directory.parent} onClick={() => void browse(directory!.parent)}><ToolIcon name="up" /></button>
+          <div className="node-files-path-input"><ToolIcon name="folder" /><input aria-label="节点目录路径" value={pathInput} onChange={event => setPathInput(event.target.value)} placeholder="输入节点上的绝对路径" /></div>
+          <button className="node-tool-button" disabled={!client || loading}>打开</button><button type="button" className="node-tool-button node-tool-button-icon" aria-label="刷新" title="刷新目录" disabled={!directory || loading} onClick={() => void browse(directory!.path, 0, true)}><ToolIcon name="refresh" /></button>
+        </form>
+        <header className="node-panel-heading node-files-toolbar"><div><h2>文件</h2><span>{loading ? '正在读取目录…' : selected.size ? `已选择 ${selected.size} 项` : `${directory?.entries.length || 0} 项`}</span></div>
+          <div className="node-files-actions">
+            <FileTransferAction direction="upload" mode={uploadMode} direct={uploadDirect} busy={busy}
+              disabled={!client || !directory || busy || !!batch || (uploadMode === 'direct' && !directReady)}
+              hint={uploadMode === 'direct' && !directReady ? '请重新检测直连，或手动选择中转' : `使用${uploadMode === 'direct' ? '直连' : '中转'}上传到当前目录`}
+              onModeChange={mode => { manualMode.current.upload = true; uploadChoice.current = mode; setUploadMode(mode); }}
+              onExecute={() => fileInput.current?.click()} />
+            <FileTransferAction direction="download" mode={downloadMode} direct={downloadDirect} count={selected.size}
+              disabled={!client || !selected.size || !!downloadBatch || (downloadMode === 'direct' && downloadDirect.state !== 'available')}
+              hint={!selected.size ? '先从下方列表选择文件' : downloadMode === 'direct' && !canSaveDirect(selected.size > 1) ? '浏览器不支持此保存方式，请选择中转' : downloadMode === 'direct' && !directReady ? '请重新检测直连，或手动选择中转' : downloadMode === 'direct' ? '使用直连下载，选择本地保存位置' : '使用中转下载，由浏览器保存'}
+              onModeChange={mode => { manualMode.current.download = true; setDownloadMode(mode); }}
+              onExecute={() => void chooseDownloads([...selected])} />
+          </div>
           <input hidden multiple type="file" ref={fileInput} onChange={(event) => { const files = Array.from(event.target.files || []); event.target.value = ''; void chooseUploads(files); }} />
         </header>
         {error && <p role="alert" className="node-tools-error node-files-error">{error}</p>}
-        <div className="node-files-list" aria-busy={loading}><table><thead><tr><th className="node-file-check">选择</th><th>名称</th><th className="node-file-type">类型</th><th className="node-file-size">大小</th><th className="node-file-date">修改时间</th></tr></thead><tbody>
-          {directory?.entries.map((entry) => <tr key={entry.path}><td className="node-file-check">{(entry.type === 'file' || entry.linkType === 'file') && <input type="checkbox" aria-label={`选择 ${entry.name}`} checked={selected.has(entry.path)} onChange={(event) => setSelected((old) => { const next = new Set(old); event.target.checked ? next.add(entry.path) : next.delete(entry.path); return next; })} />}</td>
-            <td><div className="node-file-name"><ToolIcon name={entry.type === 'directory' || entry.linkType === 'directory' ? 'folder' : 'file'} />{entry.type === 'directory' || entry.linkType === 'directory' ? <button type="button" className="node-tool-text-button" title={entry.path} onClick={() => void browse(entry.path)}>{entry.name}{entry.type === 'symlink' ? ' ↗' : ''}</button> : <span title={entry.path}>{entry.name}</span>}</div></td>
+        <div className="node-files-list" aria-busy={loading}><table><thead><tr><th className="node-file-check"><input type="checkbox" aria-label="全选当前目录文件" title="全选当前目录文件" checked={allSelected} disabled={!selectable.length} ref={element => { if (element) element.indeterminate = selected.size > 0 && !allSelected; }} onChange={event => setSelected(event.target.checked ? new Set(selectable.map(entry => entry.path)) : new Set())} /></th><th>名称</th><th className="node-file-type">类型</th><th className="node-file-size">大小</th><th className="node-file-date">修改时间</th></tr></thead><tbody>
+          {entries.map(entry => <tr key={entry.path} aria-selected={selected.has(entry.path)} onClick={event => { if (!(event.target as HTMLElement).closest('button, input') && (entry.type === 'file' || entry.linkType === 'file')) toggleSelected(entry.path); }}><td className="node-file-check">{(entry.type === 'file' || entry.linkType === 'file') && <input type="checkbox" aria-label={`选择 ${entry.name}`} checked={selected.has(entry.path)} onChange={() => toggleSelected(entry.path)} />}</td>
+            <td><div className="node-file-name"><ToolIcon name={entry.type === 'directory' || entry.linkType === 'directory' ? 'folder' : 'file'} />{entry.type === 'directory' || entry.linkType === 'directory' ? <button type="button" className="node-tool-text-button" title={entry.path} onClick={() => void browse(entry.path)}>{entry.name}{entry.type === 'symlink' ? ' ↗' : ''}</button> : entry.type === 'file' || entry.linkType === 'file' ? <button type="button" className="node-tool-text-button" title={entry.path} onClick={() => toggleSelected(entry.path)}>{entry.name}{entry.type === 'symlink' ? ' ↗' : ''}</button> : <span title={entry.path}>{entry.name}</span>}</div></td>
             <td className="node-file-type">{entry.type === 'symlink' ? `软链接（${{ file: '文件', directory: '目录', other: '特殊文件', unavailable: '不可访问' }[entry.linkType || 'unavailable']}）` : { directory: '目录', file: '文件', other: '特殊文件' }[entry.type]}</td><td className="node-file-size">{entry.type === 'file' || entry.linkType === 'file' ? sizeText(entry.size) : '—'}</td><td className="node-file-date">{new Date(entry.modifiedAt).toLocaleString()}</td></tr>)}
-        </tbody></table>{directory && !directory.entries.length && !loading && <div className="node-directory-empty"><ToolIcon name="folder" /><strong>目录为空</strong><span>点击“上传文件”添加文件</span></div>}</div>
-        <footer className="node-file-browser-footer"><span>切换目录不影响当前传输</span>{directory?.nextCursor !== null && directory?.nextCursor !== undefined && <button type="button" className="node-tool-text-button" disabled={loading} onClick={() => void browse(directory.path, directory.nextCursor!)}>加载更多</button>}</footer>
+        </tbody></table>{directory && !directory.entries.length && !loading && <div className="node-directory-empty"><ToolIcon name="folder" /><strong>目录为空</strong><span>点击“上传”添加文件</span></div>}</div>
+        <footer className="node-file-browser-footer"><span>{selected.size ? <>{selected.size} 项已选 <button type="button" className="node-tool-text-button" onClick={() => setSelected(new Set())}>取消选择</button></> : '点击文件选择，点击文件夹进入目录'}</span>{directory?.nextCursor !== null && directory?.nextCursor !== undefined && <button type="button" className="node-tool-text-button" disabled={loading} onClick={() => void browse(directory.path, directory.nextCursor!)}>加载更多</button>}</footer>
       </section>
-      <TransferPanel rows={rows} onCancel={(row) => void cancelRow(row)} onDownload={requestDownload} />
+      <div className="node-files-sidebar"><DirectDiagnosticsPanel status={directStatus + (directReady && !canSaveDirect(selected.size > 1) ? '；当前浏览器不支持直连保存，上传仍可直连' : '')} ready={directReady} report={directReport} onProbe={() => void direct.current?.probe()} probeDisabled={!client || !direct.current || rows.some(row => row.transport === 'direct' && !row.error && row.startedAt && !doneStates.has(row.task?.status || '') && row.task?.status !== 'ready')} />
+        <TransferPanel rows={rows} onCancel={row => void cancelRow(row)} onDownload={requestDownload} onClearFinished={clearFinishedTransfers} onRetry={(row, transport) => { if (transport === 'relay') setFallback(row); else void retryTransfer(row, transport); }} />
+      </div>
     </div>
-    {batch && <div className="node-file-confirm-backdrop"><section role="dialog" aria-modal="true" aria-labelledby="node-upload-confirm"><h2 id="node-upload-confirm">确认整批覆盖</h2><p>以下同名文件将被覆盖；其他文件一同上传。传输期间请避免同时编辑这些目标文件。</p><ul>{batch.targets.filter((target) => target.existing).map((target) => <li key={target.path}>{target.path}</li>)}</ul><div><button type="button" className="node-tool-button" onClick={() => setBatch(null)}>取消整批</button><button type="button" className="node-tool-button node-tool-button-primary" onClick={() => startUploads(batch, true)}>确认覆盖并上传整批</button></div></section></div>}
+    {batch && <FileConfirmDialog title="确认整批覆盖" onCancel={() => setBatch(null)} actions={<><button type="button" autoFocus className="node-tool-button" onClick={() => setBatch(null)}>取消整批</button><button type="button" className="node-tool-button node-tool-button-primary" onClick={() => startUploads(batch, true)}>确认覆盖并上传整批</button></>}><p>以下同名文件将被覆盖，其他文件一同上传。传输期间请避免编辑这些目标文件。</p><ul>{batch.targets.filter(target => target.existing).map(target => <li key={target.path}>{target.path}</li>)}</ul></FileConfirmDialog>}
+    {downloadBatch && <FileConfirmDialog title="确认本地整批覆盖" onCancel={() => setDownloadBatch(null)} actions={<><button type="button" autoFocus className="node-tool-button" onClick={() => setDownloadBatch(null)}>取消整批</button><button type="button" className="node-tool-button node-tool-button-primary" onClick={() => startDirectoryDownloads(downloadBatch)}>确认覆盖并下载整批</button></>}><p>以下本地同名文件将被覆盖，其他文件保存到同一目录。写入前会再次检查文件是否变化。</p><ul>{[...downloadBatch.existing.keys()].map(name => <li key={name}>{name}</li>)}</ul></FileConfirmDialog>}
+    {fallback && <FileConfirmDialog title="确认改用中转" onCancel={() => setFallback(null)} actions={<><button type="button" autoFocus className="node-tool-button" onClick={() => setFallback(null)}>返回</button><button type="button" className="node-tool-button node-tool-button-primary" onClick={() => void retryTransfer(fallback, 'relay')}>确认改用中转</button></>}><p>直连已中断。通过控制中心重新传输以下文件，将从头开始。</p><div className="node-file-confirm-file"><ToolIcon name={fallback.direction} /><strong>{fallback.name}</strong><span>{sizeText(fallback.size)}</span></div><p>{fallback.direction === 'download' ? '已选择的保存位置会继续使用。' : '上传会重新检查同名文件，覆盖前需要确认。'}</p></FileConfirmDialog>}
+    {leaveConfirm && <FileConfirmDialog title="离开文件管理？" onCancel={() => setLeaveConfirm(false)} actions={<><button type="button" autoFocus className="node-tool-button" onClick={() => setLeaveConfirm(false)}>继续传输</button><button type="button" className="node-tool-button node-tool-button-danger" onClick={() => window.location.assign('/')}>结束传输并离开</button></>}><p>当前还有未完成或尚未确认完成的文件传输。离开后会结束这些任务，已完成的文件会保留。</p>{rows.some(row => row.task?.status === 'ready' && row.task.transport !== 'direct') && <p>中转下载的保存进度由浏览器管理，请先在浏览器下载列表确认是否已完成。</p>}</FileConfirmDialog>}
   </>;
 }

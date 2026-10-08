@@ -6,14 +6,15 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { NODE_FILES_CAPABILITY, TERMINAL_PTY_CAPABILITY, type NodeToolEvent, type ControlNodeToolMessage } from '@controller-center/protocol';
+import { pathToFileURL } from 'node:url';
+import { NODE_FILES_CAPABILITY, NODE_FILES_DIRECT_CAPABILITY, TERMINAL_PTY_CAPABILITY, type NodeToolEvent, type ControlNodeToolMessage } from '@controller-center/protocol';
 import { AgentConnections } from '../apps/control-plane/src/connections.js';
 import { NodeTools } from '../apps/control-plane/src/node-tools.js';
 import { NodeFiles } from '../apps/agent/src/node-files.js';
 import { NodeTerminals } from '../apps/agent/src/node-terminals.js';
 import { OutboundNetwork } from '../apps/agent/src/outbound-network.js';
 
-export async function nodeToolsHarness(options: { leaseMs?: number; quotaBytes?: number; fileLimit?: number; webDirectory?: string } = {}) {
+export async function nodeToolsHarness(options: { leaseMs?: number; quotaBytes?: number; fileLimit?: number; webDirectory?: string; direct?: boolean; stunUrls?: string[] | undefined } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'cc-node-tools-'));
   const app = Fastify();
   await app.register(websocket);
@@ -27,7 +28,7 @@ export async function nodeToolsHarness(options: { leaseMs?: number; quotaBytes?:
   };
   let tools: NodeTools;
   app.get('/test/agent', { websocket: true }, (socket) => {
-    connections.set('node', 'boot', socket, [NODE_FILES_CAPABILITY, TERMINAL_PTY_CAPABILITY]);
+    connections.set('node', 'boot', socket, [NODE_FILES_CAPABILITY, TERMINAL_PTY_CAPABILITY, ...(options.direct ? [NODE_FILES_DIRECT_CAPABILITY] : [])]);
     tools.nodeConnected('node');
     socket.on('message', (raw) => { if (connections.isCurrent('node', socket)) tools.handleAgent('node', JSON.parse(raw.toString())); });
     socket.on('close', () => connections.remove('node', socket));
@@ -45,7 +46,7 @@ export async function nodeToolsHarness(options: { leaseMs?: number; quotaBytes?:
   // Register first; resolve publicOrigin to the actual ephemeral port before any transfer starts.
   const toolOptions = { directory: path.join(directory, 'stage'), sqlite, connections, publicOrigin: '',
     allowedOrigins: ['http://127.0.0.1:5175', 'http://localhost:5175'], session,
-    reserveBytes: 1, ...options };
+    reserveBytes: 1, stunUrls: [], ...options };
   tools = new NodeTools(app, toolOptions);
   connections.onDisconnect = (nodeId) => tools.nodeDisconnected(nodeId);
   const origin = await app.listen({ host: '127.0.0.1', port: 0 }); toolOptions.publicOrigin = origin; toolOptions.allowedOrigins.push(origin);
@@ -61,7 +62,10 @@ export async function nodeToolsHarness(options: { leaseMs?: number; quotaBytes?:
     if (holdCompletion && event.action === 'files.complete') { held.push({ event, generation: current }); return true; }
     agent.send(JSON.stringify({ type: 'agent.nodeTool', generation: current, event })); return true;
   };
-  const files = new NodeFiles(path.join(directory, 'agent-data'), directory, network, `${origin.replace('http:', 'ws:')}/agent/connect`, emit);
+  const packagedAgent = process.env.NODE_TOOLS_AGENT_PACKAGE_DIR;
+  const Files = packagedAgent ? (await import(pathToFileURL(path.resolve(packagedAgent, 'dist/node-files.js')).href)).NodeFiles as typeof NodeFiles : NodeFiles;
+  const files = new Files(path.join(directory, 'agent-data'), directory, network, `${origin.replace('http:', 'ws:')}/agent/connect`, emit);
+  if (options.direct) { await files.direct.initialize(); if (!files.direct.available) throw new Error('Test WebRTC unavailable'); }
   const terminals = new NodeTerminals(directory, emit);
   if (!await terminals.initialize()) throw new Error('Test PTY unavailable');
   const reset = new Promise<void>((resolve) => {

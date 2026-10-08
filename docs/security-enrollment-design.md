@@ -2,9 +2,13 @@
 
 ## 部署边界
 
-- 公网只暴露外层 Nginx 的 `443`。Web 静态资源、REST/SSE、`/agent/enroll` 和 `/agent/connect` 均使用同一 HTTPS Origin。
-- Control Plane 端口只在可信内网或容器网络中开放。Agent 主动发起 HTTPS/WSS 出站连接，节点无需开放入站端口。
+- 当前 Web 与 Control Plane 的公网入口只暴露外层 Nginx 的 `443`。Web 静态资源、REST/SSE、`/agent/enroll` 和 `/agent/connect` 均使用同一 HTTPS Origin。
+- Control Plane 端口只在可信内网或容器网络中开放。Agent 主动发起 HTTPS/WSS 出站连接，节点无需开放固定入站服务端口。
 - 外层 Nginx 负责证书、TLS 策略和公网限流；应用仍负责管理员身份、节点身份、一次性凭证和来源校验。
+
+2026-10-08 的 [节点文件直连上传/下载](node-tools-design.md) 已实现，生产发布与节点 Agent 升级记录见该设计：控制入口仍走现有 HTTPS/WSS，文件数据经 WebRTC；STUN 服务及两端 UDP 出站/相关回包是额外网络条件，不把“控制入口仅 443”解释为直连无需其他网络路径。第一版不引入 TURN 或固定的 Agent HTTP 文件服务，不能穿透的网络保留中转方式。
+
+直连协商与每个文件任务分别授权，绑定管理员页面、节点及当前连接世代；页面握手不授予文件访问权限。节点凭证和管理员 Cookie 不转发给对端。注销、节点凭证撤销、控制连接世代失效或租约过期后，即使数据通道仍连通也停止任务；具体凭证、对端绑定和清理规则以节点工具设计为准。
 
 ## 管理员认证
 

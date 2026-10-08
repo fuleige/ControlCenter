@@ -77,7 +77,7 @@ export class AgentConnections {
 
   has(nodeId: string): boolean {
     const connection = this.connections.get(nodeId);
-    return connection?.socket.readyState === connection?.socket.OPEN;
+    return Boolean(connection && connection.socket.readyState === connection.socket.OPEN);
   }
 
   hasCapability(nodeId: string, capability: string): boolean {

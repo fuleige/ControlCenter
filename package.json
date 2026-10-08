@@ -10,8 +10,10 @@
   "scripts": {
     "build": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/node-files && npm run build -w @controller-center/control-plane && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs && npm run build -w @controller-center/web",
     "package:agent": "npm run build -w @controller-center/protocol && npm run build -w @controller-center/node-files && npm run build -w @controller-center/agent && node scripts/build-agent-package.mjs",
+    "clean:agent-packages": "node scripts/cleanup-agent-packages.mjs",
+    "test:agent-packages": "node --test scripts/cleanup-agent-packages.test.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present && npm run test:agent-packages",
     "dev:server": "npm run dev -w @controller-center/control-plane",
     "dev:agent": "npm run dev -w @controller-center/agent",
     "dev:web": "npm run dev -w @controller-center/web",

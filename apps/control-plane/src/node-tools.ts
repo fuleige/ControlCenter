@@ -6,9 +6,9 @@ import path from 'node:path';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { WebSocket } from 'ws';
 import {
-  NODE_FILES_CAPABILITY, TERMINAL_PTY_CAPABILITY, NODE_TOOL_LEASE_MS, TERMINAL_FRAME_BYTES, TERMINAL_WINDOW_BYTES,
+  NODE_FILES_CAPABILITY, NODE_FILES_DIRECT_CAPABILITY, DEFAULT_NODE_FILES_STUN_URLS, TERMINAL_PTY_CAPABILITY, NODE_TOOL_LEASE_MS, TERMINAL_FRAME_BYTES, TERMINAL_WINDOW_BYTES,
   isRecord, type AgentNodeToolMessage, type NodeToolCommand, type NodeFileTaskView,
-  type NodeUploadTarget, type NodeDownloadSource, type NodeDirectory,
+  type NodeUploadTarget, type NodeDownloadSource, type NodeDirectory, type NodeFileSignal, type NodeFileTransport,
 } from '@controller-center/protocol';
 import { fileSize, hashFile, readableError, validHash, writeChunk } from '@controller-center/node-files';
 import type { AgentConnections } from './connections.js';
@@ -17,10 +17,13 @@ interface Options {
   directory: string; sqlite: DatabaseSync; connections: AgentConnections; publicOrigin: string; allowedOrigins: string[];
   session: (request: FastifyRequest, touch?: boolean) => { id: string; expiresAt: string } | null;
   quotaBytes?: number; reserveBytes?: number; terminalLimit?: number; fileLimit?: number; leaseMs?: number;
+  stunUrls?: string[] | undefined;
 }
 interface Page {
   id: string; nodeId: string; sessionId: string; request: FastifyRequest; expires: number;
   socket: WebSocket | null; pingOutstanding: boolean; plans: Map<string, NodeUploadTarget[]>;
+  direct: { id: string; token: string; ready: boolean; candidates: number; created: number } | null;
+  probes: number;
 }
 interface Terminal {
   id: string; nodeId: string; socket: WebSocket; request: FastifyRequest; sessionId: string; generation: string;
@@ -60,6 +63,7 @@ export class NodeTools {
   private readonly diskReserve: number;
   private readonly terminalLimit: number;
   private readonly fileLimit: number;
+  private readonly stunUrls: string[];
   private closing = false;
   private readonly startupCleanup = new Set<string>();
   private readonly allocationQueues = new Map<string, Promise<unknown>>();
@@ -68,6 +72,8 @@ export class NodeTools {
     this.quota = positive(options.quotaBytes, 8 * 1024 ** 3);
     this.diskReserve = positive(options.reserveBytes, 512 * 1024 ** 2);
     this.terminalLimit = positive(options.terminalLimit, 8); this.fileLimit = positive(options.fileLimit, 2);
+    this.stunUrls = [...(options.stunUrls ?? DEFAULT_NODE_FILES_STUN_URLS)];
+    if (this.stunUrls.length > 8 || this.stunUrls.some((url) => url.length > 512 || !/^stun:[a-zA-Z0-9.\[\]:-]+(?:\?transport=udp)?$/.test(url))) throw new Error('NODE_FILES_STUN_URLS 必须是逗号分隔的 stun: 地址，首版不支持 TURN');
     mkdirSync(options.directory, { recursive: true, mode: 0o700 }); chmodSync(options.directory, 0o700);
     options.sqlite.exec('CREATE TABLE IF NOT EXISTS node_file_tasks (id TEXT PRIMARY KEY, metadata TEXT NOT NULL)');
     // A restart never resumes an old task. Keep failed-cleanup records accounted for.
@@ -88,17 +94,25 @@ export class NodeTools {
   }
   nodeDisconnected(nodeId: string): void {
     for (const terminal of this.terminals.values()) if (terminal.nodeId === nodeId) this.closeTerminal(terminal, '节点连接已断开');
-    for (const task of this.tasks.values()) if (task.nodeId === nodeId && !ended.has(task.view.status) && task.view.status !== 'ready') {
+    for (const task of this.tasks.values()) if (task.nodeId === nodeId && !ended.has(task.view.status) && (task.view.status !== 'ready' || task.view.transport === 'direct')) {
       this.failTask(task, task.view.direction === 'upload' && task.started ? '提交结果不确定，请检查目标文件；节点连接已断开' : '节点连接已断开，文件任务已中断');
     }
     for (const [id, pending] of this.pending) if (pending.nodeId === nodeId) {
       clearTimeout(pending.timer); this.pending.delete(id); pending.reject(failure('节点已离线', 409));
     }
     this.generations.delete(nodeId);
+    for (const page of this.pages.values()) if (page.nodeId === nodeId) { page.direct = null; if (page.socket) safeSend(page.socket, { action: 'files.direct.closed' }); }
   }
   handleAgent(nodeId: string, message: AgentNodeToolMessage): void {
     if (message.generation !== this.generations.get(nodeId) || !isRecord(message.event)) return;
     const event = message.event;
+    if (event.action === 'files.direct.signal' || event.action === 'files.direct.ready') {
+      const page = this.pages.get(event.pageId);
+      if (!page || page.nodeId !== nodeId || page.direct?.id !== event.connectionId || page.expires <= Date.now() || !this.options.session(page.request)) return;
+      if (event.action === 'files.direct.ready') page.direct.ready = true;
+      if (page.socket) safeSend(page.socket, event);
+      return;
+    }
     if (event.action === 'files.result') {
       const pending = this.pending.get(event.requestId);
       if (!pending || pending.nodeId !== nodeId || pending.generation !== message.generation) return;
@@ -126,24 +140,30 @@ export class NodeTools {
     }
     if (!('id' in event)) return;
     const task = this.tasks.get(event.id);
-    if (!task || task.nodeId !== nodeId || task.generation !== message.generation || ended.has(task.view.status)) return;
+    if (!task || task.nodeId !== nodeId || task.generation !== message.generation) return;
+    if (event.action === 'files.stopped') { task.view.stopped = true; if (!ended.has(task.view.status)) this.persist(task); return; }
+    if (ended.has(task.view.status)) return;
     if (event.action === 'files.progress') {
       if (task.view.status === 'ready') return;
       if (!Number.isSafeInteger(event.offset) || event.offset < task.view.agentOffset || event.offset > task.view.size) return;
       task.view.agentOffset = event.offset;
+      if (task.view.transport === 'direct') task.view.offset = event.offset;
       task.view.phase = event.phase === 'committing' ? 'committing' : event.phase === 'verifying' ? 'verifying'
         : task.view.direction === 'upload' ? 'node-upload' : 'node-download';
       if (event.phase !== 'transferring') task.view.status = event.phase;
       task.updated = Date.now(); this.persist(task);
       this.logTask(task, 'progress');
-    } else if (event.action === 'files.error') this.failTask(task, event.error);
+    } else if (event.action === 'files.error') { task.view.errorKind = event.kind || 'business'; this.failTask(task, event.error); }
     else if (event.action === 'files.complete') {
-      if (!validHash(event.sha256) || event.sha256 !== task.view.sha256) { this.failTask(task, '节点整体校验结果不一致'); return; }
+      if (!validHash(event.sha256) || (task.view.transport !== 'direct' && event.sha256 !== task.view.sha256)) { this.failTask(task, '节点整体校验结果不一致'); return; }
+      if (task.view.transport === 'direct') task.view.sha256 = event.sha256;
       if (task.view.direction === 'upload') {
         task.view.status = 'completed'; task.view.phase = 'completed'; task.view.agentOffset = task.view.size;
         this.persist(task); void this.cleanupTask(task);
         this.logTask(task, 'completed');
-      } // Download readiness is established by the HTTP finalize/streamed hash, never this event alone.
+      } else if (task.view.transport === 'direct' && !task.cancelRequested) {
+        task.view.status = 'ready'; task.view.phase = 'ready'; task.view.offset = task.view.agentOffset = task.view.size; task.readyAt = Date.now(); this.persist(task);
+      } // Relay download readiness is established by the HTTP finalize/streamed hash.
     }
   }
   private send(nodeId: string, command: NodeToolCommand): boolean {
@@ -177,6 +197,7 @@ export class NodeTools {
     const page = task ? this.pages.get(task.pageId) : null;
     if (!task || task.sessionId !== session.id || !page || page.expires <= Date.now()) throw failure('文件任务已失效', 410);
     if (!download && this.page(request).id !== task.pageId) throw failure('文件任务不属于当前页面', 403);
+    if (task.view.transport === 'direct' && !ended.has(task.view.status) && task.generation !== this.generations.get(task.nodeId)) throw failure('节点连接世代已失效', 410);
     return task;
   }
   private agentTask(request: FastifyRequest, id: string): Task {
@@ -248,7 +269,7 @@ export class NodeTools {
     await task.queue.catch(() => undefined);
     await task.handle?.close().catch(() => undefined); task.handle = null;
     try {
-      await unlink(task.stagePath).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
+      if (task.stagePath) await unlink(task.stagePath).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
       task.retained = false;
       this.options.sqlite.prepare('DELETE FROM node_file_tasks WHERE id=?').run(task.view.id);
       if (!this.pages.has(task.pageId)) this.tasks.delete(task.view.id);
@@ -265,6 +286,7 @@ export class NodeTools {
   private async expirePage(page: Page, reason = 'page-close-request'): Promise<void> {
     if (this.pages.get(page.id) !== page) return;
     this.pages.delete(page.id); page.socket?.close(1000, 'File page ended');
+    this.send(page.nodeId, { action: 'files.direct.close', pageId: page.id }); page.direct = null;
     this.app.log.info({ pageId: page.id, nodeId: page.nodeId, reason }, 'Node file page ended');
     for (const task of this.tasks.values()) if (task.pageId === page.id) {
       this.cancelTask(task);
@@ -285,6 +307,7 @@ export class NodeTools {
       const session = this.options.session(page.request, true);
       if (!session || session.id !== page.sessionId || page.expires <= now) { await this.expirePage(page, !session ? 'session-expired' : 'page-lease-expired'); continue; }
       if (page.socket && page.socket.readyState === page.socket.OPEN && !page.pingOutstanding) { page.pingOutstanding = true; page.socket.ping(); }
+      if (page.direct) this.send(page.nodeId, { action: 'files.direct.lease', pageId: page.id });
       const activeIds = [...this.tasks.values()].filter((task) => task.pageId === page.id && task.started && !ended.has(task.view.status) && !task.cancelRequested).map((task) => task.view.id);
       if (activeIds.length) this.send(page.nodeId, { action: 'files.lease', ids: activeIds });
     }
@@ -320,16 +343,18 @@ export class NodeTools {
       if ([...this.tasks.values()].filter((task) => task.nodeId === page.nodeId && !ended.has(task.view.status) && task.view.status !== 'ready').length >= this.fileLimit) throw failure('节点文件任务已满，请等待当前传输结束', 429);
       if (this.tasks.size >= 512) throw failure('文件任务过多，请关闭已完成任务所在页面', 429);
       if (extra.target && [...this.tasks.values()].some((task) => task.nodeId === page.nodeId && task.target?.path === extra.target!.path && !ended.has(task.view.status))) throw failure('此目标文件正在上传，请等待其完成', 409);
+      if (view.transport !== 'direct') {
       let used = [...this.tasks.values()].filter((task) => task.retained).reduce((total, task) => total + task.view.size, 0);
       for (const id of this.startupCleanup) { try { used += statSync(path.join(this.options.directory, `${id}.part`)).size; } catch { /* missing */ } }
       const disk = await statfs(this.options.directory);
       const pendingDiskBytes = [...this.tasks.values()].filter((task) => task.retained).reduce((total, task) => total + Math.max(0, task.view.size - task.view.offset), 0);
       if (used + view.size > this.quota || disk.bavail * disk.bsize - view.size - pendingDiskBytes < this.diskReserve) throw failure('服务器暂存空间或磁盘余量不足', 507);
+      }
       const task: Task = { view, ...extra, pageId: page.id, nodeId: page.nodeId, sessionId: page.sessionId, generation: this.generations.get(page.nodeId)!,
-        token: randomBytes(32).toString('base64url'), stagePath: path.join(this.options.directory, `${view.id}.part`), handle: null,
-        controller: new AbortController(), queue: Promise.resolve(), streams: new Set(), updated: Date.now(), readyAt: null, started: false, cancelRequested: false, retained: true, identityKey: key, chunkRequests: 0, queuedChunks: 0, log: { at: 0, phase: '', status: '' } };
+        token: randomBytes(32).toString('base64url'), stagePath: view.transport === 'direct' ? '' : path.join(this.options.directory, `${view.id}.part`), handle: null,
+        controller: new AbortController(), queue: Promise.resolve(), streams: new Set(), updated: Date.now(), readyAt: null, started: false, cancelRequested: false, retained: view.transport !== 'direct', identityKey: key, chunkRequests: 0, queuedChunks: 0, log: { at: 0, phase: '', status: '' } };
       this.tasks.set(view.id, task); this.persist(task);
-      try { task.handle = await open(task.stagePath, 'wx+', 0o600); }
+      try { if (task.retained) task.handle = await open(task.stagePath, 'wx+', 0o600); }
       catch (error) { this.failTask(task, readableError(error)); throw failure(readableError(error), 507); }
       if (!this.pages.has(page.id) || ended.has(task.view.status) || task.generation !== this.generations.get(page.nodeId)) { this.cancelTask(task); await this.cleanupTask(task); throw failure('文件页面或节点已失联', 410); }
       this.logTask(task, 'created');
@@ -341,6 +366,21 @@ export class NodeTools {
   }
   private serial<T>(task: Task, operation: () => Promise<T>): Promise<T> {
     const pending = task.queue.catch(() => undefined).then(operation); task.queue = pending; return pending;
+  }
+  private transport(page: Page, value: unknown): NodeFileTransport {
+    if (value === undefined || value === 'relay') return 'relay';
+    if (value !== 'direct') throw failure('文件传输方式无效');
+    this.requireNode(page.nodeId, NODE_FILES_DIRECT_CAPABILITY);
+    if (!page.direct?.ready) throw failure('直连尚未就绪，请重新检测或选择中转', 409);
+    return 'direct';
+  }
+  private startDirect(page: Page, task: Task): void {
+    if (task.started || ended.has(task.view.status)) return;
+    if (!page.direct?.ready) { this.failTask(task, '直连通道已失效'); return; }
+    task.started = true;
+    const common = { id: task.view.id, pageId: page.id, connectionId: page.direct.id, token: task.token };
+    const command: NodeToolCommand = task.target ? { action: 'files.direct.upload', ...common, target: task.target } : { action: 'files.direct.download', ...common, source: task.source! };
+    if (!this.send(page.nodeId, command)) this.failTask(task, '节点已离线');
   }
   private reserveChunk(request: FastifyRequest, agent: boolean): void {
     const id = (request.params as { id: string }).id;
@@ -436,7 +476,7 @@ export class NodeTools {
     app.get<{ Params: { nodeId: string } }>('/api/node-tools/nodes/:nodeId/info', async (request) => {
       this.session(request); const nodeId = request.params.nodeId;
       return { online: this.options.connections.has(nodeId), terminal: this.options.connections.hasCapability(nodeId, TERMINAL_PTY_CAPABILITY),
-        files: this.options.connections.hasCapability(nodeId, NODE_FILES_CAPABILITY) };
+        files: this.options.connections.hasCapability(nodeId, NODE_FILES_CAPABILITY), direct: this.options.connections.hasCapability(nodeId, NODE_FILES_DIRECT_CAPABILITY) };
     });
     app.get<{ Params: { nodeId: string } }>('/api/node-tools/nodes/:nodeId/terminal', {
       websocket: true, preValidation: async (request) => this.socketAuth(request, TERMINAL_PTY_CAPABILITY),
@@ -485,8 +525,8 @@ export class NodeTools {
       const session = this.session(request); this.requireNode(request.params.nodeId, NODE_FILES_CAPABILITY);
       if (this.pages.size >= 128) throw failure('文件管理页面过多，请关闭不用的页面', 429);
       const page: Page = { id: randomUUID(), nodeId: request.params.nodeId, sessionId: session.id, request, expires: Date.now() + this.leaseMs,
-        socket: null, pingOutstanding: false, plans: new Map() }; this.pages.set(page.id, page);
-      return { pageId: page.id };
+        socket: null, pingOutstanding: false, plans: new Map(), direct: null, probes: 0 }; this.pages.set(page.id, page);
+      return { pageId: page.id, direct: this.options.connections.hasCapability(page.nodeId, NODE_FILES_DIRECT_CAPABILITY), stunUrls: this.stunUrls };
     });
     app.get<{ Params: { nodeId: string; pageId: string } }>('/api/node-tools/nodes/:nodeId/pages/:pageId/connect', {
       websocket: true, preValidation: async (request) => {
@@ -509,6 +549,24 @@ export class NodeTools {
       if (page && page.sessionId === this.session(request).id) await this.expirePage(page);
       return reply.code(204).send();
     });
+    app.get('/api/node-tools/files/direct', async (request) => {
+      const page = this.page(request); return { ready: Boolean(page.direct?.ready), connectionId: page.direct?.id || null };
+    });
+    app.post<{ Body: { connectionId: string; signal: NodeFileSignal } }>('/api/node-tools/files/direct/signal', async (request) => {
+      const page = this.page(request); this.requireNode(page.nodeId, NODE_FILES_DIRECT_CAPABILITY);
+      if (!page.socket || page.socket.readyState !== page.socket.OPEN || (request.headers.origin && !this.options.allowedOrigins.includes(request.headers.origin))) throw failure('直连协商需要有效且来源受信任的文件控制连接', 403);
+      const body = request.body;
+      if (!body || !/^[a-f0-9-]{36}$/i.test(body.connectionId) || !isRecord(body.signal)) throw failure('直连协商消息无效');
+      const signal = body.signal;
+      if (signal.type === 'offer') {
+        if (typeof signal.sdp !== 'string' || signal.sdp.length > 64 * 1024 || ++page.probes > 20) throw failure('直连协商超过限制', 429);
+        page.direct = { id: body.connectionId, token: randomBytes(32).toString('base64url'), ready: false, candidates: 0, created: Date.now() };
+      } else if (signal.type === 'candidate') {
+        if (typeof signal.candidate !== 'string' || signal.candidate.length > 2048 || typeof signal.mid !== 'string' || signal.mid.length > 128 || page.direct?.id !== body.connectionId || ++page.direct.candidates > 128) throw failure('直连候选地址无效');
+      } else throw failure('直连信令类型无效');
+      if (!page.direct || !this.send(page.nodeId, { action: 'files.direct.signal', pageId: page.id, connectionId: page.direct.id, token: page.direct.token, stunUrls: this.stunUrls, signal })) throw failure('节点当前离线', 409);
+      return { token: page.direct.token };
+    });
     app.get<{ Querystring: { path?: string; cursor?: string } }>('/api/node-tools/files/list', async (request) => {
       const page = this.page(request);
       return { directory: await this.rpc(page.nodeId, (requestId) => ({ action: 'files.list', requestId, path: request.query.path || '', cursor: Number(request.query.cursor || 0) })) };
@@ -524,31 +582,46 @@ export class NodeTools {
       const planId = randomUUID(); page.plans.set(planId, result);
       return { planId, targets: result };
     });
-    app.post<{ Body: { planId: string; index: number; overwrite: boolean } }>('/api/node-tools/files/uploads', async (request) => {
+    app.post<{ Body: { planId: string; index: number; overwrite: boolean; transport?: NodeFileTransport } }>('/api/node-tools/files/uploads', async (request) => {
       const page = this.page(request); const body = request.body;
+      const transport = this.transport(page, body?.transport);
       const target = body && Number.isInteger(body.index) ? page.plans.get(body.planId)?.[body.index] : null;
       if (!target) throw failure('上传预检已失效，请重新选择文件', 410);
       if (target.existing && body.overwrite !== true) throw failure('同名文件尚未确认覆盖', 409);
       const task = await this.allocate(page, { id: randomUUID(), direction: 'upload', name: target.name, path: target.path, size: fileSize(target.size), offset: 0, agentOffset: 0,
-        status: 'transferring', phase: 'browser-upload', error: null, sha256: null }, { target }, `upload:${body.planId}:${body.index}`);
-      return { task: task.view };
+        status: 'transferring', phase: transport === 'direct' ? 'node-upload' : 'browser-upload', error: null, sha256: null, transport }, { target }, `upload:${body.planId}:${body.index}`);
+      if (transport === 'direct') this.startDirect(page, task);
+      return { task: task.view, ...(transport === 'direct' ? { token: task.token } : {}) };
     });
-    app.post<{ Body: { path: string; requestId: string } }>('/api/node-tools/files/downloads', async (request) => {
+    app.post<{ Body: { path: string; requestId: string; transport?: NodeFileTransport } }>('/api/node-tools/files/downloads', async (request) => {
       const page = this.page(request); const body = request.body;
       if (!body || typeof body.requestId !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.requestId)) throw failure('下载请求无效');
       const old = [...this.tasks.values()].find((task) => task.pageId === page.id && task.identityKey === `download:${body.requestId}`);
-      if (old) return { task: old.view };
+      if (old) return { task: old.view, ...(old.view.transport === 'direct' ? { token: old.token } : {}) };
+      const transport = this.transport(page, body.transport);
       const source = await this.rpc(page.nodeId, (requestId) => ({ action: 'files.stat', requestId, path: body.path })) as NodeDownloadSource;
       if (!source || !source.identity) throw failure('节点文件结果无效');
       const task = await this.allocate(page, { id: randomUUID(), direction: 'download', name: source.name, path: source.path, size: fileSize(source.size), offset: 0, agentOffset: 0,
-        status: 'transferring', phase: 'node-download', error: null, sha256: null }, { source }, `download:${body.requestId}`);
-      if (!task.started && !ended.has(task.view.status)) {
+        status: 'transferring', phase: 'node-download', error: null, sha256: null, transport }, { source }, `download:${body.requestId}`);
+      if (transport === 'direct') this.startDirect(page, task);
+      else if (!task.started && !ended.has(task.view.status)) {
         task.started = true;
         if (!this.send(page.nodeId, { action: 'files.download', id: task.view.id, source, url: `${this.options.publicOrigin}/agent/node-files/${task.view.id}`, token: task.token })) this.failTask(task, '节点已离线');
       }
-      return { task: task.view };
+      return { task: task.view, ...(transport === 'direct' ? { token: task.token } : {}) };
+    });
+    app.post<{ Params: { id: string }; Body: { sha256: string } }>('/api/node-tools/tasks/:id/saved', async (request) => {
+      const task = this.browserTask(request, request.params.id);
+      if (task.view.transport !== 'direct' || task.view.direction !== 'download' || task.view.status !== 'ready' || task.cancelRequested || !validHash(request.body?.sha256) || task.view.sha256 !== request.body.sha256) throw failure('直连下载尚未通过最终校验', 409);
+      task.view.status = 'completed'; task.view.phase = 'completed'; this.persist(task); await this.cleanupTask(task); this.logTask(task, 'saved'); return { task: task.view };
     });
     app.get<{ Params: { id: string } }>('/api/node-tools/tasks/:id', async (request) => ({ task: this.browserTask(request, request.params.id).view }));
+    app.post<{ Params: { id: string } }>('/api/node-tools/tasks/:id/resume', async (request) => {
+      const page = this.page(request); const task = this.browserTask(request, request.params.id);
+      if (task.view.transport !== 'direct' || !page.direct?.ready || task.generation !== this.generations.get(page.nodeId) || task.cancelRequested || ended.has(task.view.status) || task.view.status === 'ready') throw failure('直连任务已失效，不能续传', 410);
+      if (!this.send(page.nodeId, { action: 'files.direct.resume', id: task.view.id, pageId: page.id, connectionId: page.direct.id, token: task.token })) throw failure('节点已离线', 409);
+      return { task: task.view };
+    });
     app.put<{ Params: { id: string; offset: string } }>('/api/node-tools/tasks/:id/chunks/:offset', { onRequest: async (request) => this.reserveChunk(request, false), onResponse: async (request) => this.releaseChunk(request) }, async (request) => {
       const task = this.browserTask(request, request.params.id);
       if (task.view.direction !== 'upload') throw failure('文件传输方向无效');

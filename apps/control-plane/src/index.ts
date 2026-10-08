@@ -291,6 +291,7 @@ const nodeTools = new NodeTools(app, {
   reserveBytes: Number(process.env.NODE_FILES_DISK_RESERVE_BYTES) || 512 * 1024 ** 2,
   terminalLimit: Number(process.env.NODE_TERMINAL_LIMIT) || 8,
   fileLimit: Number(process.env.NODE_FILE_CONCURRENCY) || 2,
+  stunUrls: process.env.NODE_FILES_STUN_URLS?.split(',').map((value) => value.trim()).filter(Boolean),
 });
 connections.onDisconnect = (nodeId) => nodeTools.nodeDisconnected(nodeId);
 
