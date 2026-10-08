@@ -15,7 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { NodeToolButtons } from "./NodeToolButtons";
-import { agentPackageTargetLabel, selectAgentPackage } from "./agent-package-ui";
+import { agentPackageTargetLabel, macOSPackageDownloadVerified, selectAgentPackage } from "./agent-package-ui";
 const NodeToolsPage = lazy(() => import("./NodeToolsPage"));
 import "./node-tools.css";
 import { createPortal } from "react-dom";
@@ -40,6 +40,7 @@ import {
   createAttachmentUpload,
   deleteAttachmentUpload,
   downloadAgentPackage,
+  createAgentPackageDownloadLink,
   fetchWorkspaceFileContent,
   getConversation,
   getWorkspaceFile,
@@ -81,6 +82,7 @@ import {
 import type {
   Approval,
   AgentPackageInfo,
+  AgentPackageDownloadLink,
   AttachmentRecord,
   Conversation,
   ConversationAttentionUpdate,
@@ -2280,18 +2282,19 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
   }
 
   return <section className="workspace-settings" aria-label="工作空间管理">
-    <div className="settings-copy"><h3>工作空间</h3><p>为节点登记可以执行任务的本地目录。路径会交给对应 Agent 验证；默认工作空间固定为 Agent 的启动目录。</p></div>
-    <label className="workspace-node-select"><span>管理节点</span><select value={nodeId} disabled={Boolean(busyId)} onChange={(event) => { setNodeId(event.target.value); setAdding(false); setEditingId(null); setConfirmation(null); setError(null); }}>
-      {nodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.status === "online" ? "在线" : "离线"}</option>)}
-    </select></label>
+    <div className="settings-copy"><h3>工作空间</h3><p>管理节点的任务目录，默认目录为 Agent 启动目录。</p></div>
     <div className="workspace-settings-toolbar">
-      <div><strong>{selectedNode?.name ?? "没有节点"}</strong><span>{workspaces.filter((workspace) => !workspace.archivedAt && workspace.source !== "history").length} 个新会话可选</span></div>
+      <label className="workspace-node-select"><span>节点</span><select aria-label="管理节点" value={nodeId} disabled={Boolean(busyId) || nodes.length === 0} onChange={(event) => { setNodeId(event.target.value); setAdding(false); setEditingId(null); setConfirmation(null); setError(null); }}>
+        {nodes.length === 0 && <option value="">没有节点</option>}
+        {nodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.status === "online" ? "在线" : "离线"}</option>)}
+      </select></label>
       <button type="button" className="primary-button" disabled={!selectedNode || selectedNode.status !== "online" || adding} onClick={() => setAdding(true)}>添加工作空间</button>
     </div>
+    <p className="workspace-list-summary">{loading ? '读取中…' : `${workspaces.filter((workspace) => !workspace.archivedAt && workspace.source !== "history").length} 个可用于新会话`}</p>
     {adding && <form className="workspace-add-form" onSubmit={(event) => void addWorkspace(event)}>
       <label><span>名称（可选）</span><input value={newName} maxLength={64} onChange={(event) => setNewName(event.target.value)} placeholder="默认使用目录名称" /></label>
       <label><span>该节点上的路径</span><input value={newPath} onChange={(event) => setNewPath(event.target.value)} placeholder="例如 /root/codes/project-a" autoFocus /></label>
-      <p>该路径可以位于 Agent 用户有权访问的任意位置。系统不会自动创建目录。</p>
+      <p>使用该节点上已存在、Agent 有权访问的目录。</p>
       <div><button type="button" onClick={() => { setAdding(false); setNewName(""); setNewPath(""); }}>取消</button><button className="primary-button" disabled={!newPath.trim() || busyId === "add"}>{busyId === "add" ? "验证中…" : "验证并添加"}</button></div>
     </form>}
     {error && <p className="form-error workspace-settings-error">{error}</p>}
@@ -2299,13 +2302,13 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
       {loading && workspaces.length === 0 ? <div className="empty compact">正在读取工作空间…</div> : workspaces.map((workspace) => {
         const editable = !workspace.isDefault && workspace.source !== "config" && workspace.status !== "archived";
         const isEditing = editingId === workspace.id;
-        return <article className={`workspace-card workspace-${workspace.status}`} key={workspace.id}>
+        return <article className={`workspace-card workspace-${workspace.status}${isEditing ? ' workspace-editing' : ''}`} key={workspace.id}>
           <div className="workspace-card-main">
             {isEditing ? <div className="workspace-edit-fields">
               <input aria-label="工作空间名称" value={editName} maxLength={64} onChange={(event) => setEditName(event.target.value)} />
               <input aria-label="工作空间路径" value={editPath} onChange={(event) => setEditPath(event.target.value)} />
             </div> : <div className="workspace-card-copy">
-              <div><strong>{workspace.name}</strong>{workspace.isDefault ? <b>默认</b> : <span>{workspaceSourceLabels[workspace.source]}</span>}</div>
+              <div><strong title={workspace.name}>{workspace.name}</strong>{workspace.isDefault ? <b>默认</b> : <span>{workspaceSourceLabels[workspace.source]}</span>}</div>
               <code title={workspace.path}>{workspace.path}</code>
               {workspace.validationError && <small>{workspace.validationError}</small>}
             </div>}
@@ -2372,6 +2375,9 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   const onlyLinuxPackages = availablePackages.length > 0 && availablePackages.every((item) => item.target?.startsWith("linux-"));
   const [packageLoading, setPackageLoading] = useState(true);
   const [packageDownloading, setPackageDownloading] = useState(false);
+  const [packageLinkBusy, setPackageLinkBusy] = useState(false);
+  const [packageLink, setPackageLink] = useState<AgentPackageDownloadLink | null>(null);
+  const [packageCopyStatus, setPackageCopyStatus] = useState('');
   const [packageError, setPackageError] = useState<string | null>(null);
   const usedIds = useRef(new Set<string>());
   const refreshRevision = useRef(0);
@@ -2439,6 +2445,27 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
     }
   }
 
+  async function copyPackageLink(): Promise<void> {
+    if (!selectedPackage?.available) return;
+    setPackageLinkBusy(true); setPackageError(null); setPackageCopyStatus('');
+    try {
+      const link = await createAgentPackageDownloadLink(selectedPackage.target);
+      setPackageLink(link);
+      try { await navigator.clipboard.writeText(link.url); setPackageCopyStatus('下载链接已复制'); }
+      catch { setPackageCopyStatus('链接已生成，请从下方手动复制'); }
+    } catch (reason) { setPackageError(formatErrorMessage(reason, '生成安装包下载链接')); }
+    finally { setPackageLinkBusy(false); }
+  }
+
+  async function copyPackageCommand(): Promise<void> {
+    if (!packageLink || Date.parse(packageLink.expiresAt) <= clock) return;
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    try {
+      await navigator.clipboard.writeText(`wget -O ${quote(packageLink.fileName)} ${quote(packageLink.url)}`);
+      setPackageCopyStatus('wget 命令已复制');
+    } catch { setPackageCopyStatus('无法自动复制，可手动复制下载链接'); }
+  }
+
   async function create(): Promise<void> {
     setBusy(true);
     setError(null);
@@ -2482,39 +2509,53 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   }
 
   return <section className="enrollment-settings">
-    <div className="settings-copy"><h3>节点接入</h3><p>生成一次性注册 Token，让新 Agent 建立自己的长期身份。有效期 10 分钟，倒计时结束后自动删除清理。</p></div>
+    <div className="settings-copy enrollment-heading">
+      <div><h3>节点接入</h3><p>Token 有效期 10 分钟，注册一次即失效。</p></div>
+      <button type="button" className="primary-button" disabled={busy} onClick={() => void create()}>{busy ? "生成中…" : "生成注册 Token"}</button>
+    </div>
     <div className="agent-package-card">
-      <div className="agent-package-details">
+      <div className="agent-package-heading">
         <strong>Agent 客户端安装包</strong>
-        {packageLoading
-          ? <span>正在读取安装包信息…</span>
-          : selectedPackage?.available
-            ? <><span>v{selectedPackage.version} · {selectedPackage.size !== null ? formatFileSize(selectedPackage.size) : "大小未知"} · {selectedPackage.target ? agentPackageTargetLabel(selectedPackage.target) : "旧版通用包"}</span><code title={selectedPackage.fileName ?? undefined}>{selectedPackage.fileName}</code><code title={selectedPackage.sha256 ?? undefined}>SHA-256 {selectedPackage.sha256}</code></>
-            : availablePackages.length > 0
-              ? <span>请先选择目标机器的系统和架构。安装包不能跨系统或架构使用。</span>
-              : <span>Agent v{agentPackage?.version ?? __APP_VERSION__} 安装包暂不可下载。</span>}
+        <span>{packageLoading ? '读取中…' : `v${selectedPackage?.version ?? agentPackage?.version ?? __APP_VERSION__}${selectedPackage?.available && selectedPackage.size !== null ? ` · ${formatFileSize(selectedPackage.size)}` : ''}`}</span>
       </div>
       <div className="agent-package-controls">
-        {availablePackages.length > 0 && <label><span>安装目标</span><select aria-label="Agent 安装目标" value={packageTarget} disabled={packageDownloading} onChange={(event) => { setPackageTarget(event.target.value); setPackageError(null); }}><option value="" disabled>请选择目标节点的系统和架构</option>{availablePackages.map((item) => <option key={item.target} value={item.target}>{agentPackageTargetLabel(item.target!)}</option>)}</select></label>}
-        <button type="button" className="primary-button" disabled={packageLoading || packageDownloading || !selectedPackage?.available} onClick={() => void downloadPackage()}>{packageDownloading ? "下载中…" : "下载客户端"}</button>
+        {availablePackages.length > 0 && <select aria-label="Agent 安装目标" value={packageTarget} disabled={packageDownloading || packageLinkBusy} onChange={(event) => { setPackageTarget(event.target.value); setPackageError(null); setPackageLink(null); setPackageCopyStatus(''); }}><option value="" disabled>选择系统与架构</option>{availablePackages.map((item) => <option key={item.target} value={item.target}>{agentPackageTargetLabel(item.target!)}</option>)}</select>}
+        <div className="agent-package-buttons">
+          <button type="button" className="primary-button" disabled={packageLoading || packageDownloading || packageLinkBusy || !selectedPackage?.available} onClick={() => void downloadPackage()}>{packageDownloading ? "下载中…" : "下载客户端"}</button>
+          <button type="button" disabled={packageLoading || packageDownloading || packageLinkBusy || !selectedPackage?.available} onClick={() => void copyPackageLink()}>{packageLinkBusy ? '生成中…' : '复制下载链接'}</button>
+        </div>
       </div>
-      {onlyLinuxPackages && <p className="agent-package-notice" role="status">目前仅提供 Linux 安装包，macOS 安装包暂不可下载。请勿在 macOS 上使用 Linux 包。</p>}
-    </div>
-    <div className="enrollment-create-card">
-      <div><strong>注册新节点</strong><span>在目标机器准备好控制中心 HTTPS 地址，然后粘贴这里生成的 Token。</span></div>
-      <button type="button" className="primary-button" disabled={busy} onClick={() => void create()}>{busy ? "生成中…" : "生成注册 Token"}</button>
+      {!packageLoading && !selectedPackage?.available && availablePackages.length === 0 && <span>安装包暂不可下载</span>}
+      {(selectedPackage?.available || onlyLinuxPackages) && <div className="agent-package-footer">
+        {onlyLinuxPackages && <p className="agent-package-notice" role="status">目前仅提供 Linux 安装包</p>}
+        {selectedPackage?.target?.startsWith('darwin-') && (macOSPackageDownloadVerified(selectedPackage)
+          ? <p className="agent-package-verified" role="status" title="2026-10-08 用户确认当前 ARM64 安装包可正常直连下载">macOS 直连下载已实机验证</p>
+          : <p className="agent-package-notice" role="status" title="请先测试终端和文件上传、下载">macOS 待实机验证</p>)}
+        {selectedPackage?.available && <details className="agent-package-details" key={selectedPackage.fileName}>
+          <summary>安装包详情</summary>
+          <code>{selectedPackage.fileName}</code><code>SHA-256 {selectedPackage.sha256}</code>
+        </details>}
+      </div>}
+      {packageLink && <div className="agent-package-link">
+        <div><span role="status">{Date.parse(packageLink.expiresAt) <= clock ? '链接已过期，请重新复制' : packageCopyStatus}</span><button type="button" disabled={Date.parse(packageLink.expiresAt) <= clock} onClick={() => void copyPackageCommand()}>复制 wget 命令</button></div>
+        <details open={packageCopyStatus.includes('手动')} key={packageLink.url}>
+          <summary>查看链接 · 有效至 {new Date(packageLink.expiresAt).toLocaleTimeString()}</summary>
+          <input readOnly aria-label="客户端临时下载链接" value={packageLink.url} onFocus={event => event.target.select()} />
+          <small>其他设备无需登录；过期或服务重启后需重新复制。</small>
+        </details>
+      </div>}
     </div>
     {(error ?? refreshError ?? packageError) && <p className="form-error workspace-settings-error">{error ?? refreshError ?? packageError}</p>}
     {nodes.length > 0 && <div className="enrollment-nodes">
-      <header><strong>已登记节点</strong><span>丢失或停用节点时应立即撤销其长期凭证</span></header>
+      <header><strong>已登记节点 <small>{nodes.length}</small></strong></header>
       {nodes.map((node) => <article key={node.id}>
         <div><strong>{node.name}</strong><small>{node.accessMode === "enrolled" ? "独立凭证" : node.accessMode === "revoked" ? "接入已撤销" : "旧共享凭证"} · {node.status === "online" ? "在线" : "离线"}{node.permissionMode === "danger-full-access" ? " · 全权限" : ""}</small></div>
         {confirmNodeId === node.id ? <div className="enrollment-node-confirm"><span>撤销后 Agent 会立即断开</span><button type="button" onClick={() => setConfirmNodeId(null)}>取消</button><button type="button" className="danger-text" disabled={busy} onClick={() => void revokeAccess(node)}>确认撤销</button></div>
           : <button type="button" className="danger-text" disabled={busy || node.accessMode !== "enrolled"} onClick={() => setConfirmNodeId(node.id)}>撤销接入</button>}
       </article>)}
     </div>}
-    <div className="enrollment-history">
-      <header><strong>注册 Token</strong><span>可在有效期内查看和复制，到期自动删除</span></header>
+    {entries.length > 0 && <div className="enrollment-history">
+      <header><strong>注册 Token</strong><span>到期自动清理</span></header>
       {entries.map((entry) => {
         const node = entry.nodeId ? nodes.find((candidate) => candidate.id === entry.nodeId) : null;
         return <article key={entry.id}>
@@ -2538,8 +2579,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
           </div>
         </article>;
       })}
-      {entries.length === 0 && <div className="empty compact">当前没有有效的注册 Token</div>}
-    </div>
+    </div>}
   </section>;
 }
 
@@ -2599,7 +2639,7 @@ function SettingsPanel({
 
   return <div className="overlay-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="settings-panel" role="dialog" aria-modal="true" aria-label="设置">
-      <header><div><span>Controller Center</span><h2>设置</h2></div><button type="button" onClick={onClose} aria-label="关闭设置">×</button></header>
+      <header><div><span>Controller Center</span><h2>设置</h2></div><small className="settings-header-version">v{__APP_VERSION__}</small><button type="button" onClick={onClose} aria-label="关闭设置">×</button></header>
       <div className="settings-layout">
         <nav aria-label="设置分类">
           <button type="button" className={section === "defaults" ? "active" : ""} aria-current={section === "defaults" ? "page" : undefined} onClick={() => setSection("defaults")}><SettingsIcon /><span>对话默认值</span></button>
@@ -2609,10 +2649,10 @@ function SettingsPanel({
           <div className="settings-version"><span>Controller Center</span><strong>v{__APP_VERSION__}</strong></div>
         </nav>
         {section === "defaults" ? <form className="settings-form" onSubmit={(event) => void save(event)}>
-          <div className="settings-copy"><h3>对话默认值</h3><p>创建新会话时优先使用这些选项。节点不支持所选模型时，将自动使用该节点的本机默认模型。</p></div>
+          <div className="settings-copy"><h3>对话默认值</h3><p>仅影响新会话；模型不可用时使用节点默认模型。</p></div>
           <div className="settings-default-fields">
-            <label><span><strong>默认模型</strong><small>用于新建会话，已有会话保持原设置。</small></span><select aria-label="默认模型" value={model} onChange={(event) => setModel(event.target.value)}><option value="">各节点本机默认</option>{models.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
-            <label><span><strong>默认思考强度</strong><small>跟随模型默认值，或指定思考强度。</small></span><select aria-label="默认思考强度" value={effort} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}><option value="">模型默认</option>{Object.entries(effortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label><span>默认模型</span><select aria-label="默认模型" value={model} onChange={(event) => setModel(event.target.value)}><option value="">各节点本机默认</option>{models.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
+            <label><span>默认思考强度</span><select aria-label="默认思考强度" value={effort} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}><option value="">模型默认</option>{Object.entries(effortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
           </div>
           {error && <p className="form-error">{error}</p>}
           <div className="settings-actions"><button type="button" onClick={onClose}>取消</button><button className="primary-button" disabled={busy}>{busy ? "保存中…" : "保存设置"}</button></div>

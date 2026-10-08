@@ -1,5 +1,12 @@
 import type { AgentPackageInfo } from "./types";
 
+// User acceptance on 2026-10-08 covers this exact ARM64 artifact's direct download.
+// A rebuilt archive, a different target or a later version needs its own verification.
+export function macOSPackageDownloadVerified(info: AgentPackageInfo): boolean {
+  return info.target === "darwin-arm64" && info.version === "0.3.19"
+    && info.sha256 === "d4a9981ea1ab7c0fd391ed0570e1b33f058d541018727ed41469f5628620d852";
+}
+
 export function agentPackageTargetLabel(target: string): string {
   const labels: Record<string, string> = {
     "linux-x64-glibc": "Linux · x64 · glibc",

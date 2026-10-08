@@ -223,6 +223,12 @@ export interface AgentPackageInfo {
   builtAt: string | null;
 }
 
+export interface AgentPackageDownloadLink {
+  url: string;
+  expiresAt: string;
+  fileName: string;
+}
+
 export interface TaskCenterEntry {
   id: string;
   notificationId: string | null;

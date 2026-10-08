@@ -2027,12 +2027,101 @@ test("安装包要求明确选择系统且 macOS 下载不会回退到 Linux", a
   await page.getByRole("button", { name: "节点接入", exact: true }).click();
   await expect(downloadButton).toBeDisabled();
   await target.selectOption(macOS.target);
+  await expect(page.getByText('macOS 待实机验证', { exact: true })).toBeVisible();
+  await page.locator('.agent-package-details summary').click();
   await expect(page.getByText(macOS.fileName, { exact: true })).toBeVisible();
   await expect(page.getByText(/目前仅提供 Linux 安装包/)).toHaveCount(0);
   download = page.waitForEvent("download");
   await downloadButton.click();
   expect((await download).suggestedFilename()).toBe(macOS.fileName);
   expect(requestedTargets).toEqual([linux.target, macOS.target]);
+});
+
+test('安装包可复制跨设备下载链接和 wget 命令并展示 macOS 下载验证结果', async ({ page }) => {
+  await mockControlCenter(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (text: string) => {
+      (window as unknown as { packageClipboard: string }).packageClipboard = text;
+    } } });
+  });
+  const linux = { available: true, version: '0.3.19', target: 'linux-x64-glibc', size: 100,
+    fileName: 'controller-center-agent-v0.3.19-linux-x64-glibc.tar.gz', sha256: 'test', builtAt: now };
+  const mac = { ...linux, target: 'darwin-arm64', fileName: 'controller-center-agent-v0.3.19-darwin-arm64.tar.gz',
+    sha256: 'd4a9981ea1ab7c0fd391ed0570e1b33f058d541018727ed41469f5628620d852' };
+  const requestedTargets: string[] = []; let downloads = 0;
+  let downloadUrl = '';
+  await page.route('**/api/agent-package**', async route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/api/agent-package/download-link') {
+      const target = route.request().postDataJSON().target; requestedTargets.push(target);
+      const fileName = target === mac.target ? mac.fileName : linux.fileName;
+      downloadUrl = `${url.origin}/api/agent-package/shared/test-ticket/${fileName}`;
+      await route.fulfill({ json: { url: downloadUrl, fileName, expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() } });
+    } else if (url.pathname.endsWith('/download')) { downloads++; await route.fulfill({ body: 'package' }); }
+    else await route.fulfill({ json: { package: linux, packages: [linux, mac] } });
+  });
+  await page.goto('/');
+  await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
+  await page.getByRole('button', { name: '节点接入', exact: true }).click();
+  const copy = page.getByRole('button', { name: '复制下载链接', exact: true });
+  await expect(copy).toBeDisabled();
+  await page.getByRole('combobox', { name: 'Agent 安装目标' }).selectOption(mac.target);
+  await expect(page.getByText('macOS 直连下载已实机验证', { exact: true })).toBeVisible();
+  await expect(page.getByText('macOS 待实机验证', { exact: true })).toHaveCount(0);
+  const layout = await page.locator('.enrollment-settings').evaluate(section => {
+    const packageCard = section.querySelector('.agent-package-card')!.getBoundingClientRect();
+    const firstNode = section.querySelector('.enrollment-nodes article')!.getBoundingClientRect();
+    return { packageHeight: packageCard.height, firstNodeTop: firstNode.top - section.getBoundingClientRect().top,
+      firstNodeVisible: firstNode.bottom <= section.getBoundingClientRect().bottom };
+  });
+  expect(layout.packageHeight).toBeLessThan(160);
+  expect(layout.firstNodeTop).toBeLessThan(300);
+  expect(layout.firstNodeVisible).toBe(true);
+  await expect(page.locator('.enrollment-history')).toHaveCount(0);
+  await copy.click();
+  await expect(page.getByRole('status', { name: '' }).filter({ hasText: '下载链接已复制' })).toBeVisible();
+  await expect(page.getByRole('textbox', { name: '客户端临时下载链接' })).toBeHidden();
+  await page.locator('.agent-package-link summary').click();
+  await expect(page.getByRole('textbox', { name: '客户端临时下载链接' })).toHaveValue(downloadUrl);
+  expect(await page.evaluate(() => (window as unknown as { packageClipboard: string }).packageClipboard)).toBe(downloadUrl);
+  await page.getByRole('button', { name: '复制 wget 命令' }).click();
+  expect(await page.evaluate(() => (window as unknown as { packageClipboard: string }).packageClipboard)).toBe(`wget -O '${mac.fileName}' '${downloadUrl}'`);
+  expect(requestedTargets).toEqual([mac.target]); expect(downloads).toBe(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+  await page.screenshot({ path: `/tmp/controller-center-package-links-${page.viewportSize()!.width}.png`, fullPage: true });
+  await page.getByRole('combobox', { name: 'Agent 安装目标' }).selectOption(linux.target);
+  await expect(page.getByRole('textbox', { name: '客户端临时下载链接' })).toHaveCount(0);
+  await expect(page.getByText('macOS 直连下载已实机验证', { exact: true })).toHaveCount(0);
+});
+
+test('安装包复制权限被拒时保留手动链接且生成失败显示原因', async ({ page }) => {
+  await mockControlCenter(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: async () => { throw new DOMException('denied', 'NotAllowedError'); } } });
+  });
+  const descriptor = { available: true, version: '0.3.18', target: 'darwin-arm64', size: 100,
+    fileName: 'controller-center-agent-v0.3.18-darwin-arm64.tar.gz', sha256: 'test', builtAt: now };
+  let fail = false;
+  await page.route('**/api/agent-package**', async route => {
+    const url = new URL(route.request().url());
+    if (url.pathname.endsWith('/download-link')) {
+      if (fail) await route.fulfill({ status: 503, json: { error: '下载服务暂不可用' } });
+      else await route.fulfill({ json: { url: `${url.origin}/api/agent-package/shared/manual/${descriptor.fileName}`, fileName: descriptor.fileName, expiresAt: new Date(Date.now() + 3600000).toISOString() } });
+    } else await route.fulfill({ json: { package: descriptor, packages: [descriptor] } });
+  });
+  await page.goto('/');
+  await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
+  await page.getByRole('button', { name: '节点接入', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Agent 安装目标' }).selectOption(descriptor.target);
+  const copy = page.getByRole('button', { name: '复制下载链接', exact: true });
+  await copy.click();
+  await expect(page.getByText('链接已生成，请从下方手动复制', { exact: true })).toBeVisible();
+  const input = page.getByRole('textbox', { name: '客户端临时下载链接' }); await expect(input).toBeVisible();
+  await input.focus();
+  expect(await input.evaluate((element: HTMLInputElement) => element.selectionEnd! - element.selectionStart!)).toBe((await input.inputValue()).length);
+  fail = true; await copy.click();
+  await expect(page.locator('.workspace-settings-error')).toContainText('下载服务暂不可用');
+  await expect(copy).toBeEnabled();
 });
 
 test("设置页在列表展示注册 Token、状态和到期倒计时", async ({ page }) => {
@@ -2095,7 +2184,7 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
   await page.getByRole("button", { name: "节点接入" }).click();
-  await expect(page.getByText("v0.3.13 · 566 KB · 旧版通用包")).toBeVisible();
+  await expect(page.getByText("v0.3.13 · 566 KB", { exact: true })).toBeVisible();
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载客户端" }).click();
   await expect((await downloadStarted).suggestedFilename()).toBe("controller-center-agent-v0.3.13.tar.gz");
@@ -2104,10 +2193,10 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await expect(page.getByText(registrationToken)).toBeVisible();
   await expect(page.getByText("未注册", { exact: true })).toBeVisible();
   await expect(page.getByText(/剩余 0:(0[1-9]|1[0-5])/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "复制" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "复制", exact: true })).toBeVisible();
 
   registrationStatus = "used";
   await expect(page.getByText("已注册", { exact: true })).toBeVisible({ timeout: 12_000 });
   await expect(page.getByText(registrationToken)).toHaveCount(0, { timeout: 8_000 });
-  await expect(page.getByText("当前没有有效的注册 Token")).toBeVisible();
+  await expect(page.locator('.enrollment-history')).toHaveCount(0);
 });

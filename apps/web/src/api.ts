@@ -1,6 +1,7 @@
 import type {
   Approval,
   AgentPackageInfo,
+  AgentPackageDownloadLink,
   AttachmentRecord,
   Conversation,
   ConversationAttentionUpdate,
@@ -478,6 +479,10 @@ export async function revokeEnrollmentToken(id: string): Promise<void> {
 export async function getAgentPackageInfo(): Promise<AgentPackageInfo> {
   const result = await api<{ package: AgentPackageInfo; packages?: AgentPackageInfo[] }>("/api/agent-package");
   return { ...result.package, packages: result.packages ?? [] };
+}
+
+export function createAgentPackageDownloadLink(target?: string): Promise<AgentPackageDownloadLink> {
+  return api('/api/agent-package/download-link', { method: 'POST', body: JSON.stringify({ target }) });
 }
 
 export async function downloadAgentPackage(fileName: string, target?: string): Promise<void> {

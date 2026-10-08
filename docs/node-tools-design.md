@@ -1,6 +1,6 @@
 # 节点终端与文件管理设计
 
-> 状态：终端、HTTPS 中转及 WebRTC 直连上传/下载已实现；2026-10-08 已更新生产 Web 与 Control Plane，随后重做并发布文件管理界面；节点 Agent 升级独立安排。Linux/Chromium、macOS 验证边界及生产发布记录见第 10 节。
+> 状态：终端、HTTPS 中转及 WebRTC 直连上传/下载已实现；2026-10-08 已更新生产 Web 与 Control Plane，发布 Agent v0.3.19 的 Linux 和 macOS ARM64 包；用户已确认 Mac mini 直连下载可用。Linux/Chromium、macOS 验证边界及生产发布记录见第 10 节，节点 Agent 升级独立安排。
 > 日期：2026-10-08
 > 范围：Controller Center Web、Control Plane、Linux/macOS Agent
 
@@ -21,11 +21,11 @@
 ## 2. 当前实现与新增约束
 
 - Agent 通过 `/agent/connect` 建立经过节点凭证认证的 WSS；文件页独立 WebSocket 维护页面租约并接收直连信令。
-- 协议 v5 增加可选 `node_files_direct_v1`，包含直连上传和下载；Agent v0.3.17 起在原生库加载成功后声明。当前修复包为 v0.3.18；只有 `node_files_v1` 的 Agent 继续使用中转，不禁止文件入口。
+- 协议 v5 增加可选 `node_files_direct_v1`，包含直连上传和下载；Agent v0.3.17 起在原生库加载成功后声明。当前安装包为 v0.3.19；只有 `node_files_v1` 的 Agent 继续使用中转，不禁止文件入口。
 - `apps/control-plane/src/node-tools.ts` 根据任务传输方式分配暂存；直连只登记任务状态，不打开暂存文件、不预留文件配额。复用 `packages/node-files` 的路径、分片、哈希及文件身份校验。
 - 节点文件当前按 1 MiB HTTP 分片传输、流式校验；不能复用对话预览中的 JSON/Base64 或整文件读取。DataChannel 帧大小与应用分片分别约束，见第 6.2 节。
 - 现有 Nginx 的 `client_max_body_size 3m` 适配中转分片；保留 WebSocket Upgrade、缓冲、超时与响应范围配置。WebRTC 数据不经 Nginx HTTP 路由，STUN 与 UDP 网络条件需单独验证，既有 HTTP/WSS 代理配置不等于 WebRTC 代理支持。
-- Agent 安装包使用 `npm install --ignore-scripts`，已按构建目标携带并验证 PTY 原生文件。若新增 WebRTC 原生依赖，须适配打包并在 Linux x64/glibc、macOS ARM64 与 Node.js 24 环境验证；依赖加载失败只停用直连能力，不影响中转或聊天。
+- Agent 安装包使用 `npm install --ignore-scripts`，按构建目标携带 PTY 与 WebRTC 原生文件，使用 Node.js 24 构建基线，运行支持 Node 24 及以上并实际检测原生能力。Linux x64/glibc、macOS ARM64 验证记录分别保留；依赖加载失败只停用对应能力，不影响中转或聊天。
 
 ## 3. 界面与使用流程
 
@@ -193,7 +193,7 @@ HTTP 分片维持 1 MiB。直连可沿用逻辑分片及哈希语义，但每个
 - Web/Control Plane 控制入口维持 HTTPS/WSS。控制面 `NODE_FILES_STUN_URLS` 为逗号分隔的 STUN 地址，最多 8 个；未设置时使用 `stun:stun.cloudflare.com:3478`、`stun:global.stun.twilio.com:3478`、`stun:stun.l.google.com:19302` 三个候选，显式留空只交换主机候选。Cloudflare 列在首位作为首选测试服务；WebRTC 同时探测候选服务器并自行选择实际可用路径，列表顺序不保证串行访问或最终路径。多个地址提高覆盖机会，不保证 NAT 跨网可达，发布前仍需验证实际网络。直连需要节点与浏览器的 UDP 出站及相关回包，不要求固定公网 HTTP 监听或手动端口映射。现有 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 和 `--codex-proxy-only` 的 HTTP/WSS 含义保持不变，不能宣称它们自动代理 WebRTC。当前不配置 TURN；以后增加 TURN 时，使用 relay candidate 的路线必须标为中继，不能显示直连。
 - 前端记录浏览器环境、协商、两端连接、通道授权和传输中断的失败阶段。文件页提供诊断详情，失败时展开，并在浏览器控制台输出有界诊断记录；展示各 STUN 地址、浏览器错误码/错误文本、两端候选类型数量、连接状态和检测过程，不输出原始 SDP、候选 IP/端口或令牌。`icecandidateerror` 的 701 表示浏览器报告此地址探测不可达；DNS、UDP、防火墙或部分接口路径仍需区分。成功公网候选优先于局部错误；已建立直连不因单个 STUN 错误降级。没有来源信息或没有返回结果时标为未单独确认，不把建连超时等同于 STUN 服务宕机。浏览器只能逐项观察自己的探测；当前 Agent 的候选信息不能证明其逐个 STUN 地址的访问结果。检测失败不启动文件任务，不自动切换已有任务到中转。
 - PTY 及新增 WebRTC 原生依赖按实际 OS、架构、Linux libc 与 Node.js 24 目标打包，构建后验证实际独立安装包。Linux x64/glibc 和 macOS ARM64 是首批验证目标，Linux 结果不能代替 macOS；模块加载失败只停用对应 capability，不带崩聊天与中转。下载页继续明确系统目标、独立 Agent 版本与 SHA-256。
-- 新协议消息通过可选 capability 守卫，保持协议 v5；旧 Agent 仍可中转。Controller Center 与 Agent 独立发布。Agent 运行代码或原生依赖变化时独立升级其版本，当前修复包为 v0.3.18；已验证并发布 Linux x64/glibc 安装包，Web 与 Control Plane 已部署，macOS 产物和节点升级边界见第 10 节。
+- 新协议消息通过可选 capability 守卫，保持协议 v5；旧 Agent 仍可中转。Controller Center 与 Agent 独立发布。Agent 运行代码或原生依赖变化时独立升级其版本，当前安装包为 v0.3.19；Linux x64/glibc 已验证并发布，macOS ARM64 直连下载获用户实机确认，Web 与 Control Plane 已部署，产物和节点升级边界见第 10 节。
 
 ## 8. 实施顺序与验收
 
@@ -234,7 +234,7 @@ HTTP 分片维持 1 MiB。直连可沿用逻辑分片及哈希语义，但每个
 
 ## 10. 已实施能力与验证记录
 
-第 10.1—10.4 节保留截至 2026-10-01 的终端及 HTTPS 中转验证，不能作为直连验收。2026-10-08 的本地实现、直连验证与未覆盖边界见第 10.5—10.6 节；生产发布及随后调整见第 10.7—10.12 节。节点 Agent 升级独立安排。
+第 10.1—10.4 节保留截至 2026-10-01 的终端及 HTTPS 中转验证，不能作为直连验收。2026-10-08 的本地实现、直连验证与未覆盖边界见第 10.5—10.6 节；生产发布及随后调整见第 10.7—10.15 节。节点 Agent 升级独立安排。
 
 ### 10.1 已实现基线
 
@@ -386,3 +386,37 @@ Web 构建、类型检查和 **33 项单元测试**通过；常规场景及最�
 Web 构建与类型检查通过，复核 **8 个 Chromium 场景**：直连完整上传/下载、中转覆盖及原生下载、保存 API 能力差异、直连状态及按钮颜色、操作区占高、文件选择、短窗口滚动以及 390/320 像素布局。检查约束桌面正常工具栏高度不超过 64 像素，手机操作区不超过 180 像素，同时保留可滚动文件列表。
 
 只发布 Web，生产 release 为 `20261008T082826Z-3861865`。公网健康、登录、在线节点目录及 8 个静态资源一致性检查通过。1440 × 900 页面实测工具栏为 **56 像素**，文件列表可视高度由上一版 483 增至 **630 像素**；320 × 844 页面操作区为 **120 像素**，文件列表可视高度由 138 增至 **217 像素**。上传与下载直连状态、蓝色下载按钮和独立选择均正常，无水平溢出或浏览器运行异常。生产验证未创建文件传输任务，临时登录已注销；Control Plane、Agent 进程和 v0.3.18 安装包保持原状态，未提交或推送 Git。截图与检查结果位于 `/tmp/controller-center-file-toolbar-production-desktop.png`、`/tmp/controller-center-file-toolbar-production-mobile.png` 和 `/tmp/controller-center-file-toolbar-production-check.json`。
+
+### 10.13 macOS ARM64 安装包、跨设备下载链接与节点接入页面精简
+
+按用户要求生成 Agent v0.3.18 的 macOS ARM64 测试包 `controller-center-agent-v0.3.18-darwin-arm64.tar.gz`，大小 **5,876,295 字节**，SHA-256 **`b66ae11b32836d4c9c317409e61e9e94138c4bd6690b0f3b00ccd9ef9e6b2bfa`**。复用同版本 Linux 包的编译运行代码、协议、文件模块和锁定依赖，换入官方 `node-pty@1.1.0` 与 `node-datachannel@0.33.4` 的 Darwin ARM64 原生模块，删除 Linux 原生构建。验证 npm 锁文件完整性、三个原生文件的 Mach-O ARM64 架构及 helper 执行权限；45 个运行文件与 Linux 包逐个哈希一致。没有升级 Agent 版本，也没有重建 Linux 包；当前版本两种平台归档均保留。需要 ARM64 Node.js 24.x；**终端、直连上传及下载尚待 Mac 实机验证**，Intel / Rosetta 包未生成。
+
+节点接入页面增加“复制下载链接”及“复制 wget 命令”。管理员生成随机 256 位安装包下载凭证，绑定目标平台、版本和 SHA-256，有效期一小时；其他设备无需管理员 Cookie 或 Token 即可下载所选产物，普通下载及生成链接接口仍要求登录。链接过期、服务重启、产物变更或移除后失效，不授权其他 API 或节点文件。应用日志隐藏下载凭证，专用 Nginx 路径关闭访问日志，响应不缓存。复制失败自动展开只读链接供手动复制；切换平台清理旧链接，已过期链接禁止复制 wget 命令。
+
+页面同时收紧布局：安装包默认只显示版本、大小、平台选择及两个操作，文件名和校验值收进“安装包详情”，下载链接按需展开；macOS 保留简短未验证提示。生成注册 Token 并入页头，删除重复说明和单独的大卡片，空 Token 列表不再占位置，已登记节点紧接安装包并显示数量，节点行与操作按钮同步缩小。保持明确选择平台、避免 Mac 下载回退到 Linux、Token 倒计时和撤销确认。
+
+类型检查及构建通过，安装包接口 **5 项测试**和桌面 / 320 像素的 **8 项 Chromium 检查**通过，覆盖免登录下载、错误平台、链接篡改与到期、产物替换、服务重启失效、平台选择、剪贴板拒绝、错误反馈、Token 列表与到期清理。发布前无文件任务，SQLite 在线备份至 `/var/backups/controller-center/pre-package-links-20261008T091042Z/`。Control Plane 已更新并重新连接现有 Agent，Web release 为 `20261008T091450Z-3885521`。公网实测复制链接和 wget 命令，以及不带 Cookie 的 wget / curl 下载均成功，文件名、大小和 SHA-256 与 Mac 产物一致；私有接口仍拒绝未登录请求，篡改链接返回 410，应用请求日志未包含下载凭证。7 个静态资源与部署文件一致，无浏览器异常。
+
+生产安装包区域在 1440 × 900 页面为 **112.6 像素**，320 × 700 页面为 **152.6 像素**，三个已登记节点均在首屏可见，没有横向溢出。Linux 包哈希和运行 Agent 进程未变化，临时验证登录已注销；未提交或推送 Git。截图及结果见 `/tmp/controller-center-enrollment-production-1440.png`、`/tmp/controller-center-enrollment-production-320.png`、`/tmp/controller-center-package-links-production-check.json`，Mac 静态审计结果见 `/tmp/controller-center-macos-0.3.18-audit.json`。
+
+### 10.14 Node 版本检查放宽与 Agent v0.3.19 安装包发布
+
+用户在 Mac mini 的 Node 26 环境遇到 v0.3.18 的启动检查拒绝。该检查把 Node 24 构建基线设为唯一允许的主版本，尚未加载原生模块就停止。本轮发布 Agent v0.3.19，将运行门槛改为 Node 24 及以上；较新主版本提示构建基线和实际能力检测，系统、CPU 架构及 Linux libc 不匹配仍在注册和创建节点状态前拒绝。安装包 `engines` 与 `BUILD-INFO.json` 同步为 `>=24`；正式构建机仍使用 Node 24 基线，不改变协议或现有终端、直连能力检测流程。
+
+运行检查 **6 项测试**、Agent 类型检查和打包通过。Linux x64/glibc 独立包分别在 Node 24.14.1 和官方 Node 26.11.1 运行包验证，真实 TTY、尺寸调整、两个终端独立关闭及 1 MiB 原生 DataChannel 传输均通过，错误目标仍在创建节点状态前被拒绝。macOS ARM64 包验证三个原生二进制架构、helper 权限、45 个运行文件与同版本 Linux 包一致，以及 Node 26 对 Mac 目标元数据的版本检查；这些结果不代表 Mac 原生模块已在实机运行。**Mac 终端、直连上传和下载仍由用户下载后实测。**
+
+产物为 `controller-center-agent-v0.3.19-darwin-arm64.tar.gz`，大小 **5,876,360 字节**，SHA-256 **`d4a9981ea1ab7c0fd391ed0570e1b33f058d541018727ed41469f5628620d852`**；同版本 Linux x64/glibc 包大小 **5,791,664 字节**，SHA-256 **`8d75d755ae6dbe0b66f7fda0e7f35e1862e7612fabb39c870799c8a7c03966ee`**。两个产物先在独立输出目录生成、验证，再发布至 `artifacts/`；旧 v0.3.18 归档已清理，运行安装目录保留。
+
+Control Plane 在启动时缓存 Agent 安装包版本，因此只重启现有 Control Plane 一次，使下载目录识别 v0.3.19；没有改动本轮 Control Plane 代码，也没有重启运行中的 Linux Agent。重启前无文件任务，SQLite 在线备份及上一版归档位于 `/var/backups/controller-center/pre-agent-0.3.19-20261008T095539Z/`。前端重新发布为 `20261008T095719Z-3902972`，没有重载 Nginx。公网健康、v0.3.19 平台元数据、复制下载链接及 wget 命令、免登录 wget/curl 下载与实际 SHA-256 一致性均通过，7 个前端静态资源一致，无浏览器异常；现有 Linux Agent 已重新连接，临时验证登录已注销。Mac Agent 由用户自行替换并重启，保留原工作目录和 `AGENT_DATA_DIR`，无需重新注册；本轮未提交或推送 Git。
+
+验证日志保存在 `/tmp/controller-center-agent-0.3.19/`，Mac 静态审计结果为 `/tmp/controller-center-macos-0.3.19-audit.json`，公网验证结果为 `/tmp/controller-center-agent-0.3.19/production-check.json`。
+
+### 10.15 macOS 实机反馈与本轮提交检查
+
+2026-10-08 用户在 Mac mini 更换安装包并自行重启后确认：“macos 端已经可以了，可以正常直连下载这些功能”。本轮确认对应 Agent v0.3.19 Darwin ARM64 产物，SHA-256 为 `d4a9981ea1ab7c0fd391ed0570e1b33f058d541018727ed41469f5628620d852`；此前 Node 26 被安装检查拒绝的问题已解决。记录用户明确反馈的启动使用及直连下载结果，不把该反馈扩展成独立的直连上传、终端、1 GiB、长时间并发或浏览器和网络矩阵验收。
+
+节点接入页面对匹配平台、版本和 SHA-256 的当前产物显示“macOS 直连下载已实机验证”；重新打包、其他版本及 Intel / Rosetta 包需另行验证。已有归档的构建元数据和 README 保留当时的待验证状态，后续验收以本节为准，归档和校验值不因说明更新而改变。
+
+本轮同时检查跨设备临时下载链接、macOS 原生依赖打包、Node 24 及以上运行检查和紧凑设置界面。三个设置分类已统一字号和控件尺寸：对话默认值缩为两行，保存操作紧跟表单；工作空间合并节点选择和添加入口，目录信息与操作集中展示，保留迁移、停用和删除确认；手机版本号移至页头。此前已完成 1440、820、390 和 320 像素的本地及公网页面检查，默认值保存与工作空间编辑、取消行为正常。设置界面变更只发布 Web，未改变相关后端接口。
+
+提交前全项目类型检查、Web 构建、脚本语法检查通过，**114 项自动化测试**及四种页面尺寸下的 **16 项 Chromium 检查**通过；默认关闭的 1 GiB 中转测试本次未重跑。覆盖安装目标选择、已验证与未验证提示、链接及 wget 命令复制、剪贴板拒绝、错误反馈和 Token 到期清理。Web 发布为 `20261008T101900Z-3907372`，公网复核三个设置分类的四种尺寸布局、macOS 验证提示与产物 SHA-256，以及 7 个静态资源一致性，均正常且无浏览器异常。Control Plane、Agent、Nginx 配置及安装包未改变；验证未修改默认值、工作空间或创建文件任务，临时登录已注销。检查结果见 `/tmp/controller-center-release-production-check.json`，测试日志为 `/tmp/controller-center-release-{typecheck,unit-tests,e2e,web-build}.log`。

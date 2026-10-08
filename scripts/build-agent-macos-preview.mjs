@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { accessSync, chmodSync, constants, cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { cleanupAgentPackages } from './cleanup-agent-packages.mjs';
 
 // Reuse an existing release's JavaScript and locked production dependencies.
-// The official node-pty Darwin prebuild replaces every host native build.
+// Official Darwin prebuilds replace the PTY and WebRTC host native modules.
 // This produces a test download; it does not claim a macOS runtime smoke test.
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 if (process.argv.length !== 3) throw new Error("Usage: node scripts/build-agent-macos-preview.mjs <Linux Agent archive.tar.gz>");
@@ -70,15 +70,44 @@ try {
   chmodSync(helper, 0o755);
   accessSync(helper, constants.X_OK);
   chmodSync(path.join(directory, "agent.sh"), 0o755);
+
+  const rtcName = '@node-datachannel/darwin-arm64';
+  const rtcDependency = sourceLock.packages[`node_modules/${rtcName}`];
+  const repositoryRtc = repositoryLock.packages[`node_modules/${rtcName}`];
+  const rtcInfo = JSON.parse(readFileSync(path.join(directory, 'node_modules/node-datachannel/package.json'), 'utf8'));
+  if (!rtcDependency || !repositoryRtc || packageInfo.dependencies['node-datachannel'] !== rtcInfo.version
+      || rtcDependency.version !== rtcInfo.version || rtcDependency.integrity !== repositoryRtc.integrity
+      || !rtcDependency.integrity?.startsWith('sha512-') || !rtcDependency.resolved?.startsWith('https://registry.npmjs.org/')) {
+    throw new Error('The macOS WebRTC prebuild must match the original release and repository lock integrity');
+  }
+  const response = await fetch(rtcDependency.resolved, { signal: AbortSignal.timeout(30_000) });
+  if (!response.ok) throw new Error(`Cannot download the official macOS WebRTC prebuild: HTTP ${response.status}`);
+  const rtcArchive = Buffer.from(await response.arrayBuffer());
+  if (`sha512-${createHash('sha512').update(rtcArchive).digest('base64')}` !== rtcDependency.integrity) {
+    throw new Error('The downloaded macOS WebRTC prebuild does not match the release lock integrity');
+  }
+  const rtcArchivePath = path.join(temporary, 'macos-webrtc.tgz');
+  writeFileSync(rtcArchivePath, rtcArchive);
+  const rtcScope = path.join(directory, 'node_modules/@node-datachannel');
+  rmSync(rtcScope, { recursive: true, force: true });
+  const rtcDestination = path.join(rtcScope, 'darwin-arm64');
+  mkdirSync(rtcDestination, { recursive: true });
+  run('tar', ['-xzf', rtcArchivePath, '--strip-components=1', '-C', rtcDestination]);
+  const nativeRtcInfo = JSON.parse(readFileSync(path.join(rtcDestination, 'package.json'), 'utf8'));
+  if (nativeRtcInfo.name !== rtcName || nativeRtcInfo.version !== rtcInfo.version) throw new Error('Unexpected macOS WebRTC prebuild identity');
+  checkArm64MachO(path.join(rtcDestination, 'node_datachannel.node'));
+  // The loader prefers local builds over platform packages, so remove Linux builds.
+  for (const relative of ['build', 'dist/build']) rmSync(path.join(directory, 'node_modules/node-datachannel', relative), { recursive: true, force: true });
   const buildInfo = {
     ...info, builtAt: new Date().toISOString(), target, platform: "darwin", arch: "arm64", libc: null, glibcVersion: null,
     builtOn: { platform: process.platform, arch: process.arch, nodeVersion: process.version },
     sourceTarget, nativeModule: `node-pty@${ptyInfo.version} official npm prebuild`, nativeVerification: "pending-macos-test",
+    nativeModules: [`node-pty@${ptyInfo.version} official npm prebuild`, `node-datachannel@${rtcInfo.version} official npm prebuild`],
   };
   writeFileSync(infoPath, `${JSON.stringify(buildInfo, null, 2)}\n`);
   const readmePath = path.join(directory, "README.md");
-  const previewNote = `> macOS ARM64 测试安装包：沿用 Agent v${version} 的运行代码和锁定依赖，使用 node-pty@${ptyInfo.version} 官方 macOS ARM64 预编译模块。已检查架构、完整性及 spawn-helper 执行权限，尚待 Mac 实机验证。需要 ARM64 Node.js 24.x，可用 node -p 'process.platform + "-" + process.arch' 确认输出为 darwin-arm64。升级现有节点时保留原工作目录及 AGENT_DATA_DIR，无需重新注册。\n\n`;
-  writeFileSync(readmePath, previewNote + readFileSync(readmePath, "utf8"));
+  const previewNote = `> macOS ARM64 测试安装包：沿用 Agent v${version} 的运行代码和锁定依赖，使用 node-pty@${ptyInfo.version} 和 node-datachannel@${rtcInfo.version} 官方 macOS ARM64 预编译模块。已检查架构、完整性及 spawn-helper 执行权限，终端和 WebRTC 仍待 Mac 实机验证。需要 ARM64 Node.js 24 或以上版本；Node 26 可通过版本检查，原生能力仍需实测。可用 node -p 'process.platform + "-" + process.arch' 确认输出为 darwin-arm64。升级现有节点时保留原工作目录及 AGENT_DATA_DIR，无需重新注册。\n\n`;
+  writeFileSync(readmePath, previewNote + readFileSync(path.join(repositoryRoot, 'docs/agent-cli.md'), 'utf8'));
   const releaseDirectory = path.join(temporary, releaseName);
   renameSync(directory, releaseDirectory);
   if (!existsSync(artifactDirectory)) throw new Error("Artifact output directory must already exist");

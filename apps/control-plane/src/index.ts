@@ -19,6 +19,7 @@ import {
 } from "@controller-center/protocol";
 import { loadConfig } from "./config.js";
 import { findAgentPackage, listAgentPackages } from "./agent-package.js";
+import { AGENT_PACKAGE_SHARED_PATH, agentPackageLogUrl, registerAgentPackageDownloadLinks } from './agent-package-download.js';
 import { NodeTools, NodeToolError } from "./node-tools.js";
 import { AgentConnections } from "./connections.js";
 import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type MessageListCursor, type WorkspaceRecord } from "./database.js";
@@ -45,7 +46,9 @@ ensureAdminToken(database, config.adminTokenPath, config.adminToken);
 const enrollmentDisplayKey = ensureEnrollmentDisplayKey(config.enrollmentDisplayKeyPath);
 const connections = new AgentConnections();
 const events = new UiEventBus();
-const app = Fastify({ logger: true, trustProxy: config.trustProxy });
+const app = Fastify({ logger: { serializers: { req: (request: FastifyRequest) => ({
+  method: request.method, url: agentPackageLogUrl(request.url), hostname: request.hostname, remoteAddress: request.ip,
+}) } }, trustProxy: config.trustProxy });
 const uiStreams = new Set<FastifyReply["raw"]>();
 const taskCenterPolicy = { limit: 200, replyPreviewCharacters: 120, readRetentionDays: 30, unreadRetentionDays: 90 } as const;
 const workspaceFileMaxBytes = 8 * 1024 * 1024;
@@ -276,7 +279,8 @@ app.addHook("onRequest", async (request, reply) => {
   if (!pathname.startsWith("/api/")
     || pathname === "/api/health"
     || pathname === "/api/auth/login"
-    || pathname === "/api/auth/session") return;
+    || pathname === "/api/auth/session"
+    || pathname.startsWith(`${AGENT_PACKAGE_SHARED_PATH}/`)) return;
   if (!originAllowed(request)) return reply.code(403).send({ error: "请求来源不受信任" });
   if (requestHasValidAdminToken(request) || authenticatedSession(request, true)) return;
   return reply.code(401).send({ error: "登录状态已失效" });
@@ -696,6 +700,11 @@ app.get<{ Querystring: { target?: string } }>("/api/agent-package/download", asy
   reply.header("Content-Disposition", `attachment; filename="${descriptor.fileName}"`);
   reply.header("X-Content-Type-Options", "nosniff");
   return reply.send(createReadStream(descriptor.filePath));
+});
+
+registerAgentPackageDownloadLinks(app, {
+  directory: config.agentArtifactDirectory, version: agentPackageVersion, publicOrigin: config.publicOrigin,
+  authorized: (request) => requestHasValidAdminToken(request) || Boolean(authenticatedSession(request, true)),
 });
 
 app.get("/api/enrollment-tokens", async (_request, reply) => {

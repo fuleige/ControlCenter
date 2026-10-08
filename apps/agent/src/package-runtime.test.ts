@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentPackageVersion, assertAgentPackageRuntime } from "./package-runtime.js";
 
 const directories: string[] = [];
@@ -28,11 +28,27 @@ describe("standalone Agent compatibility", () => {
     expect(() => assertAgentPackageRuntime(metadata("linux-x64-glibc"), { target: "darwin-arm64", nodeMajor: 24 }))
       .toThrow(/安装包目标为 linux-x64-glibc.*当前运行环境为 darwin-arm64.*请下载 darwin-arm64/);
   });
-  it("rejects the wrong CPU, libc and Node.js major", () => {
+  it("rejects the wrong CPU and libc even on newer Node.js", () => {
     const macOS = metadata("darwin-arm64");
     expect(() => assertAgentPackageRuntime(macOS, { target: "darwin-x64", nodeMajor: 24 })).toThrow(/darwin-x64/);
     expect(() => assertAgentPackageRuntime(metadata("linux-x64-glibc"), { target: "linux-x64-musl", nodeMajor: 24 })).toThrow(/linux-x64-musl/);
-    expect(() => assertAgentPackageRuntime(macOS, { target: "darwin-arm64", nodeMajor: 25 })).toThrow(/需要 Node.js 24.x/);
+    const warn = vi.fn();
+    expect(() => assertAgentPackageRuntime(macOS, { target: "darwin-x64", nodeMajor: 26 }, warn)).toThrow(/darwin-x64/);
+    expect(warn).not.toHaveBeenCalled();
+  });
+  it("blocks older Node.js but allows newer majors with a compatibility notice", () => {
+    const macOS = metadata("darwin-arm64");
+    const warn = vi.fn();
+    for (const nodeMajor of [18, 22, 23, Number.NaN]) {
+      expect(() => assertAgentPackageRuntime(macOS, { target: "darwin-arm64", nodeMajor }, warn)).toThrow(/需要 Node.js 24 或以上/);
+    }
+    expect(() => assertAgentPackageRuntime(macOS, { target: "darwin-arm64", nodeMajor: 24 }, warn)).not.toThrow();
+    expect(warn).not.toHaveBeenCalled();
+    for (const nodeMajor of [25, 26, 27]) {
+      expect(() => assertAgentPackageRuntime(macOS, { target: "darwin-arm64", nodeMajor }, warn)).not.toThrow();
+      expect(warn).toHaveBeenLastCalledWith(expect.stringContaining(`Node.js ${nodeMajor}.x`));
+    }
+    expect(warn).toHaveBeenCalledTimes(3);
   });
   it("allows matching targets and source checkouts without build metadata", () => {
     const file = metadata("darwin-arm64");

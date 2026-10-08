@@ -94,7 +94,7 @@ try {
       start: "node dist/index.js",
       enroll: "node dist/enroll.js",
     },
-    engines: { node: "24.x" },
+    engines: agentPackage.engines,
     dependencies: agentPackage.dependencies,
   }, null, 2)}\n`);
   writeFileSync(path.join(releaseDirectory, "protocol/package.json"), `${JSON.stringify({
@@ -113,7 +113,7 @@ try {
     name: "Controller Center Agent",
     version,
     builtAt: new Date().toISOString(),
-    node: "24.x",
+    node: agentPackage.engines.node,
     target, platform: process.platform, arch: process.arch, libc, nodeVersion: process.version,
     glibcVersion: process.platform === "linux" ? process.report.getReport().header.glibcVersionRuntime ?? null : null,
   }, null, 2)}\n`);

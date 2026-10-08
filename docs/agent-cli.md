@@ -1,15 +1,21 @@
 # Agent 客户端命令与配置
 
-本文档对应 Agent `v0.3.18`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
+本文档对应 Agent `v0.3.19`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
 
 `AGENT_DATA_DIR` 不是必填项，省略时使用当前用户的 `~/.controller-center-agent`。它保存节点 ID、注册凭证、可靠队列和附件缓存，必须在注册与后续启动之间保持不变。它不决定 Codex 工作空间：Agent 的启动目录才是默认工作空间。正式使用不建议把状态默认放到当前目录，否则从不同项目启动时可能产生不同节点身份；隔离测试时可以显式指定当前目录下的绝对路径，例如先执行 `export AGENT_DATA_DIR="$PWD/test-data"`。
 
 ## 获取和安装
 
-登录 Controller Center Web，进入“设置 → 节点接入”，选择目标机器的系统、CPU 架构和 Linux libc，再下载对应安装包；页面不会自动选中第一个包，只展示已构建的目标。当服务端仅有 Linux 包时，会明确提示 macOS 包暂不可下载。安装包已经包含编译结果、生产依赖和 PTY 原生模块，目标机器需要 Node.js 24.x，不需要再次执行 `npm install` 或编译源码。
+登录 Controller Center Web，进入“设置 → 节点接入”，选择目标机器的系统、CPU 架构和 Linux libc，再下载对应安装包；页面不会自动选中第一个包，只展示已构建的目标。当服务端仅有 Linux 包时，会明确提示 macOS 包暂不可下载。安装包已经包含编译结果、生产依赖和 PTY 原生模块，目标机器需要 Node.js 24 或以上版本，不需要再次执行 `npm install` 或编译源码。Node 24 为打包基线，较新主版本只提示兼容状态、不阻止启动，终端和直连原生能力仍在启动时检测。
+
+也可点击“复制下载链接”，在另一台设备直接用 wget 或 curl 下载，无需复制管理员 Cookie 或 Token。链接只允许下载所选安装包，有效期一小时；Control Plane 重启、安装包更新或移除后也会失效，需重新生成。页面提供“复制 wget 命令”；浏览器拒绝剪贴板操作时，可以从只读输入框手动复制链接。macOS 可使用系统 curl，例如：
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.18-linux-x64-glibc.tar.gz
+curl -fL '粘贴页面复制的下载链接' -o controller-center-agent-v0.3.19-darwin-arm64.tar.gz
+```
+
+```bash
+cc_agent_archive=controller-center-agent-v0.3.19-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -21,9 +27,9 @@ sudo mv "$cc_agent_directory" /opt/controller-center-agent
 
 每次新包成功生成后自动清理同一输出目录的其他版本安装包与源码归档，保留当前 Agent 版本的各系统/架构包；构建失败不删除原包。已有包可执行 `npm run clean:agent-packages` 清理，未生成当前版本安装包时会拒绝清理。`AGENT_PACKAGE_OUTPUT_DIR` 可指定独立输出目录，清理不会跨目录。
 
-2026-10-08 已按用户要求移除旧版 macOS ARM64 v0.3.15 测试包，目前下载目录只提供 v0.3.18 Linux x64/glibc 包。旧 Mac 包曾获用户实机反馈暂无异常，历史记录与 SHA-256 见 [节点工具的 macOS 验证记录](node-tools-design.md#104-macos-安装与验证边界)；这不代表当前 v0.3.18 的 Mac 原生库已验证。新的 macOS 包仍需在对应目标上构建和验证。
+2026-10-08 下载目录提供 v0.3.19 Linux x64/glibc 与 macOS ARM64 包。v0.3.19 放宽 Node 版本检查，允许 Mac 的 Node 26 继续启动。Mac 包复用同版本运行代码与锁定依赖，换入官方 `node-pty@1.1.0`、`node-datachannel@0.33.4` ARM64 预编译模块，并检查 npm 完整性、Mach-O 架构和 helper 执行权限。用户已在 Mac mini 确认当前包可正常使用及直连下载；对应文件 SHA-256 与验证范围见[本轮实机反馈](node-tools-design.md#1015-macos-实机反馈与本轮提交检查)。页面对这一精确产物显示“macOS 直连下载已实机验证”。包内 `nativeVerification: pending-macos-test` 和 README 的待验证说明记录的是构建时状态，后续用户反馈以该记录为准，不为更新说明而重新打包。Intel / Rosetta 的 darwin-x64 包本轮未生成。
 
-macOS 上运行 ARM64 Node.js 时需要 `darwin-arm64` 包，Intel 或 Rosetta 下的 x64 Node.js 需要 `darwin-x64` 包；以 `node -p 'process.platform + "-" + process.arch'` 输出为准。Linux 包不能直接用于 macOS。Agent v0.3.16 在首次注册和启动前检查安装包构建目标及 Node.js 主版本，不匹配时明确提示并停止，避免错误注册或启动后才发现终端缺失。此检查不会读取或修改注册凭证。
+macOS 上运行 ARM64 Node.js 时需要 `darwin-arm64` 包，Intel 或 Rosetta 下的 x64 Node.js 需要 `darwin-x64` 包；以 `node -p 'process.platform + "-" + process.arch'` 输出为准。Linux 包不能直接用于 macOS。Agent 在首次注册和启动前检查系统、架构、libc 和 Node 最低版本，不匹配时明确提示并停止；v0.3.19 起不再拒绝高于 Node 24 的主版本。此检查不会读取或修改注册凭证。
 
 如需要在 Mac 构建独立包，在对应源码目录及 Node.js 24.x 环境执行：
 
@@ -32,12 +38,12 @@ npm ci
 npm run package:agent
 ```
 
-构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.18-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
+构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.19-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
 
 将安装包放入下载目录前，在同一台构建机验证实际压缩包：
 
 ```bash
-node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.18-darwin-arm64.tar.gz
+node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.19-darwin-arm64.tar.gz
 ```
 
 此验证针对 v0.3.16 及后续版本：会解压到独立临时目录，检查版本与目标一致性，实际打开两个终端、验证 TTY 和窗口尺寸、关闭一个终端后确认另一个仍可交互，并确认错误目标会在创建节点状态前停止。验证不会注册测试节点或读取已有节点凭证。源码仓库提供手动触发的 `node-tools-verification.yml`，分别在 Linux x64 与 Mac ARM64 上构建、验证并保存对应目标的产物。旧版 v0.3.15 ARM64 测试包由用户在 Mac 通过网页实际打开终端及操作文件验收，不使用依赖新版启动校验模块的验证脚本。

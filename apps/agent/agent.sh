@@ -86,7 +86,7 @@ EOF
 
 require_runtime() {
   if ! command -v node >/dev/null 2>&1; then
-    echo "错误：找不到 node，请先安装 Node.js 24.x。" >&2
+    echo "错误：找不到 node，请先安装 Node.js 24 或以上版本。" >&2
     exit 1
   fi
 }

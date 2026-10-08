@@ -23,6 +23,7 @@ function currentRuntime(): PackageRuntime {
 export function assertAgentPackageRuntime(
   buildInfoPath: string | URL = new URL("../BUILD-INFO.json", import.meta.url),
   runtime: PackageRuntime = currentRuntime(),
+  warn: (message: string) => void = console.warn,
 ): void {
   let info: { target?: unknown };
   try {
@@ -37,7 +38,12 @@ export function assertAgentPackageRuntime(
   if (info.target !== runtime.target) {
     throw new Error(`安装包目标为 ${info.target}，当前运行环境为 ${runtime.target}。请下载 ${runtime.target} 的 Agent 安装包；Linux 与 macOS 安装包不能混用`);
   }
-  if (runtime.nodeMajor !== 24) throw new Error(`此安装包需要 Node.js 24.x，当前为 Node.js ${runtime.nodeMajor}.x，请切换到 Node.js 24 后启动`);
+  if (!Number.isSafeInteger(runtime.nodeMajor) || runtime.nodeMajor < 24) {
+    throw new Error(`此安装包需要 Node.js 24 或以上版本，当前为 Node.js ${runtime.nodeMajor}.x，请升级 Node.js 后启动`);
+  }
+  if (runtime.nodeMajor > 24) {
+    warn(`[agent] 当前 Node.js ${runtime.nodeMajor}.x 高于打包基线 24.x，继续运行；终端与直连能力以启动检测结果为准`);
+  }
 }
 
 export function requireAgentPackageRuntime(): void {
