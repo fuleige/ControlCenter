@@ -1871,7 +1871,8 @@ test("同工作区已有任务时确认后才并发启动", async ({ page }, tes
   expect(submissions).toHaveLength(1);
   expect(submissions[0]?.allowWorkspaceConcurrency).toBeUndefined();
 
-  await dialog.getByRole("button", { name: "仍然继续" }).click();
+  await expect(dialog.getByRole("button", { name: "仍然继续" })).toBeFocused();
+  await page.keyboard.press("Enter");
   await expect.poll(() => submissions.length).toBe(2);
   expect(submissions[1]?.allowWorkspaceConcurrency).toBe(true);
   expect(submissions[1]?.clientRequestId).toBe(submissions[0]?.clientRequestId);

@@ -41,13 +41,16 @@
 .node-tool-info > summary { display: grid; place-items: center; width: 30px; height: 29px; color: #a7b8d0; cursor: pointer; list-style: none; border-radius: 5px; }
 .node-tool-info > summary::-webkit-details-marker { display: none; }
 .node-tool-info > summary:hover, .node-tool-info[open] > summary { background: #242e3e; }
-.node-tool-info-popover { position: absolute; top: 47px; right: 10px; z-index: 30; width: 350px; max-width: calc(100vw - 20px); padding: 16px; border: 1px solid #354151; border-radius: 9px; background: #1b2330; box-shadow: 0 12px 30px #0006; font-size: 12px; }
+.node-tool-info-popover { position: absolute; top: 47px; right: 10px; z-index: 30; width: 350px; max-width: calc(100vw - 20px); max-height: calc(100dvh - 60px); overflow: auto; padding: 16px; border: 1px solid #354151; border-radius: 9px; background: #1b2330; box-shadow: 0 12px 30px #0006; font-size: 12px; }
 .node-tool-info-popover strong { color: #e6edf3; }
 .node-tool-info-popover dl { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 10px; margin: 14px 0; }
 .node-tool-info-popover dt { color: #8fa1b9; }
 .node-tool-info-popover dd { margin: 0; overflow-wrap: anywhere; }
 .node-tool-info-popover p { margin: 0; color: #a7b8d0; line-height: 1.7; }
-.node-terminal-toast { position: absolute; top: 48px; right: 12px; z-index: 35; margin: 0; padding: 9px 12px; border: 1px solid #84494a; border-radius: 7px; background: #362526; color: #f2b6b6; font-size: 12px; }
+.node-tool-info-popover p + p { margin-top: 10px; }
+.node-terminal-notifications { position: absolute; top: 48px; right: 12px; z-index: 35; display: grid; gap: 8px; max-width: min(440px, calc(100% - 24px)); pointer-events: none; }
+.node-terminal-toast { margin: 0; padding: 9px 12px; border: 1px solid #84494a; border-radius: 7px; background: #362526; color: #f2b6b6; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.node-terminal-copy-toast[data-state=success] { border-color: #36765e; background: #19382a; color: #b3e7c6; }
 
 /* Keep the file list stable while connection details and transfers use the sidebar. */
 .files-page { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 16px; padding: 0 22px 22px; }

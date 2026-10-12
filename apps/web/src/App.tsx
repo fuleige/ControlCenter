@@ -393,8 +393,8 @@ function WorkspaceConcurrencyDialog({
             : detail ?? "当前工作区已有任务正在运行或排队，继续后多个任务可能同时修改同一批文件。"}</p>
           <p className="compact-confirm-note">并发修改可能导致文件覆盖、补丁冲突或测试结果互相影响，请确认这些风险可以接受。</p>
           <div className="compact-confirm-actions">
-            <button type="button" autoFocus disabled={busy} onClick={onCancel}>取消</button>
-            <button className="primary-button" type="button" disabled={busy} onClick={onConfirm}>
+            <button type="button" disabled={busy} onClick={onCancel}>取消</button>
+            <button className="primary-button" type="button" autoFocus disabled={busy} onClick={onConfirm}>
               {busy ? "正在启动…" : "仍然继续"}
             </button>
           </div>

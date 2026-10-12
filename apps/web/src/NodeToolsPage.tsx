@@ -30,22 +30,62 @@ export default function NodeToolsPage({ nodeId, mode }: { nodeId: string; mode: 
       : !ready ? <section className="node-tools-route-message"><p role="status">正在连接节点…</p></section> : mode === 'terminal' ? <TerminalPage nodeId={nodeId} name={name} /> : <FilesPage nodeId={nodeId} name={name} />}
   </main>;
 }
+function clipboardFailureReason(reason: unknown): string {
+  if (!window.isSecureContext) return '当前页面不是安全环境，请使用 HTTPS 打开';
+  if (!navigator.clipboard?.writeText) return '当前页面无法访问剪贴板接口';
+  if (!document.hasFocus()) return '页面未处于前台，请切回终端后重新选择';
+  if (reason instanceof Error && reason.name === 'NotAllowedError') return '浏览器未允许写入剪贴板，请检查网站的剪贴板权限';
+  if (reason instanceof Error && reason.name === 'AbortError') return '复制操作被取消，请重新选择';
+  const detail = reason instanceof Error ? reason.message : typeof reason === 'string' ? reason : '';
+  return detail.trim().slice(0, 180) || '浏览器未提供具体错误原因';
+}
 function TerminalPage({ nodeId, name }: { nodeId: string; name: string }) {
   const container = useRef<HTMLDivElement>(null); const connection = useRef<WebSocket | null>(null);
   const terminalInstance = useRef<XtermTerminal | null>(null); const terminalEnded = useRef(false);
+  const fullscreenRequestId = useRef(0);
+  const keyboard = (navigator as Navigator & { keyboard?: { lock(keys: string[]): Promise<void>; unlock(): void } }).keyboard;
   const [status, setStatus] = useState('正在启动终端…'); const [user, setUser] = useState(''); const [cwd, setCwd] = useState(''); const [ended, setEnded] = useState(false);
   const [fullscreen, setFullscreen] = useState(false); const [screenError, setScreenError] = useState('');
+  const [copyNotice, setCopyNotice] = useState<{ success: boolean; message: string } | null>(null);
   useEffect(() => {
-    const changed = () => setFullscreen(document.fullscreenElement?.classList.contains('terminal-page') || false);
+    if (!copyNotice) return;
+    const timer = window.setTimeout(() => setCopyNotice(null), copyNotice.success ? 2000 : 6000);
+    return () => window.clearTimeout(timer);
+  }, [copyNotice]);
+  useEffect(() => {
+    const changed = () => {
+      const isFullscreen = document.fullscreenElement === container.current?.closest('.terminal-page');
+      setFullscreen(isFullscreen);
+      if (!isFullscreen) { fullscreenRequestId.current++; keyboard?.unlock(); }
+      if (!terminalEnded.current) terminalInstance.current?.focus();
+    };
     document.addEventListener('fullscreenchange', changed);
-    return () => document.removeEventListener('fullscreenchange', changed);
-  }, []);
+    return () => { fullscreenRequestId.current++; document.removeEventListener('fullscreenchange', changed); keyboard?.unlock(); };
+  }, [keyboard]);
   async function toggleFullscreen() {
+    const requestId = ++fullscreenRequestId.current;
     setScreenError('');
     try {
       if (document.fullscreenElement) await document.exitFullscreen();
-      else await container.current?.closest<HTMLElement>('.terminal-page')?.requestFullscreen();
-    } catch { setScreenError('无法进入全屏，请检查浏览器权限'); }
+      else {
+        const screen = container.current?.closest<HTMLElement>('.terminal-page');
+        if (!screen) return;
+        // Request the lock before fullscreen consumes the click's user activation.
+        const lock = !terminalEnded.current && keyboard
+          ? keyboard.lock(['Escape', 'KeyW']).then(() => true, () => false)
+          : Promise.resolve(false);
+        await screen.requestFullscreen();
+        const locked = await lock;
+        if (requestId !== fullscreenRequestId.current) return;
+        if (document.fullscreenElement !== screen || terminalEnded.current) keyboard?.unlock();
+        else if (!locked) setScreenError('键盘锁定失败，Esc 仍会退出全屏');
+      }
+    } catch {
+      if (requestId !== fullscreenRequestId.current) return;
+      keyboard?.unlock(); setScreenError('无法进入全屏，请检查浏览器权限');
+    } finally {
+      if (requestId === fullscreenRequestId.current && !terminalEnded.current) terminalInstance.current?.focus();
+    }
   }
   function closeTerminal() {
     if (connection.current?.readyState === WebSocket.OPEN) connection.current.send(JSON.stringify({ action: 'close' }));
@@ -53,6 +93,8 @@ function TerminalPage({ nodeId, name }: { nodeId: string; name: string }) {
   }
   function finishTerminal(reason: string | ((current: string) => string)) {
     terminalEnded.current = true; setEnded(true); setStatus(reason);
+    fullscreenRequestId.current++;
+    keyboard?.unlock();
     const terminal = terminalInstance.current;
     if (terminal) {
       terminal.options.disableStdin = true; terminal.options.cursorBlink = false; terminal.options.cursorInactiveStyle = 'none';
@@ -97,23 +139,45 @@ function TerminalPage({ nodeId, name }: { nodeId: string; name: string }) {
           send({ action: 'input', data: data.slice(index, end) }); index = end;
         }
       });
+      let copyRequestId = 0;
+      const selection = terminal.onSelectionChange(async () => {
+        const text = terminal.getSelection();
+        if (!text) return;
+        const requestId = ++copyRequestId;
+        let notice: { success: boolean; message: string };
+        try {
+          await navigator.clipboard.writeText(text);
+          notice = { success: true, message: '复制成功' };
+        } catch (reason) {
+          notice = { success: false, message: `复制失败：${clipboardFailureReason(reason)}。可使用右键菜单复制。` };
+        }
+        if (active && requestId === copyRequestId) setCopyNotice(notice);
+      });
       const resize = new ResizeObserver(() => { try { fit.fit(); if (opened && !terminalEnded.current) send({ action: 'resize', cols: terminal.cols, rows: terminal.rows }); } catch { /* disposed */ } });
       resize.observe(container.current);
-      const close = () => { send({ action: 'close' }); socket.close(); };
+      const close = () => { fullscreenRequestId.current++; keyboard?.unlock(); send({ action: 'close' }); socket.close(); };
+      const confirmLeaving = (event: BeforeUnloadEvent) => {
+        if (!opened || terminalEnded.current) return;
+        event.preventDefault(); event.returnValue = true;
+      };
+      window.addEventListener('beforeunload', confirmLeaving);
       window.addEventListener('pagehide', close);
-      dispose = () => { window.removeEventListener('pagehide', close); close(); resize.disconnect(); input.dispose(); terminal.dispose(); terminalInstance.current = null; connection.current = null; };
+      dispose = () => { window.removeEventListener('beforeunload', confirmLeaving); window.removeEventListener('pagehide', close); close(); resize.disconnect(); input.dispose(); selection.dispose(); terminal.dispose(); terminalInstance.current = null; connection.current = null; };
     }).catch((reason) => { if (active) finishTerminal(formatErrorMessage(reason, '加载终端')); });
     return () => { active = false; dispose?.(); };
-  }, [nodeId]);
+  }, [nodeId, keyboard]);
   return <><header className="node-terminal-toolbar">
     <div className="node-terminal-identity"><ToolIcon name="terminal" /><h1 title={name}>{name}</h1>{user && <span className="node-terminal-user" title="Agent 系统用户">{user}</span>}</div>
     <span role="status" title={status} data-state={ended ? 'ended' : status === '已连接' ? 'online' : 'connecting'} className={`node-tool-connection ${ended ? 'node-tool-ended' : ''}`}><i aria-hidden="true" />{status}</span>
     <div className="node-terminal-controls">
-      <details className="node-tool-info"><summary aria-label="终端信息" title="启动目录与使用说明"><ToolIcon name="info" /></summary><div className="node-tool-info-popover"><strong>终端信息</strong><dl><dt>系统用户</dt><dd>{user || '等待节点确认'}</dd><dt>启动目录</dt><dd>{cwd || '等待节点确认'}</dd></dl><p>关闭、刷新或断线后终端结束，无法接回；请先保存编辑内容。终端使用上述系统用户的正常 Shell 权限。</p></div></details>
+      <details className="node-tool-info"><summary aria-label="终端信息" title="启动目录与使用说明"><ToolIcon name="info" /></summary><div className="node-tool-info-popover"><strong>终端信息</strong><dl><dt>系统用户</dt><dd>{user || '等待节点确认'}</dd><dt>启动目录</dt><dd>{cwd || '等待节点确认'}</dd></dl><p>遇到快捷键与浏览器冲突时，请使用 Google Chrome（谷歌浏览器），并点击本页面的“全屏”按钮。全屏后，Ctrl+W、Esc 优先交给终端。</p><p>终端运行期间，关闭标签页、刷新或跳转会要求浏览器确认；选择取消后可继续使用终端。</p><p>关闭、刷新或断线后终端结束，无法接回；请先保存编辑内容。终端使用上述系统用户的正常 Shell 权限。</p></div></details>
       <button type="button" className="node-tool-button node-tool-button-ghost" aria-label={fullscreen ? '退出全屏' : '全屏'} onClick={() => void toggleFullscreen()}><ToolIcon name={fullscreen ? 'collapse' : 'expand'} /><span>{fullscreen ? '退出全屏' : '全屏'}</span></button>
       {ended ? <button type="button" className="node-tool-button" onClick={() => window.location.reload()}><ToolIcon name="terminal" />新开终端</button> : <button type="button" className="node-tool-button node-tool-button-ghost node-tool-button-danger" aria-label="关闭终端" onClick={closeTerminal}><ToolIcon name="close" /><span>关闭</span></button>}
     </div>
-  </header>{screenError && <p className="node-terminal-toast" role="alert">{screenError}</p>}
+  </header><div className="node-terminal-notifications">
+    {screenError && <p className="node-terminal-toast" role="alert">{screenError}</p>}
+    {copyNotice && <p className="node-terminal-toast node-terminal-copy-toast" role={copyNotice.success ? 'status' : 'alert'} data-state={copyNotice.success ? 'success' : 'error'}>{copyNotice.message}</p>}
+  </div>
     <div className={`node-terminal ${ended ? 'node-terminal-ended' : ''}`} aria-label={ended ? '终端输出（已结束，只读）' : '交互终端'} ref={container} />
     {ended && <div className="node-terminal-ended-notice">终端已结束 · 已显示的输出保留，可选中复制。点击“新开终端”开始新的 Shell。</div>}</>;
 }

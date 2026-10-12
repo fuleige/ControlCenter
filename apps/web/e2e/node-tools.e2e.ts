@@ -437,15 +437,24 @@ test('real PTY renders vim and tmux, and closing one tab leaves another usable',
   expect(terminalBounds!.height / page.viewportSize()!.height).toBeGreaterThan(0.9);
   await page.getByRole('button', { name: '全屏', exact: true }).click();
   await expect.poll(() => page.evaluate(() => document.fullscreenElement?.classList.contains('terminal-page'))).toBe(true);
-  await page.getByRole('button', { name: '退出全屏', exact: true }).click();
-  await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
-  await input.focus();
+  await expect(input).toBeFocused();
+  await expect(page.locator('.node-terminal-toast')).toHaveCount(0);
+  await page.keyboard.insertText("printf '%s\\n' FULLSCREEN_CTRL_W_OK UNEXPECTED_WORD");
+  await page.keyboard.press('Control+w'); await page.keyboard.press('Enter');
+  await expect.poll(() => harness.events.filter(event => event.action === 'terminal.output').map(event => event.data).join('')).toContain('FULLSCREEN_CTRL_W_OK\r\n');
+  expect(harness.events.filter(event => event.action === 'terminal.output').map(event => event.data).join('')).not.toContain('UNEXPECTED_WORD\r\n');
+  expect(page.isClosed()).toBe(false);
   await page.keyboard.insertText('vim -u NONE -n /tmp/cc-vim-smoke.txt'); await page.keyboard.press('Enter');
   await expect(page.locator('.xterm-rows')).toContainText('cc-vim-smoke.txt');
   await page.keyboard.press('i'); await page.keyboard.insertText('VIM_SCREEN_OK');
   await expect(page.locator('.xterm-rows')).toContainText('VIM_SCREEN_OK');
   await page.screenshot({ path: 'test-results/node-tools-vim.png' });
-  await page.keyboard.press('Escape'); await page.keyboard.insertText(':q!'); await page.keyboard.press('Enter');
+  await page.keyboard.press('Escape');
+  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement))).toBe(true);
+  await page.keyboard.insertText(':q!'); await page.keyboard.press('Enter');
+  await page.getByRole('button', { name: '退出全屏', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
+  await expect(input).toBeFocused();
   const socketName = `cc-test-${randomUUID()}`;
   try {
     await page.keyboard.insertText(`tmux -L ${socketName} new-session -s screen`); await page.keyboard.press('Enter');
@@ -467,6 +476,196 @@ test('real PTY renders vim and tmux, and closing one tab leaves another usable',
     await expect(second.locator('.xterm-rows')).toContainText('SECOND_TAB_OK');
     await second.close();
   } finally { try { execFileSync('tmux', ['-L', socketName, 'kill-server'], { stdio: 'ignore' }); } catch { /* test daemon already exited */ } }
+});
+test('关闭运行中终端需要确认且取消后保留连接', async ({ page }) => {
+  await page.goto(`${harness.origin}/nodes/node/terminal`);
+  await expect(page.getByRole('status')).toHaveText('已连接');
+  const input = page.locator('.xterm-helper-textarea');
+  await page.getByLabel('终端信息').click();
+  await expect(page.locator('.node-tool-info-popover')).toBeVisible();
+  await page.getByLabel('终端信息').click(); await input.focus();
+  expect(await page.evaluate(() => navigator.userActivation.hasBeenActive)).toBe(true);
+  const opened = harness.events.filter(event => event.action === 'terminal.opened').map(event => event.id);
+  const pending = page.waitForEvent('dialog');
+  await page.close({ runBeforeUnload: true });
+  const dialog = await pending; expect(dialog.type()).toBe('beforeunload'); await dialog.dismiss();
+  expect(page.isClosed()).toBe(false);
+  await expect(page.getByRole('status')).toHaveText('已连接');
+  await input.focus(); await page.keyboard.insertText('printf "CLOSE_CANCELLED_INPUT_OK\\n"'); await page.keyboard.press('Enter');
+  await expect.poll(() => harness.events.filter(event => event.action === 'terminal.output').map(event => event.data).join('')).toContain('CLOSE_CANCELLED_INPUT_OK\r\n');
+  expect(harness.events.filter(event => event.action === 'terminal.opened').map(event => event.id)).toEqual(opened);
+  const confirmed = page.waitForEvent('dialog'); const closed = page.waitForEvent('close');
+  await page.close({ runBeforeUnload: true });
+  const confirmation = await confirmed; expect(confirmation.type()).toBe('beforeunload'); await confirmation.accept();
+  await closed;
+});
+for (const mode of ['button', 'shell'] as const) {
+  test(`终端结束后关闭标签页不再确认（${mode}）`, async ({ page }) => {
+    await page.goto(`${harness.origin}/nodes/node/terminal`);
+    await expect(page.getByRole('status')).toHaveText('已连接');
+    const input = page.locator('.xterm-helper-textarea'); await page.locator('.node-terminal').click();
+    const dialogs: string[] = [];
+    page.on('dialog', dialog => { dialogs.push(dialog.type()); void dialog.dismiss(); });
+    if (mode === 'button') await page.getByRole('button', { name: '关闭终端', exact: true }).click();
+    else { await page.keyboard.insertText('exit'); await page.keyboard.press('Enter'); }
+    await expect(input).toHaveJSProperty('readOnly', true);
+    await page.close({ runBeforeUnload: true });
+    await expect.poll(() => page.isClosed()).toBe(true);
+    expect(dialogs).toEqual([]);
+  });
+}
+test('终端拖选结束自动复制且清空选区与只读输出保持可用', async ({ context, page }) => {
+  await page.addInitScript(() => {
+    const state = window as unknown as { terminalUnlocks: number; terminalClipboardWrites: string[] };
+    state.terminalUnlocks = 0; state.terminalClipboardWrites = [];
+    const keyboard = (navigator as Navigator & { keyboard: { unlock(): void } }).keyboard;
+    const unlock = keyboard.unlock.bind(keyboard);
+    keyboard.unlock = () => { state.terminalUnlocks++; unlock(); };
+    const write = navigator.clipboard.writeText.bind(navigator.clipboard);
+    navigator.clipboard.writeText = text => { state.terminalClipboardWrites.push(text); return write(text); };
+  });
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: harness.origin });
+  await page.goto(`${harness.origin}/nodes/node/terminal`);
+  await expect(page.getByRole('status')).toHaveText('已连接');
+  const input = page.locator('.xterm-helper-textarea');
+  const marker = 'TERMINAL_SELECTION_COPY_OK';
+  await page.keyboard.insertText(`printf '%s\\n' ${marker}`); await page.keyboard.press('Enter');
+  const text = page.locator('.xterm-rows').getByText(marker, { exact: true }).last();
+  await expect(text).toBeVisible();
+  await page.evaluate(() => navigator.clipboard.writeText('CLIPBOARD_SENTINEL'));
+  const bounds = (await text.boundingBox())!;
+  const terminalBounds = await page.locator('.node-terminal').boundingBox();
+  await page.mouse.move(bounds.x + 1, bounds.y + bounds.height / 2); await page.mouse.down();
+  await page.mouse.move(bounds.x + bounds.width - 1, bounds.y + bounds.height / 2, { steps: 8 });
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('CLIPBOARD_SENTINEL');
+  expect(await page.evaluate(() => (window as unknown as { terminalClipboardWrites: string[] }).terminalClipboardWrites)).toEqual(['CLIPBOARD_SENTINEL']);
+  await expect(page.locator('.node-terminal-copy-toast')).toHaveCount(0);
+  await page.mouse.up();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(marker);
+  expect(await page.evaluate(() => (window as unknown as { terminalClipboardWrites: string[] }).terminalClipboardWrites)).toEqual(['CLIPBOARD_SENTINEL', marker]);
+  const notice = page.locator('.node-terminal-copy-toast');
+  await expect(notice).toHaveText('复制成功');
+  await expect(notice).toHaveAttribute('data-state', 'success');
+  expect(await page.locator('.node-terminal').boundingBox()).toEqual(terminalBounds);
+  await expect(input).toBeFocused();
+  await expect(notice).toBeHidden({ timeout: 4000 });
+  await page.mouse.click(bounds.x + 1, bounds.y + bounds.height / 2);
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(marker);
+  await page.keyboard.insertText('printf "AFTER_AUTO_COPY_OK\\n"'); await page.keyboard.press('Enter');
+  await expect.poll(() => harness.events.filter(event => event.action === 'terminal.output').map(event => event.data).join('')).toContain('AFTER_AUTO_COPY_OK\r\n');
+  await page.getByRole('button', { name: '全屏', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement))).toBe(true);
+  const unlocks = await page.evaluate(() => (window as unknown as { terminalUnlocks: number }).terminalUnlocks);
+  await page.getByRole('button', { name: '关闭终端', exact: true }).click();
+  await expect(input).toHaveJSProperty('readOnly', true);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { terminalUnlocks: number }).terminalUnlocks)).toBeGreaterThan(unlocks);
+  await page.getByRole('button', { name: '退出全屏', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
+  await page.evaluate(() => navigator.clipboard.writeText('READONLY_SENTINEL'));
+  const readOnlyBounds = (await text.boundingBox())!;
+  await page.mouse.dblclick(readOnlyBounds.x + readOnlyBounds.width / 2, readOnlyBounds.y + readOnlyBounds.height / 2);
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(marker);
+  await expect(notice).toHaveText('复制成功');
+  await expect(page.locator('.node-tool-connection')).toHaveText('终端已关闭');
+});
+test('键盘锁定和自动复制失败不影响全屏与终端输入', async ({ page }) => {
+  await page.addInitScript(() => {
+    const keyboard = (navigator as Navigator & { keyboard: { lock(keys: string[]): Promise<void> } }).keyboard;
+    keyboard.lock = async () => { throw new DOMException('denied', 'NotAllowedError'); };
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: async () => { throw new DOMException('denied', 'NotAllowedError'); } } });
+  });
+  const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto(`${harness.origin}/nodes/node/terminal`);
+  await expect(page.getByRole('status')).toHaveText('已连接');
+  const input = page.locator('.xterm-helper-textarea');
+  await page.getByRole('button', { name: '全屏', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement))).toBe(true);
+  await expect(page.getByRole('alert')).toHaveText('键盘锁定失败，Esc 仍会退出全屏');
+  await expect(input).toBeFocused();
+  await page.keyboard.insertText('printf "COPY_DENIED_OK\\n"'); await page.keyboard.press('Enter');
+  const text = page.locator('.xterm-rows').getByText('COPY_DENIED_OK', { exact: true }).last();
+  await expect(text).toBeVisible();
+  const bounds = (await text.boundingBox())!;
+  await page.mouse.dblclick(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  await expect(page.locator('.node-terminal-copy-toast')).toContainText('复制失败：浏览器未允许写入剪贴板，请检查网站的剪贴板权限');
+  await expect(page.getByRole('alert').filter({ hasText: '键盘锁定失败' })).toBeVisible();
+  await expect(input).toBeFocused();
+  await page.keyboard.insertText('printf "INPUT_STILL_OK\\n"'); await page.keyboard.press('Enter');
+  await expect.poll(() => harness.events.filter(event => event.action === 'terminal.output').map(event => event.data).join('')).toContain('INPUT_STILL_OK\r\n');
+  await expect(page.getByRole('status')).toHaveText('已连接'); expect(errors).toEqual([]);
+});
+test('复制失败展示具体原因且后续成功可以替换错误提示', async ({ context, page }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: harness.origin });
+  await page.addInitScript(() => {
+    const write = navigator.clipboard.writeText.bind(navigator.clipboard);
+    let attempts = 0;
+    navigator.clipboard.writeText = async text => {
+      if (++attempts === 1) throw new Error('系统剪贴板暂时不可用');
+      await write(text);
+    };
+  });
+  await page.goto(`${harness.origin}/nodes/node/terminal`);
+  await expect(page.getByRole('status')).toHaveText('已连接');
+  const input = page.locator('.xterm-helper-textarea');
+  const notice = page.locator('.node-terminal-copy-toast');
+  for (const marker of ['FIRST_COPY_FAILED', 'SECOND_COPY_OK']) {
+    await page.keyboard.insertText(`printf '%s\\n' ${marker}`); await page.keyboard.press('Enter');
+    const text = page.locator('.xterm-rows').getByText(marker, { exact: true }).last(); await expect(text).toBeVisible();
+    const bounds = (await text.boundingBox())!;
+    await page.mouse.dblclick(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+    if (marker === 'FIRST_COPY_FAILED') {
+      await expect(notice).toContainText('复制失败：系统剪贴板暂时不可用');
+      await expect(notice).toHaveAttribute('data-state', 'error');
+    } else {
+      await expect(notice).toHaveText('复制成功');
+      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(marker);
+    }
+    await expect(input).toBeFocused();
+  }
+});
+test('旧键盘锁定请求迟到不会影响后来进入的全屏或工具栏焦点', async ({ page }) => {
+  await page.addInitScript(() => {
+    const keyboard = (navigator as Navigator & { keyboard: { lock(keys: string[]): Promise<void> } }).keyboard;
+    const lock = keyboard.lock.bind(keyboard);
+    const state = { calls: 0, locked: false, reject: null as (() => void) | null };
+    (window as unknown as { pendingKeyboardLock: typeof state }).pendingKeyboardLock = state;
+    keyboard.lock = keys => {
+      if (++state.calls === 1) return new Promise<void>((_resolve, reject) => {
+        state.reject = () => reject(new DOMException('cancelled old request', 'AbortError'));
+      });
+      return lock(keys).then(() => { state.locked = true; });
+    };
+  });
+  await page.goto(`${harness.origin}/nodes/node/terminal`);
+  await expect(page.getByRole('status')).toHaveText('已连接');
+  await page.getByRole('button', { name: '全屏', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement))).toBe(true);
+  await page.getByRole('button', { name: '退出全屏', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
+  await page.getByRole('button', { name: '全屏', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { pendingKeyboardLock: { locked: boolean } }).pendingKeyboardLock.locked)).toBe(true);
+  const info = page.getByLabel('终端信息'); await info.focus();
+  await page.evaluate(() => (window as unknown as { pendingKeyboardLock: { reject: () => void } }).pendingKeyboardLock.reject());
+  await expect(info).toBeFocused();
+  await expect(page.locator('.node-terminal-toast')).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement))).toBe(true);
+});
+test('全屏请求失败释放键盘锁定并恢复终端输入', async ({ page }) => {
+  await page.addInitScript(() => {
+    const state = { locked: false }; (window as unknown as { rejectedFullscreen: typeof state }).rejectedFullscreen = state;
+    Object.defineProperty(navigator, 'keyboard', { value: {
+      lock: async () => { state.locked = true; }, unlock: () => { state.locked = false; },
+    } });
+    HTMLElement.prototype.requestFullscreen = async () => { throw new DOMException('denied', 'NotAllowedError'); };
+  });
+  await page.goto(`${harness.origin}/nodes/node/terminal`);
+  await expect(page.getByRole('status')).toHaveText('已连接');
+  await page.getByRole('button', { name: '全屏', exact: true }).click();
+  await expect(page.getByRole('alert')).toHaveText('无法进入全屏，请检查浏览器权限');
+  expect(await page.evaluate(() => (window as unknown as { rejectedFullscreen: { locked: boolean } }).rejectedFullscreen.locked)).toBe(false);
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+  await page.keyboard.insertText('printf "FULLSCREEN_FAILURE_INPUT_OK\\n"'); await page.keyboard.press('Enter');
+  await expect.poll(() => harness.events.filter(event => event.action === 'terminal.output').map(event => event.data).join('')).toContain('FULLSCREEN_FAILURE_INPUT_OK\r\n');
 });
 test('file browser and transfers remain visible and scroll independently in a short window', async ({ page }) => {
   await page.setViewportSize({ width: 1100, height: 520 });
