@@ -9,6 +9,7 @@ import {
   normalizeMathMarkdown,
   isLocalWorkspaceHref,
   parseWorkspaceFileReference,
+  resolveWorkspaceFilePath,
   parseDelimitedPreview,
   previewLineNumberText,
 } from "./App";
@@ -156,6 +157,34 @@ describe("normalizeMathMarkdown", () => {
 });
 
 describe("conversation file links", () => {
+  it("resolves failed relative file targets from the workspace or parent directory", () => {
+    expect(resolveWorkspaceFilePath("missing.md", "/workspace/repo")).toBe("/workspace/repo/missing.md");
+    expect(resolveWorkspaceFilePath("../missing.md:18:7", "/workspace/repo/docs/")).toBe("/workspace/repo/missing.md");
+    expect(resolveWorkspaceFilePath("../../../../missing.md", "/workspace/repo")).toBe("/missing.md");
+    expect(resolveWorkspaceFilePath("missing.md", "/")).toBe("/missing.md");
+    expect(resolveWorkspaceFilePath("/other/report.md", "/workspace/repo")).toBe("/other/report.md");
+  });
+
+  it("decodes file references once and removes preview locations from the copied path", () => {
+    expect(resolveWorkspaceFilePath("file:///home/ubuntu/%E6%8A%A5%E5%91%8A%20v2.md#L18")).toBe("/home/ubuntu/报告 v2.md");
+    expect(resolveWorkspaceFilePath("reports/a%20b.md?download=1#section", "/repo")).toBe("/repo/reports/a b.md");
+    expect(resolveWorkspaceFilePath("a%2520b.md", "/repo")).toBe("/repo/a%20b.md");
+    expect(resolveWorkspaceFilePath("100%.md", "/repo")).toBe("/repo/100%.md");
+    expect(resolveWorkspaceFilePath("a%23b.md", "/repo")).toBe("/repo/a#b.md");
+    expect(resolveWorkspaceFilePath("", "/repo")).toBe("");
+  });
+
+  it("supports Windows drive paths and UNC directories independently of the browser OS", () => {
+    expect(resolveWorkspaceFilePath("../missing.md", "C:\\repo\\docs\\")).toBe("C:\\repo\\missing.md");
+    expect(resolveWorkspaceFilePath("missing.md", "C:\\")).toBe("C:\\missing.md");
+    expect(resolveWorkspaceFilePath("D:/reports/missing.md", "C:\\repo")).toBe("D:\\reports\\missing.md");
+    expect(resolveWorkspaceFilePath("/missing.md", "C:\\repo")).toBe("C:\\missing.md");
+    expect(resolveWorkspaceFilePath("file:///C:/reports/a%20b.md")).toBe("C:\\reports\\a b.md");
+    expect(resolveWorkspaceFilePath("../missing.md", "\\\\server\\share\\docs")).toBe("\\\\server\\share\\missing.md");
+    expect(resolveWorkspaceFilePath("../../missing.md", "\\\\server\\share\\docs")).toBe("\\\\server\\share\\missing.md");
+    expect(resolveWorkspaceFilePath("file://server/share/a%20b.md")).toBe("\\\\server\\share\\a b.md");
+  });
+
   it("only sends local and file paths to the Agent", () => {
     expect(isLocalWorkspaceHref("/home/ubuntu/documents/a.txt")).toBe(true);
     expect(isLocalWorkspaceHref("../reports/a.csv")).toBe(true);

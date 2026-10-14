@@ -525,7 +525,9 @@ describe("ControlDatabase", () => {
     expect(database.createConversationCompaction("conversation-compact", "compact-1", requestedAt)).toMatchObject({
       status: "queued",
       beforeContextTokens: 80_000,
+      errorDismissedAt: null,
     });
+    expect(database.dismissConversationCompactionError("conversation-compact", "compact-1", requestedAt)).toBe(false);
     database.markConversationCompactionDispatching("conversation-compact", "compact-1");
     expect(database.getConversation("conversation-compact")?.compaction?.status).toBe("dispatching");
     expect(database.updateConversationCompaction("node-compact", {
@@ -556,6 +558,7 @@ describe("ControlDatabase", () => {
       afterContextTokens: 24_000,
       error: null,
     });
+    expect(database.dismissConversationCompactionError("conversation-compact", "compact-1", requestedAt)).toBe(false);
 
     database.createConversationCompaction("conversation-compact", "compact-2", "2026-09-15T08:01:00.000Z");
     database.applyAgentError({
@@ -570,8 +573,37 @@ describe("ControlDatabase", () => {
       status: "failed",
       errorCode: "authentication_failed",
       error: expect.stringContaining("登录已失效"),
+      errorDismissedAt: null,
     });
+    const legacyFailure = { ...database.getConversation("conversation-compact")!.compaction! };
+    delete legacyFailure.errorDismissedAt;
+    database.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?")
+      .run(JSON.stringify(legacyFailure), "conversation-compact");
+    expect(database.getConversation("conversation-compact")?.compaction?.errorDismissedAt).toBeNull();
+
+    const dismissedAt = "2026-09-15T08:02:00.000Z";
+    expect(database.dismissConversationCompactionError("missing-conversation", "compact-2", dismissedAt)).toBe(false);
+    expect(database.dismissConversationCompactionError("conversation-compact", "compact-1", dismissedAt)).toBe(false);
+    expect(database.dismissConversationCompactionError("conversation-compact", "compact-2", dismissedAt)).toBe(true);
+    expect(database.getConversation("conversation-compact")?.compaction).toMatchObject({
+      ...legacyFailure,
+      errorDismissedAt: dismissedAt,
+    });
+    expect(database.updateConversationCompaction("node-compact", {
+      type: "conversation.compaction", compactionId: "compact-2", conversationId: "conversation-compact",
+      threadId: "thread-compact", status: "failed", error: "重复的失败通知", occurredAt: dismissedAt,
+    })).toBe(false);
     database.close();
+
+    const reopened = new ControlDatabase(path.join(directory, "test.db"), { recoverRuntimeState: false });
+    expect(reopened.getConversation("conversation-compact")?.compaction?.errorDismissedAt).toBe(dismissedAt);
+    expect(reopened.createConversationCompaction("conversation-compact", "compact-3", dismissedAt).errorDismissedAt).toBeNull();
+    reopened.failConversationCompaction("conversation-compact", "compact-3", "新的压缩失败", dismissedAt);
+    expect(reopened.dismissConversationCompactionError("conversation-compact", "compact-2", dismissedAt)).toBe(false);
+    expect(reopened.getConversation("conversation-compact")?.compaction).toMatchObject({
+      id: "compact-3", status: "failed", error: "新的压缩失败", errorDismissedAt: null,
+    });
+    reopened.close();
   });
 
   it("stores revocable admin sessions and consumes enrollment tokens exactly once", () => {

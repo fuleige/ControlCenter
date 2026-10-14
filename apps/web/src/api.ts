@@ -545,8 +545,14 @@ export async function markAllNotificationsRead(): Promise<ConversationAttentionU
   return (await api<ConversationAttentionUpdate | undefined>("/api/notifications/read-all", { method: "POST" })) ?? null;
 }
 
-export async function dismissRunError(runId: string): Promise<void> {
-  await api<void>(`/api/runs/${runId}/error/dismiss`, { method: "POST" });
+export async function dismissTaskError(errorId: string, compactionConversationId?: string): Promise<void> {
+  const path = compactionConversationId
+    ? `/api/conversations/${encodeURIComponent(compactionConversationId)}/compaction/error/dismiss`
+    : `/api/runs/${encodeURIComponent(errorId)}/error/dismiss`;
+  await api<void>(path, {
+    method: "POST",
+    ...(compactionConversationId ? { body: JSON.stringify({ compactionId: errorId }) } : {}),
+  });
 }
 
 export async function retryRun(runId: string, allowWorkspaceConcurrency = false): Promise<Run> {

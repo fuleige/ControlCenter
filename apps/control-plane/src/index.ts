@@ -1600,6 +1600,18 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/error/dismiss", async (reque
   return reply.code(204).send();
 });
 
+app.post<{ Params: { id: string }; Body: { compactionId?: string } }>("/api/conversations/:id/compaction/error/dismiss", async (request, reply) => {
+  const conversation = database.getConversation(request.params.id);
+  if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
+  const compactionId = request.body?.compactionId;
+  if (typeof compactionId !== "string" || !compactionId.trim()) return reply.code(400).send({ error: "缺少压缩任务 ID" });
+  if (!database.dismissConversationCompactionError(conversation.id, compactionId, now())) {
+    return reply.code(409).send({ error: "压缩任务已变化或没有可关闭的错误提示" });
+  }
+  publish("conversation.compaction", compactionId, conversation.id);
+  return reply.code(204).send();
+});
+
 app.post<{ Params: { id: string }; Body: { allowWorkspaceConcurrency?: boolean } }>("/api/runs/:id/retry", async (request, reply) => {
   const body = request.body ?? {};
   const sourceRun = database.getRun(request.params.id);

@@ -56,6 +56,7 @@ export interface ConversationCompaction {
   afterContextTokens: number | null;
   errorCode: RunErrorCode | null;
   error: string | null;
+  errorDismissedAt?: string | null;
   requestedAt: string;
   startedAt: string | null;
   finishedAt: string | null;

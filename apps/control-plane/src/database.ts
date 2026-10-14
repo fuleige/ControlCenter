@@ -318,6 +318,7 @@ function conversationCompaction(value: unknown): ConversationCompaction | null {
         : null,
       errorCode: typeof compaction.errorCode === "string" ? compaction.errorCode as RunErrorCode : null,
       error: typeof compaction.error === "string" ? compaction.error : null,
+      errorDismissedAt: typeof compaction.errorDismissedAt === "string" ? compaction.errorDismissedAt : null,
       requestedAt: compaction.requestedAt,
       startedAt: typeof compaction.startedAt === "string" ? compaction.startedAt : null,
       finishedAt: typeof compaction.finishedAt === "string" ? compaction.finishedAt : null,
@@ -1321,6 +1322,7 @@ export class ControlDatabase {
       afterContextTokens: null,
       errorCode: null,
       error: null,
+      errorDismissedAt: null,
       requestedAt,
       startedAt: null,
       finishedAt: null,
@@ -1379,6 +1381,15 @@ export class ControlDatabase {
     };
     return this.sqlite.prepare("UPDATE conversations SET compaction_json = ? WHERE id = ?")
       .run(JSON.stringify(next), conversationId).changes > 0;
+  }
+
+  dismissConversationCompactionError(conversationId: string, compactionId: string, now: string): boolean {
+    return this.sqlite.prepare(`
+      UPDATE conversations SET compaction_json = json_set(compaction_json, '$.errorDismissedAt', ?)
+      WHERE id = ? AND json_extract(compaction_json, '$.id') = ?
+        AND json_extract(compaction_json, '$.status') = 'failed'
+        AND COALESCE(json_extract(compaction_json, '$.error'), '') <> ''
+    `).run(now, conversationId, compactionId).changes > 0;
   }
 
   hasActiveConversationCompaction(conversationId: string): boolean {

@@ -152,6 +152,7 @@ async function mockControlCenter(page: Page, options: {
   const presenceReports: Array<{ conversationId?: string | null; visible?: boolean }> = [];
   const quickSearchRequests: string[] = [];
   const compactRequests: Array<{ clientRequestId?: string }> = [];
+  const compactionDismissRequests: Array<{ compactionId?: string }> = [];
   const workspaceFileRequests: Array<{ path?: string; baseFileId?: string; recordHistory?: boolean }> = [];
   let workspaceFileHistory: Array<{
     id: string;
@@ -380,18 +381,28 @@ async function mockControlCenter(page: Page, options: {
     } else if (url.pathname === `/api/conversations/${conversation.id}/compact`) {
       compactRequests.push(route.request().postDataJSON() as { clientRequestId?: string });
       compactionState = {
-        id: "qa-compaction",
+        id: `qa-compaction-${compactRequests.length}`,
         status: "running",
         beforeContextTokens: conversation.tokenUsage.contextTokens,
         afterContextTokens: null,
         errorCode: null,
         error: null,
+        errorDismissedAt: null,
         requestedAt: now,
         startedAt: now,
         finishedAt: null,
         recoveryDeadlineAt: null,
       };
       await route.fulfill({ status: 202, json: { compaction: compactionState, dispatched: true, deduplicated: false } });
+    } else if (url.pathname === `/api/conversations/${conversation.id}/compaction/error/dismiss`) {
+      const request = route.request().postDataJSON() as { compactionId?: string };
+      compactionDismissRequests.push(request);
+      if (!compactionState || compactionState.id !== request.compactionId || compactionState.status !== "failed") {
+        await route.fulfill({ status: 409, json: { error: "压缩任务已变化或没有可关闭的错误提示" } });
+      } else {
+        compactionState = { ...compactionState, errorDismissedAt: now };
+        await route.fulfill({ status: 204 });
+      }
     } else if (url.pathname === `/api/conversations/${conversation.id}`) {
       await route.fulfill({
         json: {
@@ -460,7 +471,13 @@ async function mockControlCenter(page: Page, options: {
       await route.fulfill({ status: 204 });
     }
   });
-  return { presenceReports, quickSearchRequests, compactRequests, workspaceFileRequests };
+  return {
+    presenceReports, quickSearchRequests, compactRequests, compactionDismissRequests, workspaceFileRequests,
+    failCompaction: (error: string) => {
+      if (!compactionState) throw new Error("No compaction request to fail");
+      compactionState = { ...compactionState, status: "failed", error, finishedAt: now };
+    },
+  };
 }
 
 async function mockUiStream(page: Page) {
@@ -792,7 +809,7 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   const preview = await popupPromise;
   await expect(preview).toHaveURL(/\/workspace-files\/opening\?/u);
   await expect(preview.getByRole("status")).toContainText("正在读取文件");
-  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
+  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown(?:[?#]|$)/u);
   await expect(preview.getByRole("heading", { name: "report.md" })).toBeVisible();
   await expect(preview.getByRole("heading", { name: "Agent 报告" })).toBeVisible();
   await expect(preview.getByRole("heading", { name: "本次处理" })).toHaveAttribute("id", "cc-md-本次处理");
@@ -849,7 +866,7 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   const reopenPromise = page.waitForEvent("popup");
   await filePanel.locator(".conversation-file-open").click();
   const reopenedPreview = await reopenPromise;
-  await expect(reopenedPreview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
+  await expect(reopenedPreview).toHaveURL(/\/workspace-files\/workspace-file-markdown(?:[?#]|$)/u);
   await reopenedPreview.close();
   expect(workspaceFileRequests.filter((request) => request.path === "/home/ubuntu/documents/report.md")).toHaveLength(2);
   await filePanel.getByRole("button", { name: "删除 report.md 的查看记录" }).click();
@@ -873,8 +890,8 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   const nestedPopupPromise = preview.waitForEvent("popup");
   await preview.getByRole("link", { name: "打开相对表格" }).click();
   const nestedPreview = await nestedPopupPromise;
-  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
-  await expect(nestedPreview).toHaveURL(/\/workspace-files\/workspace-file-tsv$/u);
+  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown(?:[?#]|$)/u);
+  await expect(nestedPreview).toHaveURL(/\/workspace-files\/workspace-file-tsv(?:[?#]|$)/u);
   await expect(nestedPreview.getByRole("cell", { name: "alpha" })).toBeVisible();
   await expect(nestedPreview.getByRole("cell", { name: "2" })).toBeVisible();
   await expect(nestedPreview.getByRole("rowheader", { name: "1" })).toBeVisible();
@@ -890,7 +907,7 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   const missingPreview = await missingPopupPromise;
   await expect(missingPreview.getByRole("heading", { name: "文件不存在" })).toBeVisible();
   await expect(missingPreview.getByRole("alert")).toContainText("missing.md");
-  await expect(missingPreview.locator(".workspace-file-failure-path")).toHaveText("missing.md");
+  await expect(missingPreview.locator(".workspace-file-failure-path code")).toHaveText("/home/ubuntu/documents/missing.md");
   await expect(preview.locator(".workspace-file-content")).toHaveClass(/workspace-file-content-document/u);
   await expect(preview.locator(".workspace-file-error")).toHaveCount(0);
   await missingPreview.close();
@@ -911,7 +928,7 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   await locationReference.click();
   const locatedPreview = await locatedPopupPromise;
   await expect.poll(() => workspaceFileRequests.at(-1)).toEqual({ path: "/home/ubuntu/documents/task.py" });
-  await expect(locatedPreview).toHaveURL(/\/workspace-files\/workspace-file-script\?line=2$/u);
+  await expect(locatedPreview).toHaveURL(/\/workspace-files\/workspace-file-script\?line=2#fullPath=/u);
   await expect(locatedPreview.locator(".workspace-file-location")).toContainText("第 2 行");
   await expect(locatedPreview.locator("#workspace-source-line-2")).toHaveText("2");
   await expect(locatedPreview.locator("#workspace-source-line-2")).toHaveCSS("animation-name", "workspace-source-target-flash");
@@ -921,7 +938,7 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   const scriptPopupPromise = page.waitForEvent("popup");
   await page.getByRole("link", { name: "打开脚本" }).click();
   const scriptPreview = await scriptPopupPromise;
-  await expect(scriptPreview).toHaveURL(/\/workspace-files\/workspace-file-script$/u);
+  await expect(scriptPreview).toHaveURL(/\/workspace-files\/workspace-file-script(?:[?#]|$)/u);
   await expect(scriptPreview.locator(".code-line-numbers")).toHaveText("1\n2\n3");
   const sourceLayout = await scriptPreview.locator(".workspace-file-content-source").evaluate((element) => {
     const bounds = element.getBoundingClientRect();
@@ -946,9 +963,9 @@ test("对话本地链接由当前 Agent 读取并在新标签页支持相对 TSV
   await filePanel.getByRole("button", { name: "折叠文件侧边栏" }).click();
   await page.evaluate(() => { window.open = () => null; });
   await page.getByRole("link", { name: "打开本地报告" }).click();
-  const chatError = page.locator(".composer-error");
+  const chatError = page.locator(".timeline .run-error");
   await expect(chatError).toContainText("浏览器阻止了文件预览标签页");
-  await chatError.getByRole("button", { name: "关闭对话错误提示" }).click();
+  await chatError.getByRole("button", { name: "关闭任务错误提示" }).click();
   await expect(chatError).toHaveCount(0);
 });
 
@@ -979,7 +996,7 @@ test("HTML 文件使用全屏隔离网页并加载本地样式脚本图片", asy
       viewportHeight: window.innerHeight,
     };
   });
-  expect(layout.headerHeight).toBeLessThanOrEqual(50);
+  expect(layout.headerHeight).toBeLessThanOrEqual(100);
   expect(layout.iframeWidth).toBe(layout.viewportWidth);
   expect(layout.iframeHeight).toBeGreaterThanOrEqual(layout.viewportHeight - layout.headerHeight - 1);
 
@@ -994,13 +1011,162 @@ test("HTML 文件使用全屏隔离网页并加载本地样式脚本图片", asy
   const popupPromise = page.waitForEvent("popup");
   await frame.getByRole("link", { name: "打开详情文档" }).click();
   const detailsPreview = await popupPromise;
-  await expect(detailsPreview).toHaveURL(/\/workspace-files\/workspace-file-details$/u);
+  await expect(detailsPreview).toHaveURL(/\/workspace-files\/workspace-file-details(?:[?#]|$)/u);
   await expect(detailsPreview.getByRole("heading", { name: "详情文档" })).toBeVisible();
   expect(workspaceFileRequests.findLast((request) => request.path === "details.md")).toEqual({
     path: "details.md",
     baseFileId: "workspace-file-html",
   });
   await detailsPreview.close();
+});
+
+async function mockPathClipboard(page: Page) {
+  await page.context().addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { value: { writeText: async (text: string) => {
+      (window as unknown as { pathClipboard: string }).pathClipboard = text;
+    } } });
+  });
+}
+
+async function expectCopiedPath(page: Page, path: string) {
+  await expect(page.locator(".workspace-file-path code")).toHaveText(path);
+  const copy = page.getByRole("button", { name: "复制完整路径" });
+  await copy.click();
+  await expect(copy).toHaveText("已复制");
+  expect(await page.evaluate(() => (window as unknown as { pathClipboard: string }).pathClipboard)).toBe(path);
+}
+
+test("文件路径在成功、内容读取失败和预览过期后仍可展示复制", async ({ page }) => {
+  await mockControlCenter(page);
+  await mockPathClipboard(page);
+  const path = "/home/ubuntu/documents/task.py";
+  await page.goto("/workspace-files/workspace-file-script?line=2");
+  await expect(page.locator("#workspace-source-line-2")).toHaveText("2");
+  await expectCopiedPath(page, path);
+  expect(new URLSearchParams(new URL(page.url()).hash.slice(1)).get("fullPath")).toBe(path);
+  expect(new URL(page.url()).searchParams.get("line")).toBe("2");
+  await page.evaluate(() => { window.location.hash = "document-section"; });
+
+  await page.route("**/api/workspace-files/workspace-file-script/content", (route) => route.fulfill({
+    status: 503, json: { error: "读取文件内容失败" },
+  }));
+  await page.reload();
+  await expect(page.getByRole("alert")).toContainText("读取文件内容失败");
+  await expectCopiedPath(page, path);
+
+  await page.route("**/api/workspace-files/workspace-file-script", (route) => route.fulfill({
+    status: 404, json: { error: "文件预览已经失效，请从对话中重新打开" },
+  }));
+  await page.reload();
+  await expect(page.getByRole("alert")).toContainText("文件预览已经失效");
+  await expectCopiedPath(page, path);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test("工作区和父文件的相对路径打开失败时显示完整目标路径", async ({ page }) => {
+  const { workspaceFileRequests } = await mockControlCenter(page, { idleConversation: true });
+  await mockPathClipboard(page);
+  await page.route(new RegExp(`/api/conversations/${conversation.id}(?:\\?.*)?$`, "u"), (route) => route.fulfill({ json: {
+    conversation: { ...conversation, latestRunStatus: "completed" },
+    runs: [], messages: [{ id: "relative-file-link", conversationId: conversation.id, runId: null,
+      role: "assistant", content: "[工作区缺失文件](missing.md)", revision: 1, complete: true,
+      attachmentIds: [], createdAt: now, updatedAt: now }],
+    messagePage: { hasMore: false, before: null }, attachments: [], approvals: [],
+  } }));
+  await page.goto("/");
+  const workspacePopup = page.waitForEvent("popup");
+  await page.getByRole("link", { name: "工作区缺失文件" }).click();
+  const workspaceFailure = await workspacePopup;
+  await expect(workspaceFailure.getByRole("heading", { name: "文件不存在" })).toBeVisible();
+  await expectCopiedPath(workspaceFailure, "/workspace/controller-center/missing.md");
+  expect(workspaceFileRequests.at(-1)).toEqual({ path: "missing.md" });
+  await workspaceFailure.close();
+
+  await page.goto("/workspace-files/workspace-file-markdown");
+  const nestedPopup = page.waitForEvent("popup");
+  await page.getByRole("link", { name: "打开不存在文件" }).click();
+  const nestedFailure = await nestedPopup;
+  await expect(nestedFailure.getByRole("heading", { name: "文件不存在" })).toBeVisible();
+  await expectCopiedPath(nestedFailure, "/home/ubuntu/documents/missing.md");
+  expect(workspaceFileRequests.findLast((request) => request.path === "missing.md")).toEqual({
+    path: "missing.md", baseFileId: "workspace-file-markdown",
+  });
+  await nestedFailure.close();
+});
+
+test("文件预览和失败页面完整展示长路径且复制保留特殊字符", async ({ page }, testInfo) => {
+  await mockControlCenter(page);
+  await mockPathClipboard(page);
+  const directory = `/workspace/${"完整目录 名称100%#文件路径/".repeat(8)}`;
+  const path = `${directory}interactive.html`;
+  await page.route("**/api/workspace-files/workspace-file-script", (route) => route.fulfill({ json: { file: {
+    id: "workspace-file-script", conversationId: conversation.id, name: "task.py", path: `${directory}task.py`,
+    mediaType: "text/x-python; charset=utf-8", size: 64, expiresAt: now,
+    contentUrl: "/api/workspace-files/workspace-file-script/content",
+  } } }));
+  await page.goto("/workspace-files/workspace-file-script");
+  await expect(page.locator(".code-line-numbers")).toHaveText("1\n2\n3");
+  await expectCopiedPath(page, `${directory}task.py`);
+  const metadataPath = page.locator(".workspace-file-path code");
+  expect(await metadataPath.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await metadataPath.evaluate((element) => element.scrollHeight <= element.clientHeight + 1)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: `/tmp/controller-center-file-path-meta-${testInfo.project.name}.png`, fullPage: true });
+  await page.route("**/api/workspace-files/workspace-file-html", (route) => route.fulfill({ json: { file: {
+    id: "workspace-file-html", conversationId: conversation.id, name: "interactive.html", path,
+    mediaType: "text/html; charset=utf-8", size: 256, expiresAt: now,
+    contentUrl: "/api/workspace-files/workspace-file-html/content",
+  } } }));
+  await page.route("**/api/workspace-files/workspace-file-html/content", (route) => route.fulfill({
+    contentType: "text/html; charset=utf-8", body: '<h1>长路径页面</h1><a href="missing.md#L18">打开缺失文档</a>',
+  }));
+  await page.goto("/workspace-files/workspace-file-html");
+  await expect(page.frameLocator(".workspace-file-html").getByRole("heading", { name: "长路径页面" })).toBeVisible();
+  await expectCopiedPath(page, path);
+  const code = page.locator(".workspace-file-path code");
+  expect(await code.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await code.evaluate((element) => element.scrollHeight <= element.clientHeight + 1)).toBe(true);
+  await expect(code).toHaveCSS("white-space", "pre-wrap");
+  const popup = page.waitForEvent("popup");
+  await page.frameLocator(".workspace-file-html").getByRole("link", { name: "打开缺失文档" }).click();
+  const failure = await popup;
+  await expect(failure.getByRole("heading", { name: "文件不存在" })).toBeVisible();
+  await expectCopiedPath(failure, `${directory}missing.md`);
+  const failurePath = failure.locator(".workspace-file-path code");
+  expect(await failurePath.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await failurePath.evaluate((element) => element.scrollHeight <= element.clientHeight + 1)).toBe(true);
+  expect(await failure.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: `/tmp/controller-center-file-path-html-${testInfo.project.name}.png`, fullPage: true });
+  await failure.screenshot({ path: `/tmp/controller-center-file-path-error-${testInfo.project.name}.png`, fullPage: true });
+  await failure.close();
+});
+
+test("路径复制复用浏览器降级方式并在复制失败时保留可选中的路径", async ({ page }, testInfo) => {
+  test.skip(!["desktop", "compact-mobile"].includes(testInfo.project.name), "在桌面和窄屏检查剪贴板降级");
+  await mockControlCenter(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { value: { writeText: async () => {
+      throw new DOMException("denied", "NotAllowedError");
+    } } });
+    document.execCommand = () => {
+      (window as unknown as { pathClipboard: string }).pathClipboard = document.querySelector("textarea")!.value;
+      return true;
+    };
+  });
+  await page.goto("/workspace-files/workspace-file-script");
+  await expectCopiedPath(page, "/home/ubuntu/documents/task.py");
+  await page.evaluate(() => { document.execCommand = () => false; });
+  const copy = page.getByRole("button", { name: "复制完整路径" });
+  await copy.click();
+  await expect(copy).toHaveText("复制失败");
+  await expect(copy).toHaveAttribute("title", "请选中路径手动复制");
+  await expect(page.locator(".workspace-file-path code")).toHaveText("/home/ubuntu/documents/task.py");
+  await expect(page.locator(".workspace-file-path code")).toHaveCSS("user-select", "text");
+  await expect(page.locator("textarea")).toHaveCount(0);
+  await page.evaluate(() => { document.execCommand = () => { throw new DOMException("denied", "NotAllowedError"); }; });
+  await copy.click();
+  await expect(copy).toHaveText("复制失败");
+  await expect(page.locator("textarea")).toHaveCount(0);
 });
 
 test("Markdown 行号引用保持渲染视图并定位对应内容块", async ({ page }, testInfo) => {
@@ -1049,7 +1215,7 @@ test("移动端顶部栏可以打开历史抽屉、新建会话和本会话文�
   const popupPromise = page.waitForEvent("popup");
   await page.getByRole("link", { name: "打开本地报告" }).click();
   const preview = await popupPromise;
-  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown$/u);
+  await expect(preview).toHaveURL(/\/workspace-files\/workspace-file-markdown(?:[?#]|$)/u);
   await preview.close();
 
   const filesButton = topbar.getByRole("button", { name: "打开本会话文件，1 个历史文件" });
@@ -1116,6 +1282,70 @@ test("手动压缩上下文需要确认并在执行期间锁定输入", async ({
   await expect(page.getByRole("button", { name: "正在压缩" })).toBeDisabled();
   await expect(page.locator(".composer textarea")).toBeDisabled();
   await expect(page.locator(".composer textarea")).toHaveAttribute("placeholder", "正在压缩上下文…");
+});
+
+test("压缩错误关闭后刷新和切换会话不重现，新一次失败仍可关闭", async ({ page }) => {
+  const emitUpdate = await mockUiStream(page);
+  const { compactRequests, compactionDismissRequests, failCompaction } = await mockControlCenter(page, { idleConversation: true });
+  await page.goto("/");
+  const errors = page.locator(".timeline .run-error");
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    await page.getByRole("button", { name: attempt === 1 ? "压缩" : "重试压缩", exact: true }).click();
+    await page.getByRole("dialog", { name: "压缩当前会话？" }).getByRole("button", { name: "确认压缩" }).click();
+    await expect(page.getByRole("button", { name: "正在压缩" })).toBeDisabled();
+    failCompaction("压缩服务暂时不可用");
+    await emitUpdate("conversation.compaction", `qa-compaction-${attempt}`);
+    await expect(errors).toContainText("压缩失败：压缩服务暂时不可用");
+    await errors.getByRole("button", { name: "关闭任务错误提示" }).click();
+    await expect(errors).toHaveCount(0);
+    expect(compactionDismissRequests[attempt - 1]).toEqual({ compactionId: `qa-compaction-${attempt}` });
+
+    await page.reload();
+    await expect(page.getByRole("button", { name: "重试压缩", exact: true })).toBeEnabled();
+    await expect(errors).toHaveCount(0);
+    if (attempt === 1) {
+      await openNewChat(page);
+      await expect(page.getByRole("heading", { name: "开始一个新会话" })).toBeVisible();
+      if (!await page.locator(".conversations-pane").isVisible()) {
+        await page.locator(".mobile-chat-topbar").getByRole("button", { name: "打开历史会话" }).click();
+      }
+      await page.locator(".conversation-card").click();
+      await expect(page.getByRole("button", { name: "重试压缩", exact: true })).toBeEnabled();
+      await expect(errors).toHaveCount(0);
+    }
+  }
+  expect(compactRequests).toHaveLength(2);
+  expect(compactionDismissRequests).toHaveLength(2);
+});
+
+test("保存压缩错误关闭状态失败时保留原提示并允许重试", async ({ page }) => {
+  const emitUpdate = await mockUiStream(page);
+  const { failCompaction, compactionDismissRequests } = await mockControlCenter(page, { idleConversation: true });
+  let rejected = false;
+  await page.route(`**/api/conversations/${conversation.id}/compaction/error/dismiss`, async (route) => {
+    if (!rejected) {
+      rejected = true;
+      await route.fulfill({ status: 503, json: { error: "保存关闭状态暂时失败" } });
+    } else {
+      await route.fallback();
+    }
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "压缩", exact: true }).click();
+  await page.getByRole("dialog", { name: "压缩当前会话？" }).getByRole("button", { name: "确认压缩" }).click();
+  await expect(page.getByRole("button", { name: "正在压缩" })).toBeDisabled();
+  failCompaction("压缩服务暂时不可用");
+  await emitUpdate("conversation.compaction", "qa-compaction-1");
+  const errors = page.locator(".timeline .run-error");
+  const compactError = errors.filter({ hasText: "压缩失败：" });
+  await compactError.getByRole("button", { name: "关闭任务错误提示" }).click();
+  await expect(errors.filter({ hasText: "保存关闭状态暂时失败" })).toBeVisible();
+  await expect(compactError).toBeVisible();
+  expect(compactionDismissRequests).toHaveLength(0);
+  await compactError.getByRole("button", { name: "关闭任务错误提示" }).click();
+  await expect(errors).toHaveCount(0);
+  expect(compactionDismissRequests).toEqual([{ compactionId: "qa-compaction-1" }]);
 });
 
 test("长对话可以滚动并正确渲染代码、公式和移动布局", async ({ page, context }, testInfo) => {
@@ -1777,7 +2007,7 @@ for (const idleConversation of [true, false]) {
     const sendButton = page.locator(".send-button");
     await composer.fill("失败后可以重试的消息");
     await sendButton.click();
-    await expect(page.locator(".composer-error")).toContainText("发送暂时失败");
+    await expect(page.locator(".timeline .run-error")).toContainText("发送暂时失败");
     await expect(composer).toHaveValue("失败后可以重试的消息");
     expect(await page.evaluate(() => localStorage.getItem("controller-center:composer:qa-node:qa-conversation"))).toBe("失败后可以重试的消息");
 

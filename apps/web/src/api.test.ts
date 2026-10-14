@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, dismissRunError, formatErrorMessage, isWorkspaceConcurrencyConflict, listNodes, openWorkspaceFile } from "./api";
+import { ApiError, dismissTaskError, formatErrorMessage, isWorkspaceConcurrencyConflict, listNodes, openWorkspaceFile } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -147,16 +147,29 @@ describe("workspace file API", () => {
   });
 });
 
-describe("run error API", () => {
+describe("task error API", () => {
   it("persists dismissal through the run error endpoint", async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await dismissRunError("run-restarted");
+    await dismissTaskError("run-restarted");
 
     expect(fetchMock).toHaveBeenCalledWith("/api/runs/run-restarted/error/dismiss", expect.objectContaining({
       method: "POST",
       credentials: "include",
+    }));
+  });
+
+  it("dismisses the specified compaction so a delayed request cannot close a newer failure", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await dismissTaskError("compaction-old", "conversation/1");
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/conversations/conversation%2F1/compaction/error/dismiss", expect.objectContaining({
+      method: "POST",
+      credentials: "include",
+      body: JSON.stringify({ compactionId: "compaction-old" }),
     }));
   });
 });

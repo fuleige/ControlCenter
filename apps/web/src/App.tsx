@@ -33,7 +33,7 @@ import {
   compactConversation,
   deleteConversation,
   deleteConversationOpenedFile,
-  dismissRunError,
+  dismissTaskError,
   createEnrollmentToken,
   createNodeWorkspace,
   deleteNodeWorkspace,
@@ -515,9 +515,11 @@ async function copyToClipboard(value: string): Promise<void> {
   input.style.opacity = "0";
   document.body.appendChild(input);
   input.select();
-  const copied = document.execCommand("copy");
-  input.remove();
-  if (!copied) throw new Error("浏览器不允许复制");
+  try {
+    if (!document.execCommand("copy")) throw new Error("浏览器不允许复制");
+  } finally {
+    input.remove();
+  }
 }
 
 export function previewLineNumberText(source: string): string {
@@ -1126,22 +1128,93 @@ function fencedSource(content: string, language: string): string {
   return `${fence}${language}\n${content}${content.endsWith("\n") ? "" : "\n"}${fence}`;
 }
 
-function workspaceFilePreviewPath(fileId: string, location?: Pick<WorkspaceFileReference, "line" | "column">): string {
+export function resolveWorkspaceFilePath(value: string, baseDirectory?: string): string {
+  let path = parseWorkspaceFileReference(value).path;
+  try {
+    if (/^file:/iu.test(path)) {
+      const url = new URL(path);
+      path = decodeURIComponent(url.pathname);
+      if (url.hostname && url.hostname !== "localhost") path = `\\\\${url.hostname}${path.replaceAll("/", "\\")}`;
+      else if (/^\/[a-z]:[\/]/iu.test(path)) path = path.slice(1);
+    } else {
+      path = path.split(/[?#]/u, 1)[0]!;
+      try { path = decodeURIComponent(path); } catch { /* Keep literal percent signs. */ }
+    }
+  } catch {
+    return path;
+  }
+  if (!path) return "";
+  const windows = /^(?:[a-z]:|\\\\)/iu.test(path) || /^(?:[a-z]:|\\\\)/iu.test(baseDirectory ?? "");
+  const separator = windows ? "\\" : "/";
+  const base = windows ? baseDirectory?.replaceAll("/", "\\") : baseDirectory;
+  if (windows) path = path.replaceAll("/", "\\");
+  const rootPattern = windows ? /^(?:[a-z]:\\|\\\\[^\\]+\\[^\\]+\\?)/iu : /^\//u;
+  if (windows && path.startsWith("\\") && !path.startsWith("\\\\") && base) {
+    const baseRoot = base.match(rootPattern)?.[0];
+    if (baseRoot) path = `${baseRoot.replace(/\\$/u, "")}${path}`;
+  }
+  const candidate = rootPattern.test(path) || !base ? path : `${base}${separator}${path}`;
+  const root = candidate.match(rootPattern)?.[0] ?? "";
+  const parts: string[] = [];
+  for (const part of candidate.slice(root.length).split(separator)) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length && parts.at(-1) !== "..") parts.pop();
+      else if (!root) parts.push(part);
+    } else parts.push(part);
+  }
+  const prefix = root && !root.endsWith(separator) ? `${root}${separator}` : root;
+  return `${prefix}${parts.join(separator)}` || ".";
+}
+
+function workspaceFileDirectory(path: string): string {
+  return path.slice(0, Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+}
+
+function WorkspaceFilePath({ path, className = "" }: { path: string; className?: string }) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  useEffect(() => {
+    setCopyState("idle");
+  }, [path]);
+  useEffect(() => {
+    if (copyState === "idle") return;
+    const timer = window.setTimeout(() => setCopyState("idle"), 1800);
+    return () => window.clearTimeout(timer);
+  }, [copyState]);
+  if (!path) return null;
+  return <div className={`workspace-file-path ${className}`}>
+    <code title={path}>{path}</code>
+    <button
+      className={`workspace-file-path-copy ${copyState}`}
+      type="button"
+      aria-label="复制完整路径"
+      title={copyState === "failed" ? "请选中路径手动复制" : "复制完整文件路径"}
+      onClick={() => void copyToClipboard(path).then(() => setCopyState("copied")).catch(() => setCopyState("failed"))}
+    >
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        {copyState === "copied" ? <path d="m4 10 4 4 8-8" /> : <><rect x="7" y="7" width="9" height="10" rx="2" /><path d="M12 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" /></>}
+      </svg>
+      <span aria-live="polite">{copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败" : "复制路径"}</span>
+    </button>
+  </div>;
+}
+
+function workspaceFilePreviewPath(file: WorkspaceFileDescriptor, location?: Pick<WorkspaceFileReference, "line" | "column">): string {
   const parameters = new URLSearchParams();
   if (location?.line) parameters.set("line", String(location.line));
   if (location?.column) parameters.set("column", String(location.column));
   const suffix = parameters.size ? `?${parameters}` : "";
-  return `/workspace-files/${encodeURIComponent(fileId)}${suffix}`;
+  return `/workspace-files/${encodeURIComponent(file.id)}${suffix}#${new URLSearchParams({ fullPath: file.path })}`;
 }
 
-function workspaceFileOpeningPath(conversationId: string, path: string, baseFileId?: string): string {
+function workspaceFileOpeningPath(conversationId: string, path: string, baseFileId?: string, baseDirectory?: string): string {
   const parameters = new URLSearchParams({ conversationId, path });
   if (baseFileId) parameters.set("baseFileId", baseFileId);
-  return `/workspace-files/opening?${parameters}`;
+  return `/workspace-files/opening?${parameters}#${new URLSearchParams({ fullPath: resolveWorkspaceFilePath(path, baseDirectory) })}`;
 }
 
-function openWorkspaceFileTab(conversationId: string, path: string, baseFileId?: string): boolean {
-  const openingUrl = new URL(workspaceFileOpeningPath(conversationId, path, baseFileId), window.location.origin).toString();
+function openWorkspaceFileTab(conversationId: string, path: string, baseFileId?: string, baseDirectory?: string): boolean {
+  const openingUrl = new URL(workspaceFileOpeningPath(conversationId, path, baseFileId, baseDirectory), window.location.origin).toString();
   const previewWindow = window.open(openingUrl, "_blank");
   if (!previewWindow) return false;
   previewWindow.opener = null;
@@ -1362,7 +1435,7 @@ async function prepareHtmlPreviewDocument(
     anchor.target = "_blank";
     anchor.rel = "noreferrer noopener";
     if (isLocalWorkspaceHref(href)) {
-      anchor.href = new URL(workspaceFileOpeningPath(file.conversationId, href, file.id), window.location.origin).toString();
+      anchor.href = new URL(workspaceFileOpeningPath(file.conversationId, href, file.id, workspaceFileDirectory(file.path)), window.location.origin).toString();
     }
   }
 
@@ -1386,13 +1459,14 @@ async function prepareHtmlPreviewDocument(
   return `<!doctype html>\n${document.documentElement.outerHTML}`;
 }
 
-function WorkspaceFileLoadingCard() {
+function WorkspaceFileLoadingCard({ path = "" }: { path?: string }) {
   return (
     <section className="workspace-file-loading-card" role="status" aria-live="polite">
       <div className="workspace-file-loader" aria-hidden="true"><span /></div>
       <span className="workspace-file-loading-label">AGENT 文件预览</span>
       <h1>正在读取文件</h1>
       <p>正在通过当前会话连接对应 Agent，并准备安全的只读预览。</p>
+      {path && <WorkspaceFilePath path={path} className="workspace-file-failure-path" />}
       <small>文件不会写入控制中心数据库</small>
     </section>
   );
@@ -1400,11 +1474,13 @@ function WorkspaceFileLoadingCard() {
 
 function WorkspaceFileOpeningPage() {
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
+  const fullPath = new URLSearchParams(window.location.hash.slice(1)).get("fullPath")
+    || resolveWorkspaceFilePath(parameters.get("path") ?? "");
   const openingStarted = useRef(false);
   const [failure, setFailure] = useState<WorkspaceFileOpenFailure | null>(() => parameters.get("state") === "error" ? {
     title: "文件读取失败",
     message: "未能读取目标文件。",
-    path: parameters.get("path")?.trim() ?? "",
+    path: fullPath,
     hint: "请确认 Agent 在线和文件路径正确后重试。",
   } : null);
 
@@ -1418,15 +1494,15 @@ function WorkspaceFileOpeningPage() {
       setFailure({
         title: "文件预览地址无效",
         message: "打开链接中缺少会话或文件路径信息。",
-        path: reference.path,
+        path: fullPath,
       });
       return;
     }
     openingStarted.current = true;
     void openWorkspaceFile(conversationId, reference.path, baseFileId)
-      .then((descriptor) => window.location.replace(workspaceFilePreviewPath(descriptor.id, reference)))
-      .catch((reason) => setFailure(describeWorkspaceFileOpenFailure(reason, reference.path)));
-  }, [failure, parameters]);
+      .then((descriptor) => window.location.replace(workspaceFilePreviewPath(descriptor, reference)))
+      .catch((reason) => setFailure(describeWorkspaceFileOpenFailure(reason, fullPath)));
+  }, [failure, fullPath, parameters]);
 
   return (
     <main className="workspace-file-transition-page">
@@ -1435,24 +1511,26 @@ function WorkspaceFileOpeningPage() {
         <span className="workspace-file-loading-label">AGENT 文件预览</span>
         <h1>{failure.title}</h1>
         <p>{failure.message}</p>
-        {failure.path && <code className="workspace-file-failure-path" title={failure.path}>{failure.path}</code>}
+        <WorkspaceFilePath path={failure.path} className="workspace-file-failure-path" />
         {failure.hint && <small className="workspace-file-failure-hint">{failure.hint}</small>}
         <button type="button" onClick={() => window.close()}>关闭标签页</button>
-      </section> : <WorkspaceFileLoadingCard />}
+      </section> : <WorkspaceFileLoadingCard path={fullPath} />}
     </main>
   );
 }
 
 function WorkspaceFilePage({ fileId }: { fileId: string }) {
+  const pathStorageKey = `controller-center:workspace-file-path:${fileId}`;
   const requestedLocation = useMemo(() => {
     const parameters = new URLSearchParams(window.location.search);
     const line = Number(parameters.get("line"));
     const column = Number(parameters.get("column"));
     return {
+      fullPath: new URLSearchParams(window.location.hash.slice(1)).get("fullPath") || sessionStoredValue(pathStorageKey) || "",
       line: Number.isSafeInteger(line) && line > 0 ? line : null,
       column: Number.isSafeInteger(column) && column > 0 ? column : null,
     };
-  }, []);
+  }, [pathStorageKey]);
   const [file, setFile] = useState<WorkspaceFileDescriptor | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [textContent, setTextContent] = useState<string | null>(null);
@@ -1483,15 +1561,25 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
     setError(null);
     void getWorkspaceFile(fileId)
       .then(async (descriptor) => {
+        if (!active) return;
+        setFile(descriptor);
+        sessionStoreValue(pathStorageKey, descriptor.path);
+        if (!window.location.hash || new URLSearchParams(window.location.hash.slice(1)).has("fullPath")) {
+          const url = new URL(window.location.href);
+          url.hash = new URLSearchParams({ fullPath: descriptor.path }).toString();
+          window.history.replaceState(window.history.state, "", url);
+        }
         const blob = await fetchWorkspaceFileContent(descriptor);
         if (!active) return;
         createdObjectUrl = URL.createObjectURL(blob);
         const mediaType = descriptor.mediaType.split(";", 1)[0]!.toLowerCase();
         const isText = mediaType.startsWith("text/")
           || ["application/json", "application/xml", "application/yaml", "application/toml"].includes(mediaType);
-        setFile(descriptor);
         setObjectUrl(createdObjectUrl);
-        if (isText) setTextContent(await blob.text());
+        if (isText) {
+          const content = await blob.text();
+          if (active) setTextContent(content);
+        }
       })
       .catch((reason) => {
         if (active) setError(formatErrorMessage(reason, "打开 Agent 文件"));
@@ -1500,12 +1588,13 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
       active = false;
       if (createdObjectUrl) URL.revokeObjectURL(createdObjectUrl);
     };
-  }, [fileId]);
+  }, [fileId, pathStorageKey]);
 
   const openNestedFile = useCallback((nestedPath: string, baseFileId?: string) => {
     if (!file) return;
-    if (!openWorkspaceFileTab(file.conversationId, nestedPath, baseFileId)) {
-      setLinkOpenError("浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试");
+    const baseDirectory = baseFileId ? workspaceFileDirectory(file.path) : undefined;
+    if (!openWorkspaceFileTab(file.conversationId, nestedPath, baseFileId, baseDirectory)) {
+      setLinkOpenError(`浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试。文件路径：${resolveWorkspaceFilePath(nestedPath, baseDirectory)}`);
       return;
     }
     setLinkOpenError(null);
@@ -1585,6 +1674,7 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
             : extension ? extension.slice(0, 4).toUpperCase()
               : "FILE";
   const fileSize = file ? `${(file.size / 1024).toFixed(file.size < 1024 ? 2 : 1)} KB` : "";
+  const displayedPath = file?.path || requestedLocation.fullPath;
 
   return (
     <main className="workspace-file-page">
@@ -1594,7 +1684,7 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
             <span aria-hidden="true">A</span>
             <div>
               <strong>{isHtml && file ? file.name : "AGENT"}</strong>
-              <small title={isHtml && file ? file.path : undefined}>{isHtml && file ? file.path : "文件预览"}</small>
+              <small>文件预览</small>
             </div>
           </div>
           <div className="workspace-file-actions">
@@ -1602,24 +1692,25 @@ function WorkspaceFilePage({ fileId }: { fileId: string }) {
             <a className="workspace-file-home" href="/">控制中心</a>
             <button type="button" onClick={() => window.close()} aria-label="关闭文件预览">×</button>
           </div>
+          {isHtml && <WorkspaceFilePath path={displayedPath} />}
         </header>
         <div className={`workspace-file-body ${isHtml ? "workspace-file-body-html" : ""}`}>
           <div className={`workspace-file-content workspace-file-content-${previewLayout}`}>
-            {file && !isHtml && <header className="workspace-file-meta">
+            {displayedPath && !isHtml && <header className="workspace-file-meta">
               <span className="workspace-file-type-badge" aria-hidden="true">{previewBadge}</span>
               <div className="workspace-file-meta-copy">
-                <h1 id="workspace-file-title">{file.name}</h1>
-                <code title={file.path}>{file.path}</code>
+                <h1 id="workspace-file-title">{file?.name || workspaceFileDisplayName(displayedPath)}</h1>
               </div>
-              <div className="workspace-file-facts" aria-label="文件信息">
+              {file && <div className="workspace-file-facts" aria-label="文件信息">
                 <span>{previewKind}</span>
                 <span>{fileSize}</span>
                 {requestedLocation.line && <span className="workspace-file-location">引用第 {requestedLocation.line} 行{requestedLocation.column ? ` · 第 ${requestedLocation.column} 列` : ""}</span>}
                 <span>只读</span>
-              </div>
+              </div>}
+              <WorkspaceFilePath path={displayedPath} />
             </header>}
             <div className="workspace-file-preview">
-              {!file && !error && <WorkspaceFileLoadingCard />}
+              {!objectUrl && !error && <WorkspaceFileLoadingCard />}
               {error && <div className="workspace-file-error" role="alert">{error}</div>}
               {htmlError && <div className="workspace-file-error" role="alert">{htmlError}</div>}
               {linkOpenError && <div className="workspace-file-link-error" role="alert">{linkOpenError}<button type="button" aria-label="关闭提示" onClick={() => setLinkOpenError(null)}>×</button></div>}
@@ -2903,6 +2994,7 @@ function openedFileTypeLabel(file: ConversationOpenedFile): string {
 
 function ConversationFileHistoryPanel({
   files,
+  baseDirectory,
   loading,
   error,
   deletingId,
@@ -2912,6 +3004,7 @@ function ConversationFileHistoryPanel({
   onDelete,
 }: {
   files: ConversationOpenedFile[];
+  baseDirectory?: string;
   loading: boolean;
   error: string | null;
   deletingId: string | null;
@@ -2985,7 +3078,7 @@ function ConversationFileHistoryPanel({
         <button type="submit" disabled={adding || !path.trim()}>{adding && <i aria-hidden="true" />}{adding ? "验证中" : "添加"}</button>
       </div>
       {addError
-        ? <p role="alert">{addError}</p>
+        ? <><p role="alert">{addError}</p>{path.trim() && isLocalWorkspaceHref(path) && <WorkspaceFilePath path={resolveWorkspaceFilePath(path, baseDirectory)} />}</>
         : <small>支持绝对路径；相对路径从当前会话工作空间解析</small>}
     </form>}
     {error && <div className="conversation-files-error" role="alert">{error}</div>}
@@ -3047,8 +3140,8 @@ function ChatPanel({
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [dismissedRunErrorIds, setDismissedRunErrorIds] = useState<Set<string>>(() => new Set());
-  const [dismissingRunErrorId, setDismissingRunErrorId] = useState<string | null>(null);
+  const [dismissedErrorIds, setDismissedErrorIds] = useState<Set<string>>(() => new Set());
+  const [dismissingErrorId, setDismissingErrorId] = useState<string | null>(null);
   const [workspaceId, setWorkspaceId] = useState("");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
@@ -3094,6 +3187,14 @@ function ChatPanel({
     ?? modelCatalog.find((candidate) => candidate.isDefault);
   const effortOptions = selectedModel?.supportedReasoningEfforts ?? [];
   const conversationId = detail?.conversation.id ?? null;
+  const taskErrors = [
+    ...(detail?.runs ?? []),
+    ...(compaction?.status === "failed" ? [{
+      ...compaction,
+      error: compaction.error ? `压缩失败：${compaction.error}` : null,
+      compactionConversationId: conversationId ?? undefined,
+    }] : []),
+  ].filter((task) => task.error && !task.errorDismissedAt && !dismissedErrorIds.has(task.id));
   const composerStorageKey = `controller-center:composer:${node?.id ?? "none"}:${detail?.conversation.id ?? "new"}`;
   const draftWorkspaceStorageKey = `controller-center:draft-workspace:${node?.id ?? "none"}`;
   const timelineVirtualizer = useVirtualizer({
@@ -3268,7 +3369,7 @@ function ChatPanel({
       if (settleTimer) window.clearTimeout(settleTimer);
       programmaticTimelineScroll.current = false;
     };
-  }, [timeline, activeRun?.status, currentApprovals.length, viewingHistoricalMessages]);
+  }, [timeline, activeRun?.status, currentApprovals.length, viewingHistoricalMessages, error]);
 
   useLayoutEffect(() => {
     const input = promptElement.current;
@@ -3297,8 +3398,8 @@ function ChatPanel({
 
   function openAgentFile(path: string, baseFileId?: string): void {
     if (!detail) return;
-    if (!openWorkspaceFileTab(detail.conversation.id, path, baseFileId)) {
-      setError("浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试");
+    if (!openWorkspaceFileTab(detail.conversation.id, path, baseFileId, workspace?.path)) {
+      setError(`浏览器阻止了文件预览标签页，请允许本站打开新窗口后重试。文件路径：${resolveWorkspaceFilePath(path, workspace?.path)}`);
     }
   }
 
@@ -3519,18 +3620,18 @@ function ChatPanel({
     }
   }
 
-  async function closeRunError(runId: string): Promise<void> {
-    if (dismissingRunErrorId) return;
-    setDismissingRunErrorId(runId);
+  async function closeTaskError(errorId: string, compactionConversationId?: string): Promise<void> {
+    if (dismissingErrorId) return;
+    setDismissingErrorId(errorId);
     setError(null);
     try {
-      await dismissRunError(runId);
-      setDismissedRunErrorIds((current) => new Set(current).add(runId));
+      await dismissTaskError(errorId, compactionConversationId);
+      setDismissedErrorIds((current) => new Set(current).add(errorId));
       onRefresh();
     } catch (reason) {
       setError(formatErrorMessage(reason, "关闭任务错误提示"));
     } finally {
-      setDismissingRunErrorId(null);
+      setDismissingErrorId(null);
     }
   }
 
@@ -3547,11 +3648,11 @@ function ChatPanel({
     setError(null);
     try {
       await compactConversation(detail.conversation.id, compactionRequestId);
-      setShowCompactConfirm(false);
       onRefresh();
     } catch (reason) {
       setError(formatErrorMessage(reason, "压缩上下文"));
     } finally {
+      setShowCompactConfirm(false);
       setCompactSubmitting(false);
     }
   }
@@ -3629,6 +3730,7 @@ function ChatPanel({
         <button className="conversation-files-backdrop" type="button" aria-label="折叠文件侧边栏" onClick={() => setFileHistoryOpen(false)} />
         <ConversationFileHistoryPanel
           files={openedFiles}
+          baseDirectory={workspace?.path}
           loading={fileHistoryLoading}
           error={fileHistoryError}
           deletingId={deletingFileId}
@@ -3687,16 +3789,23 @@ function ChatPanel({
             })}
           </div>}
           {currentApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onDone={onRefresh} />)}
-          {detail?.runs.filter((run) => run.error && !run.errorDismissedAt && !dismissedRunErrorIds.has(run.id)).map((run) => (
-            <div className="run-error" role="status" key={`error-${run.id}`}>
-              <span>{run.error}</span>
+          {[
+            ...taskErrors.map((task) => ({
+              id: task.id,
+              error: task.error,
+              onClose: () => void closeTaskError(task.id, "compactionConversationId" in task ? task.compactionConversationId : undefined),
+            })),
+            ...(error && !showCompactConfirm ? [{ id: "conversation-error", error, onClose: () => setError(null) }] : []),
+          ].map((notice) => (
+            <div className="run-error" role="status" key={`error-${notice.id}`}>
+              <span>{notice.error}</span>
               <button
                 className="error-notice-close"
                 type="button"
                 aria-label="关闭任务错误提示"
                 title="关闭"
-                disabled={dismissingRunErrorId !== null}
-                onClick={() => void closeRunError(run.id)}
+                disabled={dismissingErrorId !== null}
+                onClick={notice.onClose}
               >×</button>
             </div>
           ))}
@@ -3742,10 +3851,6 @@ function ChatPanel({
         )}
       </div>
       <form className="composer" onSubmit={submit} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
-        {error && !showCompactConfirm && <div className="composer-error" role="alert">
-          <span>{error}</span>
-          <button className="error-notice-close" type="button" aria-label="关闭对话错误提示" title="关闭" onClick={() => setError(null)}>×</button>
-        </div>}
         <ConversationUsageBar
           usage={conversation?.tokenUsage ?? null}
           draft={isDraft}
@@ -3754,9 +3859,6 @@ function ChatPanel({
           recommended={compactRecommended}
           onRequestCompact={requestCompaction}
         />
-        {compaction?.status === "failed" && compaction.error && (
-          <div className="compaction-error" role="status">压缩失败：{compaction.error}</div>
-        )}
         {uploads.length > 0 && <div className="upload-list">{uploads.map((upload) => <div className={`upload-item upload-${upload.status}`} key={upload.localId}>
           {upload.previewUrl ? <img src={upload.previewUrl} alt="" /> : <span className="upload-file-icon">DOC</span>}
           <span className="upload-copy"><strong>{upload.file.name || "粘贴的图片"}</strong><small>{upload.status === "ready" ? `${(upload.file.size / 1024).toFixed(0)} KB · 已就绪` : upload.status === "failed" ? upload.error : `上传中 ${Math.round(upload.progress / upload.file.size * 100)}%`}</small></span>
@@ -3857,7 +3959,6 @@ function ChatPanel({
                 <h2 id="compact-confirm-title">压缩当前会话？</h2>
                 <p>Codex 会概括当前有效上下文以释放空间。聊天记录仍会保留，但后续对话使用的是压缩后的摘要。</p>
                 <p className="compact-confirm-note">压缩会消耗一定 Token，完成后不能直接撤销。</p>
-                {error && <p className="compact-confirm-error" role="alert">{error}</p>}
                 <div className="compact-confirm-actions">
                   <button type="button" autoFocus disabled={compactSubmitting} onClick={() => setShowCompactConfirm(false)}>取消</button>
                   <button className="primary-button" type="button" disabled={compactSubmitting} onClick={() => void confirmCompaction()}>
