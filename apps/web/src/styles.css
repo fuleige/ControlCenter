@@ -1186,6 +1186,12 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 }
 .composer-toolbar > * { flex: 0 0 auto; }
 .composer-toolbar::-webkit-scrollbar { display: none; }
+.fast-mode-button { display: inline-flex; gap: 5px; align-items: center; justify-content: center; min-height: 32px; height: 32px; padding: 0 9px; border: 1px solid var(--border); border-radius: 8px; background: #fff; color: var(--muted); font-size: 10px; white-space: nowrap; cursor: pointer; }
+.fast-mode-button > span { font-size: 14px; line-height: 1; }
+.fast-mode-button[aria-pressed="true"] { border-color: #a6bff5; background: #edf4ff; color: var(--accent); }
+.fast-mode-button:disabled { cursor: default; opacity: .5; }
+.output-speed { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.output-speed strong { color: #64748b; font-weight: 500; }
 .send-button { flex: 0 0 auto; align-self: end; height: 40px; padding: 0 18px; border-color: var(--accent); background: var(--accent); color: #fff; font-size: 12px; font-weight: 750; box-shadow: 0 5px 12px rgb(37 99 235 / 18%); }
 .compact-confirm-backdrop {
   position: fixed;
@@ -2033,6 +2039,7 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
   .mobile-history-button { display: none; }
   .setting-field > span { display: none; }
   .setting-field select { min-width: 104px; min-height: 34px; height: 34px; }
+  .fast-mode-button { min-height: 34px; height: 34px; }
   .stop-button { min-height: 34px; white-space: nowrap; }
   .run-dock { padding-inline: 12px; }
   .run-dock:not(:empty) { padding-bottom: 8px; }

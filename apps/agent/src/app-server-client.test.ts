@@ -52,7 +52,7 @@ describe("Codex App Server token usage", () => {
         last: { totalTokens: 123_456, inputTokens: 120_000, outputTokens: 3_456 },
         modelContextWindow: 400_000,
       },
-    })).toEqual({ totalTokens: 456_789, contextTokens: 123_456, modelContextWindow: 400_000 });
+    })).toEqual({ totalTokens: 456_789, contextTokens: 123_456, modelContextWindow: 400_000, outputTokens: 56_789 });
   });
 
   it("rejects malformed token usage notifications without crashing the Agent", () => {

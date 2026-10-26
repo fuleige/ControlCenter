@@ -8,6 +8,7 @@ import type { WebSocket } from "ws";
 import {
   CONTROL_PROTOCOL_VERSION,
   WORKSPACE_FILE_READ_CAPABILITY,
+  FAST_MODE_CAPABILITY,
   isRecord,
   parseAgentMessage,
   type AgentDurableMessage,
@@ -18,6 +19,7 @@ import {
   type ReasoningEffort,
 } from "@controller-center/protocol";
 import { loadConfig } from "./config.js";
+import { fastModeError } from "./conversation-options.js";
 import { findAgentPackage, listAgentPackages } from "./agent-package.js";
 import { AGENT_PACKAGE_SHARED_PATH, agentPackageLogUrl, registerAgentPackageDownloadLinks } from './agent-package-download.js';
 import { NodeTools, NodeToolError } from "./node-tools.js";
@@ -344,6 +346,17 @@ function dispatch(command: CommandRecord): boolean {
     if (run.status === "queued" && !database.canDispatchQueuedRun(command.nodeId, command.command.conversationId)) {
       return false;
     }
+    if (run.status === "queued" && command.command.fastMode && connections.has(command.nodeId)) {
+      const error = selectedFastModeError(command.nodeId, command.command.model ?? null, true);
+      if (error) {
+        database.updateCommand(command.id, "failed", error, now());
+        database.failRun(run.id, error, now(), "invalid_request");
+        if (command.command.type === "conversation.start") database.failConversation(command.command.conversationId, error, now());
+        notifyRun(run.id, "failed", error, now());
+        publish("run.updated", run.id, run.conversationId);
+        return false;
+      }
+    }
   }
   if (command.command.type === "conversation.compact") {
     const conversation = database.getConversation(command.command.conversationId);
@@ -527,6 +540,11 @@ function selectedEffort(nodeId: string, modelId: string | null, requested?: Reas
   if (!candidate) return model?.defaultReasoningEffort ?? null;
   if (!model || model.supportedReasoningEfforts.length === 0 || model.supportedReasoningEfforts.some((entry) => entry.reasoningEffort === candidate)) return candidate;
   return model.defaultReasoningEffort ?? null;
+}
+
+function selectedFastModeError(nodeId: string, modelId: string | null, fastMode: unknown): string | null {
+  const node = database.listNodes().find((candidate) => candidate.id === nodeId);
+  return fastModeError(fastMode, connections.hasCapability(nodeId, FAST_MODE_CAPABILITY), node?.models ?? [], modelId);
 }
 
 function processDurableMessage(nodeId: string, message: AgentDurableMessage): void {
@@ -1364,6 +1382,7 @@ app.post<{
     prompt?: string;
     model?: string;
     effort?: ReasoningEffort;
+    fastMode?: boolean;
     clientRequestId?: string;
     attachmentIds?: string[];
     allowWorkspaceConcurrency?: boolean;
@@ -1383,6 +1402,7 @@ app.post<{
   if (body.effort && !reasoningEfforts.has(body.effort)) {
     return reply.code(400).send({ error: "所选思考强度不受支持" });
   }
+  if (body.fastMode !== undefined && typeof body.fastMode !== "boolean") return reply.code(400).send({ error: "Fast 模式必须为布尔值" });
   const existing = database.getConversationByClientRequestId(clientRequestId);
   if (existing) {
     const existingRun = database.listRuns(existing.id)[0] ?? null;
@@ -1411,6 +1431,9 @@ app.post<{
   const title = automaticConversationTitle(prompt);
   const model = selectedModel(nodeId, body.model);
   const effort = selectedEffort(nodeId, model, body.effort);
+  const fastMode = body.fastMode ?? false;
+  const fastError = selectedFastModeError(nodeId, model, fastMode);
+  if (fastError) return reply.code(409).send({ error: fastError });
   const conversationRecord = {
     id: conversationId,
     nodeId,
@@ -1418,6 +1441,7 @@ app.post<{
     title,
     model,
     effort,
+    fastMode,
     clientRequestId,
     remoteThreadId: null,
     status: "creating",
@@ -1435,6 +1459,7 @@ app.post<{
     prompt,
     model,
     effort,
+    fastMode,
     clientRequestId,
     remoteTurnId: null,
     status: "queued",
@@ -1458,6 +1483,7 @@ app.post<{
     prompt,
     ...(model ? { model } : {}),
     ...(effort ? { effort: effort as ReasoningEffort } : {}),
+    ...(connections.hasCapability(nodeId, FAST_MODE_CAPABILITY) ? { fastMode } : {}),
     ...(preparedAttachments.descriptors.length ? { attachments: preparedAttachments.descriptors } : {}),
   };
   database.transaction(() => {
@@ -1492,6 +1518,7 @@ app.post<{
     prompt?: string;
     model?: string;
     effort?: ReasoningEffort;
+    fastMode?: boolean;
     clientRequestId?: string;
     attachmentIds?: string[];
     allowWorkspaceConcurrency?: boolean;
@@ -1504,6 +1531,7 @@ app.post<{
   if (body.effort && !reasoningEfforts.has(body.effort)) {
     return reply.code(400).send({ error: "所选思考强度不受支持" });
   }
+  if (body.fastMode !== undefined && typeof body.fastMode !== "boolean") return reply.code(400).send({ error: "Fast 模式必须为布尔值" });
   const conversation = database.getConversation(request.params.id);
   if (!conversation) return reply.code(404).send({ error: "会话不存在或已被删除" });
   const existingRun = database.getRunByClientRequestId(clientRequestId);
@@ -1540,12 +1568,16 @@ app.post<{
   const runId = randomUUID();
   const model = body.model?.trim() || conversation.model;
   const effort = selectedEffort(conversation.nodeId, model, body.effort ?? conversation.effort as ReasoningEffort | null);
+  const fastMode = body.fastMode ?? conversation.fastMode ?? false;
+  const fastError = selectedFastModeError(conversation.nodeId, model, fastMode);
+  if (fastError) return reply.code(409).send({ error: fastError });
   const runRecord = {
     id: runId,
     conversationId: conversation.id,
     prompt,
     model,
     effort,
+    fastMode,
     clientRequestId,
     remoteTurnId: null,
     status: "queued",
@@ -1569,6 +1601,7 @@ app.post<{
     prompt,
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
+    ...(connections.hasCapability(conversation.nodeId, FAST_MODE_CAPABILITY) ? { fastMode } : {}),
     ...(preparedAttachments.descriptors.length ? { attachments: preparedAttachments.descriptors } : {}),
   };
   database.transaction(() => {
@@ -1582,7 +1615,7 @@ app.post<{
       createdAt,
     });
     if (preparedAttachments.ids.length) database.bindAttachments(preparedAttachments.ids, conversation.id);
-    database.updateConversationPreferences(conversation.id, model, effort, createdAt);
+    database.updateConversationPreferences(conversation.id, model, effort, createdAt, fastMode);
     database.createCommand(`run:${clientRequestId}`, conversation.nodeId, command, createdAt);
   });
   dispatchPending(conversation.nodeId);
@@ -1667,12 +1700,16 @@ app.post<{ Params: { id: string }; Body: { allowWorkspaceConcurrency?: boolean }
   }));
   const createdAt = now();
   const runId = randomUUID();
+  const fastMode = sourceRun.fastMode ?? false;
+  const fastError = selectedFastModeError(conversation.nodeId, sourceRun.model, fastMode);
+  if (fastError) return reply.code(409).send({ error: fastError });
   const runRecord = {
     id: runId,
     conversationId: conversation.id,
     prompt: sourceRun.prompt,
     model: sourceRun.model,
     effort: sourceRun.effort,
+    fastMode,
     clientRequestId,
     remoteTurnId: null,
     status: "queued",
@@ -1696,6 +1733,7 @@ app.post<{ Params: { id: string }; Body: { allowWorkspaceConcurrency?: boolean }
     prompt: sourceRun.prompt,
     ...(sourceRun.model ? { model: sourceRun.model } : {}),
     ...(sourceRun.effort ? { effort: sourceRun.effort as ReasoningEffort } : {}),
+    ...(connections.hasCapability(conversation.nodeId, FAST_MODE_CAPABILITY) ? { fastMode } : {}),
     ...(attachmentDescriptors.length ? { attachments: attachmentDescriptors } : {}),
   };
   database.transaction(() => {

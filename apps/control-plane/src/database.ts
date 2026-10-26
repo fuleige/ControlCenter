@@ -9,6 +9,7 @@ import type {
   ConversationTokenUsagePayload,
   InteractionRequestedPayload,
   MessageSnapshotPayload,
+  MessageOutputStats,
   ControlCommand,
   ModelDescriptor,
   NodeDescriptor,
@@ -40,6 +41,7 @@ export interface NodeRecord {
   connectedAt: string | null;
   workspaces: WorkspaceRecord[];
   models: ModelDescriptor[];
+  capabilities?: string[];
 }
 
 export interface WorkspaceRecord {
@@ -65,6 +67,7 @@ export interface ConversationRecord {
   title: string;
   model: string | null;
   effort: string | null;
+  fastMode?: boolean;
   clientRequestId: string | null;
   remoteThreadId: string | null;
   status: "creating" | "ready" | "error";
@@ -110,6 +113,7 @@ export interface RunRecord {
   prompt: string;
   model: string | null;
   effort: string | null;
+  fastMode?: boolean;
   clientRequestId: string | null;
   remoteTurnId: string | null;
   status: "queued" | "dispatching" | "running" | "waiting_approval" | "recovering" | "completed" | "failed" | "interrupted";
@@ -133,6 +137,7 @@ export interface MessageRecord {
   content: string;
   revision: number;
   complete: boolean;
+  outputStats?: MessageOutputStats;
   attachmentIds: string[];
   createdAt: string;
   updatedAt: string;
@@ -293,6 +298,17 @@ function conversationTokenUsage(value: unknown): ConversationTokenUsage | null {
   } catch {
     return null;
   }
+}
+
+function messageOutputStats(value: unknown): MessageOutputStats | null {
+  if (value === null || value === undefined) return null;
+  try {
+    const stats = parseJson(value) as MessageOutputStats;
+    if (!stats || !Number.isSafeInteger(stats.estimatedTokens) || stats.estimatedTokens < 0
+      || !Number.isSafeInteger(stats.elapsedMs) || stats.elapsedMs < 0
+      || ![stats.averageTokensPerSecond, stats.recentTokensPerSecond].every((rate) => rate === null || typeof rate === "number" && Number.isFinite(rate) && rate >= 0)) return null;
+    return stats;
+  } catch { return null; }
 }
 
 const compactionStatuses = new Set<ConversationCompaction["status"]>([
@@ -594,6 +610,7 @@ export class ControlDatabase {
     `);
     this.ensureColumn("nodes", "display_name", "TEXT");
     this.ensureColumn("nodes", "model_catalog_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("nodes", "capabilities_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("nodes", "permission_mode", "TEXT NOT NULL DEFAULT 'workspace-write'");
     this.ensureColumn("workspaces", "source", "TEXT NOT NULL DEFAULT 'config'");
     this.ensureColumn("workspaces", "is_default", "INTEGER NOT NULL DEFAULT 0");
@@ -604,6 +621,7 @@ export class ControlDatabase {
     this.ensureColumn("workspaces", "created_at", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("workspaces", "updated_at", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("conversations", "effort", "TEXT");
+    this.ensureColumn("conversations", "fast_mode", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("conversations", "client_request_id", "TEXT");
     this.ensureColumn("conversations", "pinned_at", "TEXT");
     this.ensureColumn("conversations", "token_usage_json", "TEXT");
@@ -612,6 +630,8 @@ export class ControlDatabase {
     this.ensureColumn("notifications", "manual_unread_at", "TEXT");
     this.migrateConversationNotifications();
     this.ensureColumn("runs", "client_request_id", "TEXT");
+    this.ensureColumn("runs", "fast_mode", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("messages", "output_stats_json", "TEXT");
     this.ensureColumn("runs", "progress_phase", "TEXT");
     this.ensureColumn("runs", "progress_label", "TEXT");
     this.ensureColumn("runs", "progress_updated_at", "TEXT");
@@ -737,8 +757,8 @@ export class ControlDatabase {
       this.sqlite.prepare(`
         INSERT INTO nodes (
           id, name, platform, arch, agent_version, codex_version,
-          permission_mode, max_concurrent_runs, active_runs, status, boot_id, last_seen_at, connected_at, model_catalog_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?)
+          permission_mode, max_concurrent_runs, active_runs, status, boot_id, last_seen_at, connected_at, model_catalog_json, capabilities_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           name = excluded.name,
           platform = excluded.platform,
@@ -752,6 +772,7 @@ export class ControlDatabase {
           last_seen_at = excluded.last_seen_at,
           connected_at = excluded.connected_at,
           model_catalog_json = excluded.model_catalog_json,
+          capabilities_json = excluded.capabilities_json,
           updated_at = excluded.updated_at
       `).run(
         node.id,
@@ -766,6 +787,7 @@ export class ControlDatabase {
         now,
         now,
         JSON.stringify(node.models ?? []),
+        JSON.stringify(Array.isArray(node.capabilities) ? node.capabilities.filter((capability) => typeof capability === "string") : []),
         now,
       );
       this.sqlite.prepare("UPDATE workspaces SET is_default = 0 WHERE node_id = ?").run(node.id);
@@ -944,6 +966,7 @@ export class ControlDatabase {
       lastSeenAt: text(row, "last_seen_at"),
       connectedAt: nullableText(row, "connected_at"),
       models: parseJson(row.model_catalog_json ?? "[]") as ModelDescriptor[],
+      capabilities: parseJson(row.capabilities_json ?? "[]") as string[],
       workspaces: (workspaceStatement.all(text(row, "id")) as Row[])
         .map((workspace) => this.workspaceFromRow(workspace, text(row, "status") !== "online")),
     }));
@@ -1059,9 +1082,9 @@ export class ControlDatabase {
   createConversation(record: Omit<ConversationRecord, "unread" | "unreadAt">): void {
     this.sqlite.prepare(`
       INSERT INTO conversations (
-        id, node_id, workspace_id, title, model, effort, client_request_id,
+        id, node_id, workspace_id, title, model, effort, fast_mode, client_request_id,
         remote_thread_id, status, error, compaction_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id,
       record.nodeId,
@@ -1069,6 +1092,7 @@ export class ControlDatabase {
       record.title,
       record.model,
       record.effort,
+      record.fastMode === true ? 1 : 0,
       record.clientRequestId,
       record.remoteThreadId,
       record.status,
@@ -1094,6 +1118,7 @@ export class ControlDatabase {
       title: text(row, "title"),
       model: nullableText(row, "model"),
       effort: nullableText(row, "effort"),
+      fastMode: Number(row.fast_mode) === 1,
       clientRequestId: nullableText(row, "client_request_id"),
       remoteThreadId: nullableText(row, "remote_thread_id"),
       status: text(row, "status") as ConversationRecord["status"],
@@ -1286,10 +1311,10 @@ export class ControlDatabase {
     ).run(threadId, now, id);
   }
 
-  updateConversationPreferences(id: string, model: string | null, effort: string | null, now: string): void {
+  updateConversationPreferences(id: string, model: string | null, effort: string | null, now: string, fastMode?: boolean): void {
     this.sqlite.prepare(
-      "UPDATE conversations SET model = ?, effort = ?, updated_at = ? WHERE id = ?",
-    ).run(model, effort, now, id);
+      "UPDATE conversations SET model = ?, effort = ?, updated_at = ?, fast_mode = COALESCE(?, fast_mode) WHERE id = ?",
+    ).run(model, effort, now, fastMode === undefined ? null : fastMode ? 1 : 0, id);
   }
 
   updateConversationTokenUsage(nodeId: string, payload: ConversationTokenUsagePayload): boolean {
@@ -1306,6 +1331,8 @@ export class ControlDatabase {
       contextTokens: payload.contextTokens,
       modelContextWindow: payload.modelContextWindow,
       updatedAt: payload.updatedAt,
+      ...(payload.outputTokens !== undefined ? { outputTokens: payload.outputTokens } : {}),
+      ...(payload.reasoningOutputTokens !== undefined ? { reasoningOutputTokens: payload.reasoningOutputTokens } : {}),
     } satisfies ConversationTokenUsage), payload.conversationId, nodeId).changes > 0;
   }
 
@@ -1486,16 +1513,17 @@ export class ControlDatabase {
   createRun(record: RunRecord): void {
     this.sqlite.prepare(`
       INSERT INTO runs (
-        id, conversation_id, prompt, model, effort, client_request_id, remote_turn_id, status,
+        id, conversation_id, prompt, model, effort, fast_mode, client_request_id, remote_turn_id, status,
         progress_phase, progress_label, progress_updated_at, recovery_deadline_at,
         error, error_code, error_dismissed_at, created_at, started_at, finished_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id,
       record.conversationId,
       record.prompt,
       record.model,
       record.effort,
+      record.fastMode === true ? 1 : 0,
       record.clientRequestId,
       record.remoteTurnId,
       record.status,
@@ -1527,6 +1555,7 @@ export class ControlDatabase {
       prompt: text(row, "prompt"),
       model: nullableText(row, "model"),
       effort: nullableText(row, "effort"),
+      fastMode: Number(row.fast_mode) === 1,
       clientRequestId: nullableText(row, "client_request_id"),
       remoteTurnId: nullableText(row, "remote_turn_id"),
       status: text(row, "status") as RunRecord["status"],
@@ -1714,12 +1743,13 @@ export class ControlDatabase {
     const result = this.sqlite.prepare(`
       INSERT INTO messages (
         id, conversation_id, run_id, role, content, revision, complete,
-        attachment_ids_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)
+        attachment_ids_json, output_stats_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         content = excluded.content,
         revision = excluded.revision,
         complete = excluded.complete,
+        output_stats_json = excluded.output_stats_json,
         updated_at = excluded.updated_at
       WHERE excluded.revision > messages.revision
     `).run(
@@ -1730,6 +1760,7 @@ export class ControlDatabase {
       payload.content,
       payload.revision,
       payload.complete ? 1 : 0,
+      payload.outputStats ? JSON.stringify(payload.outputStats) : null,
       payload.occurredAt,
       payload.occurredAt,
     );
@@ -1738,6 +1769,7 @@ export class ControlDatabase {
   }
 
   private messageFromRow(row: Row): MessageRecord {
+    const outputStats = messageOutputStats(row.output_stats_json);
     return {
       id: text(row, "id"),
       conversationId: text(row, "conversation_id"),
@@ -1746,6 +1778,7 @@ export class ControlDatabase {
       content: text(row, "content"),
       revision: Number(row.revision),
       complete: Number(row.complete) === 1,
+      ...(outputStats ? { outputStats } : {}),
       attachmentIds: parseJson(row.attachment_ids_json ?? "[]") as string[],
       createdAt: text(row, "created_at"),
       updatedAt: text(row, "updated_at"),

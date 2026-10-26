@@ -25,7 +25,7 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 
 - Web 使用随机管理员 Token 登录，服务端建立 HttpOnly 会话；管理员原始 Token 不进入前端构建、Local Storage 或 URL。
 - Web 可生成 10 分钟有效的节点注册 Token；有效期内可在列表查看、复制和确认注册状态，到期自动删除；Agent 首次注册后使用与固定节点 ID 绑定的独立长期凭证。
-- “设置 → 节点接入”按系统和架构展示已准备的 Agent 安装包，选择后可下载，并查看 Agent 版本、文件大小与 SHA-256；当前下载目录包含 v0.3.19 Linux x64/glibc 与 macOS ARM64 包，macOS 当前产物已获用户实机直连下载确认，不能跨系统使用。普通下载接口沿用管理员登录态，也支持复制一小时有效的安装包专用下载链接；验证范围见[节点工具验证记录](docs/node-tools-design.md#1015-macos-实机反馈与本轮提交检查)。
+- “设置 → 节点接入”按系统和架构展示已准备的 Agent 安装包，选择后可下载，并查看 Agent 版本、文件大小与 SHA-256；当前下载目录提供 v0.3.22 Linux x64/glibc 与 macOS ARM64 包，用户已于 2026-10-26 反馈两个平台实测未发现异常；安装包不能跨系统使用。普通下载接口沿用管理员登录态，也支持复制一小时有效的安装包专用下载链接；验证范围见[本轮实机反馈](docs/node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。
 - Agent 注册、心跳、断线检测和自动重连；迁移期间仍兼容旧共享 Token。
 - Agent 可在启动时显式传入 `--yolo`，以关闭 Codex 审批和沙箱；节点会把当前权限模式上报给中心，Web 在节点名称旁持续显示“全权限”。
 - Agent 统一读取 Linux/macOS CLI 常用的代理环境变量；可通过 `--codex-proxy-only` 让控制中心注册、控制通道和附件下载强制直连，同时只让 Codex 子进程继承系统代理。
@@ -37,6 +37,8 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 - 多节点、多对话；单个节点默认最多并行 5 个顶层任务。工作区已有任务时由用户确认是否仍要并发，确认后不再强制排队。
 - 新会话在首次发送时原子创建，使用持久化幂等号避免双击、刷新和重试产生重复会话。
 - Agent 通过 `model/list` 发布本机可用模型及思考强度，结果按 Codex 版本在本机缓存 24 小时，Web 可按会话选择。
+- 对话输入区支持独立的 Fast 开关，按会话保存，从下一轮生效；正在执行或压缩上下文时不可切换。启用取决于节点 Agent 的 `fast_mode_v1` 能力及 Codex 模型目录，额度消耗更高；关闭时显式恢复普通服务档位，重试保留原任务的选择。协议仍为 v5，旧 Agent 可继续使用，未支持的节点禁用 Fast。
+- 每条可见回复可展示近 3 秒的估算输出速度与完成后的平均速度（`≈ tok/s`），使用 Agent 的单调时钟记录首段至末段文字流，不计输入 Token、首次输出前的等待和其他消息之间的工具、审批耗时。实时采样按 25 毫秒合并，只使用最近 3 秒内至少跨越 250 毫秒的有效区间；暂停后样本不足时重新等待，不沿用暂停前的速率。首个分块的 Token 不计入速度分子；仅收到完整回复、旧历史或旧 Agent 没有计时数据时不补算。Token 数按文字估算，受网络分块影响，不代表计费用量或服务端纯生成速度；Codex 的实际累计输出与推理 Token 用量单独保留，可在会话总用量提示中查看。
 - 只持久化用户消息、Codex 回复和简洁进度；命令输出、Diff、推理增量和原始事件不会发送到中心。
 - 命令执行与文件修改的最小必要确认信息，以及 `request_user_input` 表单。
 - 任务追加指令、中止当前轮次和失败状态；中止后可在同一历史会话继续发起新轮次。
@@ -173,7 +175,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可选择并下载匹配系统/CPU 架构/libc 的客户端安装包；该包已经包含编译结果、生产依赖和 PTY 原生模块，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.19-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.22-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -293,7 +295,7 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 
 选择在线节点后，可通过“新开终端”和“节点文件”打开独立标签页。终端为真实 PTY，可正常使用 Vim/tmux 等已安装程序；每次新开，关闭或断线后结束，不提供历史恢复。文件管理提供目录浏览、批量上传/下载，单文件最大 1 GiB，整批同名覆盖一次确认。
 
-2026-10-08 已实现 WebRTC 直连上传/下载、开页检测和独立的传输方式选择，并更新生产 Web 与 Control Plane；节点 Agent 独立升级。Agent v0.3.17 起声明 `node_files_direct_v1`，旧 Agent 继续中转。可用时默认直连，已选直连任务失败后须用户确认才创建中转新任务并从头传输。直连下载在网页流式保存；初始选择中转仍交给 Chrome 原生下载。STUN 默认候选为 `stun:stun.cloudflare.com:3478`、`stun:global.stun.twilio.com:3478`、`stun:stun.l.google.com:19302`；可通过 `NODE_FILES_STUN_URLS` 覆盖，显式留空关闭 STUN。文件页显示可展开的诊断详情，失败时展开，并向浏览器控制台输出地址错误和连接阶段；单个 STUN 错误不直接判定整个直连不可用。当前客户端为 v0.3.19，保留 v0.3.18 的发送排队修复，支持 Node 24 及以上运行，并提供获用户实机直连下载确认的 macOS ARM64 包。测试直连需升级对应 Agent 并验证两端实际网络。完整生命周期、验证边界与生产发布记录见 [节点工具设计](docs/node-tools-design.md)。
+2026-10-08 已实现 WebRTC 直连上传/下载、开页检测和独立的传输方式选择，并更新生产 Web 与 Control Plane；节点 Agent 独立升级。Agent v0.3.17 起声明 `node_files_direct_v1`，旧 Agent 继续中转。可用时默认直连，已选直连任务失败后须用户确认才创建中转新任务并从头传输。直连下载在网页流式保存；初始选择中转仍交给 Chrome 原生下载。STUN 默认候选为 `stun:stun.cloudflare.com:3478`、`stun:global.stun.twilio.com:3478`、`stun:stun.l.google.com:19302`；可通过 `NODE_FILES_STUN_URLS` 覆盖，显式留空关闭 STUN。文件页显示可展开的诊断详情，失败时展开，并向浏览器控制台输出地址错误和连接阶段；单个 STUN 错误不直接判定整个直连不可用。当前客户端为 v0.3.22，新增会话 Fast 档位和估算输出速度，修正密集分块与暂停恢复的速度采样，保留发送排队修复及 Node 24 及以上运行支持；用户已于 2026-10-26 反馈当前 Linux 与 macOS 包实测未发现异常；测试直连仍以两端实际设备和网络结果为准。完整生命周期、验证边界与生产发布记录见 [节点工具设计](docs/node-tools-design.md)。
 
 已实现的终端与中转文件工具需要对应 Web、Control Plane 以及 Agent v0.3.14 或更新版本；缺少工具 capability 的旧 Agent 继续支持原有聊天，工具入口显示升级提示。后续仅缺少直连能力的 Agent 保留中转入口。
 

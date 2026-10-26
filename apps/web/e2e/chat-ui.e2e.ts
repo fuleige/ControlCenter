@@ -148,6 +148,8 @@ async function mockControlCenter(page: Page, options: {
   paginatedHistory?: boolean;
   unopenedNode?: boolean;
   historyCollapsed?: boolean;
+  fastSupported?: boolean;
+  outputStats?: { estimatedTokens: number; elapsedMs: number; averageTokensPerSecond: number | null; recentTokensPerSecond: number | null };
 } = {}) {
   const presenceReports: Array<{ conversationId?: string | null; visible?: boolean }> = [];
   const quickSearchRequests: string[] = [];
@@ -194,7 +196,10 @@ async function mockControlCenter(page: Page, options: {
     } else if (url.pathname === "/api/stream") {
       await route.fulfill({ status: 200, contentType: "text/event-stream", body: "event: ready\ndata: {}\n\n" });
     } else if (url.pathname === "/api/nodes") {
-      await route.fulfill({ json: { data: [node] } });
+      await route.fulfill({ json: { data: [options.fastSupported ? { ...node, capabilities: ["fast_mode_v1"], models: [
+        { ...node.models[0], supportsFastMode: true },
+        { ...node.models[0], id: "standard-only", displayName: "Standard only", isDefault: false, supportsFastMode: false },
+      ] } : node] } });
     } else if (url.pathname === `/api/nodes/${node.id}/workspaces`) {
       await route.fulfill({ json: { data: node.workspaces } });
     } else if (url.pathname === "/api/conversations") {
@@ -427,6 +432,7 @@ async function mockControlCenter(page: Page, options: {
             runId: run.id,
             role: "assistant",
             content: markdown,
+            ...(options.outputStats ? { outputStats: options.outputStats } : {}),
             revision: 4,
             complete: false,
             attachmentIds: [],
@@ -1908,6 +1914,77 @@ async function openNewChat(page: Page): Promise<void> {
   else await page.locator(".mobile-chat-topbar").getByRole("button", { name: "新建会话" }).click();
 }
 
+test("Fast 模式保存选择并明确下发开启和关闭，切换不支持的模型会关闭", async ({ page }) => {
+  await mockControlCenter(page, { idleConversation: true, fastSupported: true });
+  const submissions: Array<{ fastMode?: boolean; model?: string }> = [];
+  await page.route(`**/api/conversations/${conversation.id}/runs`, async (route) => {
+    submissions.push(route.request().postDataJSON());
+    await route.fulfill({ json: { run: { ...run, status: "completed", finishedAt: now } } });
+  });
+  await page.goto("/");
+  const fast = page.getByRole("button", { name: "Fast 模式", exact: true });
+  await expect(fast).toBeEnabled();
+  await fast.click();
+  await expect(fast).toHaveAttribute("aria-pressed", "true");
+  await expect(fast).not.toHaveAttribute("title");
+  await expect(page.locator(".fast-mode-note")).toHaveCount(0);
+  await page.reload();
+  await expect(fast).toHaveAttribute("aria-pressed", "true");
+  const composer = page.locator(".composer textarea");
+  await composer.fill("使用 Fast 发送");
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await expect.poll(() => submissions.map((input) => input.fastMode)).toEqual([true]);
+  await expect(composer).toHaveValue("");
+  await fast.click();
+  await composer.fill("关闭 Fast 发送");
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await expect.poll(() => submissions.map((input) => input.fastMode)).toEqual([true, false]);
+  await expect(composer).toHaveValue("");
+  await fast.click();
+  await page.getByRole("combobox", { name: "选择模型" }).selectOption("standard-only");
+  await expect(fast).toHaveAttribute("aria-pressed", "false");
+  await expect(fast).toBeDisabled();
+  await page.getByRole("combobox", { name: "选择模型" }).selectOption("");
+  await expect(fast).toBeEnabled();
+  await fast.click();
+  await composer.fill("使用本机默认模型的 Fast");
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await expect.poll(() => submissions[2]).toMatchObject({ fastMode: true, model: "gpt-6-astra" });
+});
+
+test("旧节点禁用 Fast 且历史回复不显示虚构的速度", async ({ page }) => {
+  await mockControlCenter(page, { idleConversation: true });
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Fast 模式", exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Token 输出速度", { exact: true })).toHaveCount(0);
+});
+
+test("活动任务锁定 Fast 且输出暂停时不显示过期速度", async ({ page }) => {
+  await mockControlCenter(page, { fastSupported: true, outputStats: {
+    estimatedTokens: 640, elapsedMs: 10_000, averageTokensPerSecond: 62.5, recentTokensPerSecond: 80,
+  } });
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Fast 模式", exact: true })).toBeDisabled();
+  const speed = page.getByLabel("Token 输出速度", { exact: true });
+  await expect(speed).toContainText("≈ 80 tok/s");
+  await expect(speed).toContainText("输出暂停");
+  await expect(speed).not.toContainText("tok/s");
+});
+
+test("完成的回复显示并保留节点计算的平均输出速度", async ({ page }) => {
+  await mockControlCenter(page, { idleConversation: true, outputStats: {
+    estimatedTokens: 640, elapsedMs: 10_000, averageTokensPerSecond: 62.5, recentTokensPerSecond: 80,
+  } });
+  await page.goto("/");
+  const speed = page.getByLabel("Token 输出速度", { exact: true });
+  await expect(speed).toContainText("平均");
+  await expect(speed).toContainText("≈ 62.5 tok/s");
+  await expect(speed).toHaveAttribute("title", /估算/);
+  await page.reload();
+  await expect(speed).toContainText("≈ 62.5 tok/s");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
 test("首条消息发送成功后新建会话不会恢复已发送的草稿", async ({ page }) => {
   const submissions: Array<{ prompt: string }> = [];
   await mockControlCenter(page, { unopenedNode: true });
@@ -2268,17 +2345,17 @@ test("安装包要求明确选择系统且 macOS 下载不会回退到 Linux", a
   expect(requestedTargets).toEqual([linux.target, macOS.target]);
 });
 
-test('安装包可复制跨设备下载链接和 wget 命令并展示 macOS 下载验证结果', async ({ page }) => {
+test('安装包可复制跨设备下载链接和 wget 命令并展示 macOS 实机反馈', async ({ page }) => {
   await mockControlCenter(page);
   await page.addInitScript(() => {
     Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (text: string) => {
       (window as unknown as { packageClipboard: string }).packageClipboard = text;
     } } });
   });
-  const linux = { available: true, version: '0.3.19', target: 'linux-x64-glibc', size: 100,
-    fileName: 'controller-center-agent-v0.3.19-linux-x64-glibc.tar.gz', sha256: 'test', builtAt: now };
-  const mac = { ...linux, target: 'darwin-arm64', fileName: 'controller-center-agent-v0.3.19-darwin-arm64.tar.gz',
-    sha256: 'd4a9981ea1ab7c0fd391ed0570e1b33f058d541018727ed41469f5628620d852' };
+  const linux = { available: true, version: '0.3.22', target: 'linux-x64-glibc', size: 100,
+    fileName: 'controller-center-agent-v0.3.22-linux-x64-glibc.tar.gz', sha256: 'test', builtAt: now };
+  const mac = { ...linux, target: 'darwin-arm64', fileName: 'controller-center-agent-v0.3.22-darwin-arm64.tar.gz',
+    sha256: '3988ed0d267a4e47cd7c77eb5557a8dffcd5c0e79d73e6fe2e427d66baad22ed' };
   const requestedTargets: string[] = []; let downloads = 0;
   let downloadUrl = '';
   await page.route('**/api/agent-package**', async route => {
@@ -2297,7 +2374,7 @@ test('安装包可复制跨设备下载链接和 wget 命令并展示 macOS 下�
   const copy = page.getByRole('button', { name: '复制下载链接', exact: true });
   await expect(copy).toBeDisabled();
   await page.getByRole('combobox', { name: 'Agent 安装目标' }).selectOption(mac.target);
-  await expect(page.getByText('macOS 直连下载已实机验证', { exact: true })).toBeVisible();
+  await expect(page.getByText('macOS 已实机测试', { exact: true })).toBeVisible();
   await expect(page.getByText('macOS 待实机验证', { exact: true })).toHaveCount(0);
   const layout = await page.locator('.enrollment-settings').evaluate(section => {
     const packageCard = section.querySelector('.agent-package-card')!.getBoundingClientRect();
@@ -2322,7 +2399,7 @@ test('安装包可复制跨设备下载链接和 wget 命令并展示 macOS 下�
   await page.screenshot({ path: `/tmp/controller-center-package-links-${page.viewportSize()!.width}.png`, fullPage: true });
   await page.getByRole('combobox', { name: 'Agent 安装目标' }).selectOption(linux.target);
   await expect(page.getByRole('textbox', { name: '客户端临时下载链接' })).toHaveCount(0);
-  await expect(page.getByText('macOS 直连下载已实机验证', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('macOS 已实机测试', { exact: true })).toHaveCount(0);
 });
 
 test('安装包复制权限被拒时保留手动链接且生成失败显示原因', async ({ page }) => {

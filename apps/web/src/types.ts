@@ -20,6 +20,7 @@ export interface ModelDescriptor {
   id: string;
   displayName: string;
   isDefault: boolean;
+  supportsFastMode?: boolean;
   defaultReasoningEffort?: ReasoningEffort;
   supportedReasoningEfforts: Array<{
     reasoningEffort: ReasoningEffort;
@@ -43,6 +44,7 @@ export interface NodeRecord {
   lastSeenAt: string;
   workspaces: Workspace[];
   models: ModelDescriptor[];
+  capabilities?: string[];
 }
 
 export interface ConversationAttentionUpdate {
@@ -63,6 +65,7 @@ export interface Conversation {
   title: string;
   model: string | null;
   effort: ReasoningEffort | null;
+  fastMode?: boolean;
   clientRequestId: string | null;
   remoteThreadId: string | null;
   status: "creating" | "ready" | "error";
@@ -134,6 +137,15 @@ export interface ConversationTokenUsage {
   contextTokens: number;
   modelContextWindow: number | null;
   updatedAt: string;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
+}
+
+export interface MessageOutputStats {
+  estimatedTokens: number;
+  elapsedMs: number;
+  averageTokensPerSecond: number | null;
+  recentTokensPerSecond: number | null;
 }
 
 export interface Run {
@@ -142,6 +154,7 @@ export interface Run {
   prompt: string;
   model: string | null;
   effort: ReasoningEffort | null;
+  fastMode?: boolean;
   clientRequestId: string | null;
   remoteTurnId: string | null;
   status: "queued" | "dispatching" | "running" | "waiting_approval" | "recovering" | "completed" | "failed" | "interrupted";
@@ -165,6 +178,7 @@ export interface Message {
   content: string;
   revision: number;
   complete: boolean;
+  outputStats?: MessageOutputStats;
   attachmentIds: string[];
   createdAt: string;
   updatedAt: string;

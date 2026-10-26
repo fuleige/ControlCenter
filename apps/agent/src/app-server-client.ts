@@ -137,6 +137,8 @@ export interface ThreadTokenUsageSummary {
   totalTokens: number;
   contextTokens: number;
   modelContextWindow: number | null;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
 }
 
 function nonNegativeInteger(value: unknown): number | null {
@@ -160,6 +162,8 @@ export function parseThreadTokenUsage(params: unknown): ThreadTokenUsageSummary 
     totalTokens,
     contextTokens,
     modelContextWindow: modelContextWindow && modelContextWindow > 0 ? modelContextWindow : null,
+    ...(nonNegativeInteger(total.outputTokens) !== null ? { outputTokens: Number(total.outputTokens) } : {}),
+    ...(nonNegativeInteger(total.reasoningOutputTokens) !== null ? { reasoningOutputTokens: Number(total.reasoningOutputTokens) } : {}),
   };
 }
 

@@ -2,6 +2,7 @@ export * from './node-tools.js';
 import type { AgentNodeToolMessage, ControlNodeToolMessage } from './node-tools.js';
 export const CONTROL_PROTOCOL_VERSION = 5 as const;
 export const WORKSPACE_FILE_READ_CAPABILITY = "workspace_file_read_v1" as const;
+export const FAST_MODE_CAPABILITY = "fast_mode_v1" as const;
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -74,6 +75,8 @@ export interface ModelDescriptor {
   isDefault: boolean;
   defaultReasoningEffort?: ReasoningEffort;
   supportedReasoningEfforts: ModelReasoningEffort[];
+  supportsFastMode?: boolean;
+  fastServiceTier?: "fast" | "priority";
 }
 
 export interface NodeDescriptor {
@@ -190,7 +193,16 @@ export interface MessageSnapshotPayload {
   revision: number;
   content: string;
   complete: boolean;
+  outputStats?: MessageOutputStats;
   occurredAt: string;
+}
+
+/** Visible text only; token counts are estimates, timed on the node. */
+export interface MessageOutputStats {
+  estimatedTokens: number;
+  elapsedMs: number;
+  averageTokensPerSecond: number | null;
+  recentTokensPerSecond: number | null;
 }
 
 export interface ConversationTokenUsage {
@@ -200,6 +212,8 @@ export interface ConversationTokenUsage {
   contextTokens: number;
   /** Effective model context-window size reported by Codex, when available. */
   modelContextWindow: number | null;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
   updatedAt: string;
 }
 
@@ -328,6 +342,7 @@ export interface StartConversationCommand {
   prompt: string;
   model?: string;
   effort?: ReasoningEffort;
+  fastMode?: boolean;
   attachments?: AttachmentDescriptor[];
 }
 
@@ -346,6 +361,7 @@ export interface StartRunCommand {
   prompt: string;
   model?: string;
   effort?: ReasoningEffort;
+  fastMode?: boolean;
   attachments?: AttachmentDescriptor[];
 }
 

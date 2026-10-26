@@ -1,6 +1,6 @@
 {
   "name": "@controller-center/agent",
-  "version": "0.3.19",
+  "version": "0.3.22",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",

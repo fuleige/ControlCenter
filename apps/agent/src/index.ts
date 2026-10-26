@@ -10,6 +10,7 @@ import {
   NODE_FILES_CAPABILITY,
   NODE_FILES_DIRECT_CAPABILITY,
   WORKSPACE_FILE_READ_CAPABILITY,
+  FAST_MODE_CAPABILITY,
   isRecord,
   parseControlMessage,
   toJsonValue,
@@ -44,6 +45,8 @@ import { formatErrorChain, hasProxyEnvironment, OutboundNetwork } from "./outbou
 import { AgentStateStore } from "./state-store.js";
 import { readWorkspaceFile } from "./workspace-files.js";
 import { agentPackageVersion, requireAgentPackageRuntime } from "./package-runtime.js";
+import { MODEL_CACHE_SCHEMA_VERSION, parseCachedModelCatalog, parseModelCatalog, turnServiceTier } from "./model-catalog.js";
+import { OutputSpeedTracker } from "./output-speed.js";
 
 requireAgentPackageRuntime();
 
@@ -78,6 +81,7 @@ interface BufferedAssistantMessage {
   revision: number;
   timer: NodeJS.Timeout | null;
   complete: boolean;
+  outputSpeed?: OutputSpeedTracker;
 }
 
 interface PendingApproval {
@@ -214,50 +218,16 @@ function nestedString(value: unknown, objectKey: string, key: string): string | 
   return stringField(value[objectKey], key);
 }
 
-const reasoningEffortValues = new Set<ReasoningEffort>(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
-
-function parseModelCatalog(result: ModelListResult): ModelDescriptor[] {
-  if (!Array.isArray(result.data)) return [];
-  return result.data.flatMap((entry) => {
-    if (!isRecord(entry)) return [];
-    const id = typeof entry.id === "string" ? entry.id : typeof entry.model === "string" ? entry.model : "";
-    if (!id) return [];
-    const supportedReasoningEfforts = Array.isArray(entry.supportedReasoningEfforts)
-      ? entry.supportedReasoningEfforts.flatMap((option) => {
-          if (!isRecord(option) || typeof option.reasoningEffort !== "string" || !reasoningEffortValues.has(option.reasoningEffort as ReasoningEffort)) return [];
-          return [{
-            reasoningEffort: option.reasoningEffort as ReasoningEffort,
-            ...(typeof option.description === "string" ? { description: option.description } : {}),
-          }];
-        })
-      : [];
-    const defaultReasoningEffort = typeof entry.defaultReasoningEffort === "string"
-      && reasoningEffortValues.has(entry.defaultReasoningEffort as ReasoningEffort)
-      ? entry.defaultReasoningEffort as ReasoningEffort
-      : undefined;
-    return [{
-      id,
-      displayName: typeof entry.displayName === "string" ? entry.displayName : id,
-      isDefault: entry.isDefault === true,
-      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
-      supportedReasoningEfforts,
-    }];
-  });
-}
-
 const MODEL_CACHE_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 function readModelCache(): { models: ModelDescriptor[]; fresh: boolean } | null {
   const cachePath = path.join(config.dataDirectory, "model-cache.json");
   if (!existsSync(cachePath)) return null;
   try {
-    const cached = JSON.parse(readFileSync(cachePath, "utf8")) as { codexVersion?: unknown; fetchedAt?: unknown; models?: unknown };
-    if (cached.codexVersion !== codexVersion()
-      || typeof cached.fetchedAt !== "string"
-      || !Array.isArray(cached.models)) return null;
-    const models = parseModelCatalog({ data: cached.models });
+    const cached = parseCachedModelCatalog(JSON.parse(readFileSync(cachePath, "utf8")), codexVersion());
+    if (!cached) return null;
     return {
-      models,
+      models: cached.models,
       fresh: Number.isFinite(Date.parse(cached.fetchedAt))
         && Date.parse(cached.fetchedAt) >= Date.now() - MODEL_CACHE_LIFETIME_MS,
     };
@@ -268,6 +238,7 @@ function readModelCache(): { models: ModelDescriptor[]; fresh: boolean } | null 
 
 function writeModelCache(models: ModelDescriptor[]): void {
   writeFileSync(path.join(config.dataDirectory, "model-cache.json"), `${JSON.stringify({
+    schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
     codexVersion: codexVersion(),
     fetchedAt: timestamp(),
     models,
@@ -319,6 +290,7 @@ function flushAssistantMessage(message: BufferedAssistantMessage, complete = mes
     revision: message.revision,
     content: message.content,
     complete,
+    ...(message.outputSpeed ? { outputStats: message.outputSpeed.snapshot() } : {}),
     occurredAt: timestamp(),
   });
   if (complete) assistantMessages.delete(`${message.runId}:${message.itemId}`);
@@ -341,6 +313,8 @@ function appendAssistantDelta(run: ActiveRun, itemId: string, delta: string): vo
     assistantMessages.set(key, message);
   }
   message.content += delta;
+  message.outputSpeed ??= new OutputSpeedTracker();
+  message.outputSpeed.append(delta);
   if (Buffer.byteLength(message.content) >= (message.revision + 1) * 2048) {
     flushAssistantMessage(message, false);
   } else if (!message.timer) {
@@ -365,7 +339,11 @@ function completeAssistantMessage(run: ActiveRun, item: Record<string, unknown>)
     };
     assistantMessages.set(key, message);
   }
-  if (typeof item.text === "string") message.content = item.text;
+  if (typeof item.text === "string" && item.text !== message.content) {
+    // Reconstructed/completed text has no trustworthy streaming timing.
+    delete message.outputSpeed;
+    message.content = item.text;
+  }
   flushAssistantMessage(message, true);
 }
 
@@ -403,7 +381,7 @@ function handleNotification(notification: AppServerNotification): void {
     const usage = parseThreadTokenUsage(notification.params);
     if (usage) {
       tokenUsageByThread.set(context.threadId, usage);
-      const signature = `${usage.totalTokens}:${usage.contextTokens}:${usage.modelContextWindow ?? "unknown"}`;
+      const signature = JSON.stringify(usage);
       if (tokenUsageSignatureByThread.get(context.threadId) !== signature) {
         tokenUsageSignatureByThread.set(context.threadId, signature);
         emitDurable({
@@ -849,6 +827,7 @@ async function startTurnForConversation(input: {
   prompt: string;
   model?: string;
   effort?: ReasoningEffort;
+  fastMode?: boolean;
   attachments?: AttachmentDescriptor[];
   workspace?: WorkspaceDescriptor;
   reservationHeld?: boolean;
@@ -876,6 +855,8 @@ async function startTurnForConversation(input: {
       sandboxPolicy: turnSandboxPolicy(config.yolo, workspace.path, config.networkAccess),
       ...(input.model ? { model: input.model } : {}),
       ...(input.effort ? { effort: input.effort } : {}),
+      ...turnServiceTier(input.fastMode, input.model ? availableModels.find((model) => model.id === input.model)
+        : availableModels.find((model) => model.isDefault)),
     });
     const turnId = result.turn?.id;
     if (!turnId) throw new Error("turn/start did not return a turn id");
@@ -958,6 +939,7 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
           reservationHeld: true,
           ...(command.model ? { model: command.model } : {}),
           ...(command.effort ? { effort: command.effort } : {}),
+          ...(command.fastMode !== undefined ? { fastMode: command.fastMode } : {}),
           ...(command.attachments ? { attachments: command.attachments } : {}),
         });
       } finally {
@@ -988,6 +970,7 @@ async function executeCommand(commandId: string, command: ControlCommand): Promi
         prompt: command.prompt,
         ...(command.model ? { model: command.model } : {}),
         ...(command.effort ? { effort: command.effort } : {}),
+        ...(command.fastMode !== undefined ? { fastMode: command.fastMode } : {}),
         ...(command.attachments ? { attachments: command.attachments } : {}),
       });
       break;
@@ -1108,7 +1091,7 @@ function connect(): void {
         maxConcurrentRuns: config.maxConcurrentRuns,
         workspaces: config.workspaces,
         models: availableModels,
-        capabilities: [WORKSPACE_FILE_READ_CAPABILITY, ...(nodeTerminals.available ? [TERMINAL_PTY_CAPABILITY] : []), ...(nodeFiles ? [NODE_FILES_CAPABILITY] : []), ...(nodeFiles?.direct.available ? [NODE_FILES_DIRECT_CAPABILITY] : [])],
+        capabilities: [WORKSPACE_FILE_READ_CAPABILITY, ...(availableModels.some((model) => model.supportsFastMode) ? [FAST_MODE_CAPABILITY] : []), ...(nodeTerminals.available ? [TERMINAL_PTY_CAPABILITY] : []), ...(nodeFiles ? [NODE_FILES_CAPABILITY] : []), ...(nodeFiles?.direct.available ? [NODE_FILES_DIRECT_CAPABILITY] : [])],
       },
     });
   });

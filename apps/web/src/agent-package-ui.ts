@@ -1,10 +1,25 @@
 import type { AgentPackageInfo } from "./types";
 
-// User acceptance on 2026-10-08 covers this exact ARM64 artifact's direct download.
-// A rebuilt archive, a different target or a later version needs its own verification.
-export function macOSPackageDownloadVerified(info: AgentPackageInfo): boolean {
-  return info.target === "darwin-arm64" && info.version === "0.3.19"
-    && info.sha256 === "d4a9981ea1ab7c0fd391ed0570e1b33f058d541018727ed41469f5628620d852";
+// Acceptance belongs to an exact artifact; rebuilding never inherits its status.
+const macOSVerifications = [
+  {
+    version: "0.3.19",
+    sha256: "d4a9981ea1ab7c0fd391ed0570e1b33f058d541018727ed41469f5628620d852",
+    label: "macOS 直连下载已实机验证",
+    title: "2026-10-08 用户确认当前 ARM64 安装包可正常直连下载",
+  },
+  {
+    version: "0.3.22",
+    sha256: "3988ed0d267a4e47cd7c77eb5557a8dffcd5c0e79d73e6fe2e427d66baad22ed",
+    label: "macOS 已实机测试",
+    title: "2026-10-26 用户反馈当前 ARM64 安装包已在 macOS 实测，未发现异常",
+  },
+];
+
+export function macOSPackageVerification(info: AgentPackageInfo): { label: string; title: string } | null {
+  return info.target === "darwin-arm64"
+    ? macOSVerifications.find((entry) => entry.version === info.version && entry.sha256 === info.sha256) ?? null
+    : null;
 }
 
 export function agentPackageTargetLabel(target: string): string {

@@ -15,7 +15,9 @@ import {
   type ReactNode,
 } from "react";
 import { NodeToolButtons } from "./NodeToolButtons";
-import { agentPackageTargetLabel, macOSPackageDownloadVerified, selectAgentPackage } from "./agent-package-ui";
+import { supportsFastMode } from "./conversation-options";
+import { OutputSpeed } from "./OutputSpeed";
+import { agentPackageTargetLabel, macOSPackageVerification, selectAgentPackage } from "./agent-package-ui";
 const NodeToolsPage = lazy(() => import("./NodeToolsPage"));
 import "./node-tools.css";
 import { createPortal } from "react-dom";
@@ -181,6 +183,8 @@ interface TimelineEntry {
   title?: string;
   content: string;
   attachmentIds: string[];
+  complete?: boolean;
+  outputStats?: Message["outputStats"];
 }
 
 function record(value: unknown): JsonRecord | null {
@@ -250,7 +254,7 @@ function ConversationUsageBar({
             : "压缩";
   return (
     <section className={`conversation-usage ${usage ? "" : "pending"}`} aria-label="当前会话 Token 使用情况">
-      <span title={exact(usage?.totalTokens)}><small>总计</small><strong>{compactTokenCount(usage?.totalTokens)}</strong></span>
+      <span title={[exact(usage?.totalTokens), ...(usage?.outputTokens !== undefined ? [`累计输出：${exact(usage.outputTokens)}`] : []), ...(usage?.reasoningOutputTokens !== undefined ? [`其中推理：${exact(usage.reasoningOutputTokens)}`] : [])].join("\n")}><small>总计</small><strong>{compactTokenCount(usage?.totalTokens)}</strong></span>
       <span title={exact(contextWindow)}><small>窗口</small><strong>{compactTokenCount(contextWindow)}</strong></span>
       <span title={usage && contextWindow ? `${usage.contextTokens.toLocaleString("zh-CN")} / ${contextWindow.toLocaleString("zh-CN")} Token` : "尚未获取"}>
         <small>占用</small><strong>{contextPercent === null ? "--" : `${contextPercent}%`}</strong>
@@ -286,6 +290,7 @@ const statusText: Record<string, string> = {
 
 export function buildTimeline(detail: ConversationDetail | null): TimelineEntry[] {
   if (!detail) return [];
+  const finishedRuns = new Set(detail.runs.filter((run) => ["completed", "failed", "interrupted"].includes(run.status)).map((run) => run.id));
   return detail.messages
     .map((message): TimelineEntry => ({
       id: message.id,
@@ -293,6 +298,8 @@ export function buildTimeline(detail: ConversationDetail | null): TimelineEntry[
       kind: message.role === "assistant" ? "agent" : "user",
       content: message.content,
       attachmentIds: message.attachmentIds,
+      complete: message.complete || Boolean(message.runId && finishedRuns.has(message.runId)),
+      outputStats: message.outputStats,
     }))
     .filter((entry) => entry.content.trim())
     .sort((left, right) => left.at.localeCompare(right.at));
@@ -2197,6 +2204,7 @@ function TimelineCard({
     <article className={`timeline-card timeline-${entry.kind}`} title={formatDate(entry.at)}>
       {linkedAttachments.length > 0 && <div className="message-attachments">{linkedAttachments.map((attachment) => <span key={attachment.id}>{attachment.mediaType.startsWith("image/") ? "图片" : "文件"} · {attachment.name}</span>)}</div>}
       <MarkdownContent onOpenLocalPath={onOpenLocalPath}>{entry.content}</MarkdownContent>
+      {entry.kind === "agent" && entry.outputStats && <OutputSpeed stats={entry.outputStats} complete={entry.complete ?? true} />}
     </article>
   );
 }
@@ -2463,6 +2471,7 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   const [packageTarget, setPackageTarget] = useState<string>("");
   const availablePackages = agentPackage?.packages?.length ? agentPackage.packages : agentPackage?.target ? [agentPackage] : [];
   const selectedPackage = selectAgentPackage(agentPackage, packageTarget);
+  const macOSVerification = selectedPackage ? macOSPackageVerification(selectedPackage) : null;
   const onlyLinuxPackages = availablePackages.length > 0 && availablePackages.every((item) => item.target?.startsWith("linux-"));
   const [packageLoading, setPackageLoading] = useState(true);
   const [packageDownloading, setPackageDownloading] = useState(false);
@@ -2619,8 +2628,8 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
       {!packageLoading && !selectedPackage?.available && availablePackages.length === 0 && <span>安装包暂不可下载</span>}
       {(selectedPackage?.available || onlyLinuxPackages) && <div className="agent-package-footer">
         {onlyLinuxPackages && <p className="agent-package-notice" role="status">目前仅提供 Linux 安装包</p>}
-        {selectedPackage?.target?.startsWith('darwin-') && (macOSPackageDownloadVerified(selectedPackage)
-          ? <p className="agent-package-verified" role="status" title="2026-10-08 用户确认当前 ARM64 安装包可正常直连下载">macOS 直连下载已实机验证</p>
+        {selectedPackage?.target?.startsWith('darwin-') && (macOSVerification
+          ? <p className="agent-package-verified" role="status" title={macOSVerification.title}>{macOSVerification.label}</p>
           : <p className="agent-package-notice" role="status" title="请先测试终端和文件上传、下载">macOS 待实机验证</p>)}
         {selectedPackage?.available && <details className="agent-package-details" key={selectedPackage.fileName}>
           <summary>安装包详情</summary>
@@ -3145,6 +3154,7 @@ function ChatPanel({
   const [workspaceId, setWorkspaceId] = useState("");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
+  const [fastMode, setFastMode] = useState(false);
   const [messageRequestId, setMessageRequestId] = useState(newDraftRequestId);
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
@@ -3186,6 +3196,8 @@ function ChatPanel({
   const selectedModel = modelCatalog.find((candidate) => candidate.id === model)
     ?? modelCatalog.find((candidate) => candidate.isDefault);
   const effortOptions = selectedModel?.supportedReasoningEfforts ?? [];
+  const fastSupported = supportsFastMode(node, model);
+  const fastModeStorageKey = `controller-center:fast-mode:${node?.id ?? "none"}:${detail?.conversation.id ?? "new"}`;
   const conversationId = detail?.conversation.id ?? null;
   const taskErrors = [
     ...(detail?.runs ?? []),
@@ -3284,6 +3296,8 @@ function ChatPanel({
     setWorkspaceId(initialWorkspace);
     setModel(initialModel);
     setEffort(resolvedEffort);
+    const storedFastMode = storedValue(fastModeStorageKey);
+    setFastMode(storedFastMode === null ? detail?.conversation.fastMode ?? false : storedFastMode === "true");
     setMessageRequestId(newDraftRequestId());
     setUploads((current) => {
       for (const upload of current) if (upload.previewUrl) URL.revokeObjectURL(upload.previewUrl);
@@ -3552,17 +3566,20 @@ function ChatPanel({
     setError(null);
     try {
       const attachmentIds = uploads.flatMap((upload) => upload.attachment?.id ? [upload.attachment.id] : []);
+      const requestedModel = model || selectedModel?.id;
       if (!detail) {
         const result = await startConversation({
           nodeId: node.id,
           workspaceId,
           prompt: prompt.trim(),
           clientRequestId: draftRequestId,
-          ...(model ? { model } : {}),
+          ...(requestedModel ? { model: requestedModel } : {}),
           ...(effort ? { effort } : {}),
+          fastMode,
           ...(attachmentIds.length ? { attachmentIds } : {}),
           ...(allowWorkspaceConcurrency ? { allowWorkspaceConcurrency: true } : {}),
         });
+        storeValue(fastModeStorageKey, null);
         clearSentPrompt();
         clearUploads();
         onConversationStarted(result.conversation, result.run, draftRequestId);
@@ -3577,11 +3594,13 @@ function ChatPanel({
       } else {
         await startRun(detail.conversation.id, prompt.trim(), {
           clientRequestId: messageRequestId,
-          ...(model ? { model } : {}),
+          ...(requestedModel ? { model: requestedModel } : {}),
           ...(effort ? { effort } : {}),
+          fastMode,
           ...(attachmentIds.length ? { attachmentIds } : {}),
           ...(allowWorkspaceConcurrency ? { allowWorkspaceConcurrency: true } : {}),
         });
+        storeValue(fastModeStorageKey, null);
         clearSentPrompt();
         clearUploads();
         setMessageRequestId(newDraftRequestId());
@@ -3835,7 +3854,7 @@ function ChatPanel({
           <section className="run-float" aria-live="polite" aria-label="当前任务状态">
             <div className="run-float-detail">
               <strong className={`stream-state stream-state-${activeRun.status}`}><i aria-hidden="true" />{activeStateText}</strong>
-              <span>{activeModelText} · {activeEffortText}</span>
+              <span>{activeModelText} · {activeEffortText}{activeRun.fastMode ? " · Fast" : ""}</span>
             </div>
             <StatusBadge status={activeRun.status} />
             <button
@@ -3926,6 +3945,10 @@ function ChatPanel({
                   setModel(nextModel);
                   const descriptor = modelCatalog.find((candidate) => candidate.id === nextModel);
                   setEffort(descriptor?.defaultReasoningEffort ?? "");
+                  if (!supportsFastMode(node, nextModel)) {
+                    setFastMode(false);
+                    storeValue(fastModeStorageKey, "false");
+                  }
                 }}
               >
                 <option value="">本机默认</option>
@@ -3946,6 +3969,17 @@ function ChatPanel({
                 ))}
               </select>
             </label>
+            <button
+              type="button"
+              className="fast-mode-button"
+              aria-label="Fast 模式"
+              aria-pressed={fastMode}
+              disabled={busy || Boolean(activeRun) || compactionActive || !fastSupported && !fastMode}
+              onClick={() => {
+                setFastMode(!fastMode);
+                storeValue(fastModeStorageKey, String(!fastMode));
+              }}
+            ><span aria-hidden="true">ϟ</span> Fast</button>
           </div>
           <button className="send-button" disabled={busy || !prompt.trim() || !canCompose || uploads.some((upload) => upload.status !== "ready")}>
             {busy ? "…" : uploads.some((upload) => upload.status === "uploading") ? "上传中" : "发送"}

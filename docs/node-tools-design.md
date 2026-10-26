@@ -1,6 +1,6 @@
 # 节点终端与文件管理设计
 
-> 状态：终端、HTTPS 中转及 WebRTC 直连上传/下载已实现；2026-10-08 已更新生产 Web 与 Control Plane，发布 Agent v0.3.19 的 Linux 和 macOS ARM64 包；用户已确认 Mac mini 直连下载可用。Linux/Chromium、macOS 验证边界及生产发布记录见第 10 节，节点 Agent 升级独立安排。
+> 状态：终端、HTTPS 中转及 WebRTC 直连上传/下载已实现，新增会话 Fast 和估算输出速度。Controller Center 为 v0.3.16，Agent 为 v0.3.22，提供 Linux x64/glibc 和 macOS ARM64 包；2026-10-26 用户反馈两个平台实测未发现异常。当前验收范围见第 10.19 节，历史生产发布与验证记录保留在第 10 节，节点 Agent 升级独立安排。
 > 日期：2026-10-08
 > 范围：Controller Center Web、Control Plane、Linux/macOS Agent
 
@@ -21,7 +21,7 @@
 ## 2. 当前实现与新增约束
 
 - Agent 通过 `/agent/connect` 建立经过节点凭证认证的 WSS；文件页独立 WebSocket 维护页面租约并接收直连信令。
-- 协议 v5 增加可选 `node_files_direct_v1`，包含直连上传和下载；Agent v0.3.17 起在原生库加载成功后声明。当前安装包为 v0.3.19；只有 `node_files_v1` 的 Agent 继续使用中转，不禁止文件入口。
+- 协议 v5 增加可选 `node_files_direct_v1`，包含直连上传和下载；Agent v0.3.17 起在原生库加载成功后声明。当前安装包为 v0.3.22；只有 `node_files_v1` 的 Agent 继续使用中转，不禁止文件入口。
 - `apps/control-plane/src/node-tools.ts` 根据任务传输方式分配暂存；直连只登记任务状态，不打开暂存文件、不预留文件配额。复用 `packages/node-files` 的路径、分片、哈希及文件身份校验。
 - 节点文件当前按 1 MiB HTTP 分片传输、流式校验；不能复用对话预览中的 JSON/Base64 或整文件读取。DataChannel 帧大小与应用分片分别约束，见第 6.2 节。
 - 现有 Nginx 的 `client_max_body_size 3m` 适配中转分片；保留 WebSocket Upgrade、缓冲、超时与响应范围配置。WebRTC 数据不经 Nginx HTTP 路由，STUN 与 UDP 网络条件需单独验证，既有 HTTP/WSS 代理配置不等于 WebRTC 代理支持。
@@ -193,7 +193,7 @@ HTTP 分片维持 1 MiB。直连可沿用逻辑分片及哈希语义，但每个
 - Web/Control Plane 控制入口维持 HTTPS/WSS。控制面 `NODE_FILES_STUN_URLS` 为逗号分隔的 STUN 地址，最多 8 个；未设置时使用 `stun:stun.cloudflare.com:3478`、`stun:global.stun.twilio.com:3478`、`stun:stun.l.google.com:19302` 三个候选，显式留空只交换主机候选。Cloudflare 列在首位作为首选测试服务；WebRTC 同时探测候选服务器并自行选择实际可用路径，列表顺序不保证串行访问或最终路径。多个地址提高覆盖机会，不保证 NAT 跨网可达，发布前仍需验证实际网络。直连需要节点与浏览器的 UDP 出站及相关回包，不要求固定公网 HTTP 监听或手动端口映射。现有 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 和 `--codex-proxy-only` 的 HTTP/WSS 含义保持不变，不能宣称它们自动代理 WebRTC。当前不配置 TURN；以后增加 TURN 时，使用 relay candidate 的路线必须标为中继，不能显示直连。
 - 前端记录浏览器环境、协商、两端连接、通道授权和传输中断的失败阶段。文件页提供诊断详情，失败时展开，并在浏览器控制台输出有界诊断记录；展示各 STUN 地址、浏览器错误码/错误文本、两端候选类型数量、连接状态和检测过程，不输出原始 SDP、候选 IP/端口或令牌。`icecandidateerror` 的 701 表示浏览器报告此地址探测不可达；DNS、UDP、防火墙或部分接口路径仍需区分。成功公网候选优先于局部错误；已建立直连不因单个 STUN 错误降级。没有来源信息或没有返回结果时标为未单独确认，不把建连超时等同于 STUN 服务宕机。浏览器只能逐项观察自己的探测；当前 Agent 的候选信息不能证明其逐个 STUN 地址的访问结果。检测失败不启动文件任务，不自动切换已有任务到中转。
 - PTY 及新增 WebRTC 原生依赖按实际 OS、架构、Linux libc 与 Node.js 24 目标打包，构建后验证实际独立安装包。Linux x64/glibc 和 macOS ARM64 是首批验证目标，Linux 结果不能代替 macOS；模块加载失败只停用对应 capability，不带崩聊天与中转。下载页继续明确系统目标、独立 Agent 版本与 SHA-256。
-- 新协议消息通过可选 capability 守卫，保持协议 v5；旧 Agent 仍可中转。Controller Center 与 Agent 独立发布。Agent 运行代码或原生依赖变化时独立升级其版本，当前安装包为 v0.3.19；Linux x64/glibc 已验证并发布，macOS ARM64 直连下载获用户实机确认，Web 与 Control Plane 已部署，产物和节点升级边界见第 10 节。
+- 新协议消息通过可选 capability 守卫，保持协议 v5；旧 Agent 仍可中转。Controller Center 与 Agent 独立发布。Agent 运行代码或原生依赖变化时独立升级其版本，当前安装包为 v0.3.22；Linux x64/glibc 和 macOS ARM64 已获本轮用户实机反馈，产物哈希与验收范围见第 10.19 节，历史部署与节点升级边界见第 10 节。
 
 ## 8. 实施顺序与验收
 
@@ -420,3 +420,59 @@ Control Plane 在启动时缓存 Agent 安装包版本，因此只重启现有 C
 本轮同时检查跨设备临时下载链接、macOS 原生依赖打包、Node 24 及以上运行检查和紧凑设置界面。三个设置分类已统一字号和控件尺寸：对话默认值缩为两行，保存操作紧跟表单；工作空间合并节点选择和添加入口，目录信息与操作集中展示，保留迁移、停用和删除确认；手机版本号移至页头。此前已完成 1440、820、390 和 320 像素的本地及公网页面检查，默认值保存与工作空间编辑、取消行为正常。设置界面变更只发布 Web，未改变相关后端接口。
 
 提交前全项目类型检查、Web 构建、脚本语法检查通过，**114 项自动化测试**及四种页面尺寸下的 **16 项 Chromium 检查**通过；默认关闭的 1 GiB 中转测试本次未重跑。覆盖安装目标选择、已验证与未验证提示、链接及 wget 命令复制、剪贴板拒绝、错误反馈和 Token 到期清理。Web 发布为 `20261008T101900Z-3907372`，公网复核三个设置分类的四种尺寸布局、macOS 验证提示与产物 SHA-256，以及 7 个静态资源一致性，均正常且无浏览器异常。Control Plane、Agent、Nginx 配置及安装包未改变；验证未修改默认值、工作空间或创建文件任务，临时登录已注销。检查结果见 `/tmp/controller-center-release-production-check.json`，测试日志为 `/tmp/controller-center-release-{typecheck,unit-tests,e2e,web-build}.log`。
+
+### 10.16 Fast 模式、输出速度与 Agent v0.3.20 发布
+
+2026-10-20 在用户明确授权重启、确认全部 Agent 已关闭后，发布 Controller Center v0.3.16（Web、Control Plane）及独立的 Agent v0.3.20。生产重启前再次确认三个节点离线、无活动 Run。Fast 选择通过可选 `fast_mode_v1` 能力和模型目录验证，协议保持 v5；旧 Agent 仍可使用原有功能。Agent 为新回复记录节点侧文字流时序，展示带 `≈` 的估算输出速度；累计输出和推理 Token 用量分别保留，不把估算速率作为计费用量。
+
+产物先在独立目录生成、验证，再发布至 `artifacts/`，目录仅保留当前版本的两种安装包：
+
+- Linux x64/glibc：`controller-center-agent-v0.3.20-linux-x64-glibc.tar.gz`，5,867,374 字节，SHA-256 `e6ec55a0529141559c6462e4704353bc57c3d5aac87f9a73a47f348bfee5c97b`。
+- macOS ARM64：`controller-center-agent-v0.3.20-darwin-arm64.tar.gz`，5,951,967 字节，SHA-256 `77a35d02a1c5a82b9a8b1973b3d4cac98f7f60994c95d5d4398f644b6b847428`。
+
+Linux 独立包通过真实 TTY、调整尺寸、双终端独立关闭、原生 WebRTC 及 1 MiB 传输验证，Fast 参数和输出速度模块也在解压后的包内运行通过。Mac 包检查官方依赖完整性、三个原生文件的 Mach-O ARM64 架构、helper 权限以及无残留 Linux 原生模块；两包的 51 个运行文件逐个哈希一致。**这些检查不代表 v0.3.20 Mac 原生模块或 Fast 已获实机验收**，网页不会沿用 v0.3.19 精确产物的已验证标记。
+
+全项目类型检查、构建、127 项自动化测试和四种尺寸的 20 项 Chromium 检查通过，原有可选的 1 GiB 测试跳过。生产 Web release 为 `20261020T061414Z-3658779`，Control Plane 经生产脚本重启；公网健康、Origin/CORS、登录及安全 Cookie、两个安装包完整下载与 SHA-256、7 个静态资源一致性、1440 和 320 像素页面检查均通过，无浏览器运行错误。SQLite `quick_check` 为 `ok`，节点、工作空间、会话、Run、消息及审批数量与备份一致；临时验证登录已注销。
+
+数据库在线备份及上一版编译文件位于 `/var/backups/controller-center/pre-fast-mode-0.3.16-20261020T061018Z/`。构建、包审计、测试、公网检查和截图位于 `/tmp/controller-center-release-0.3.16-vghKjB/`，其中 `production-check.json` 保存最终检查结果。本轮没有启动或替换任何节点 Agent；节点安装时保留原工作目录和 `AGENT_DATA_DIR`，无需重新注册。未提交或推送 Git。
+
+### 10.17 Codex 0.163 Fast 档位识别修复与 Agent v0.3.21
+
+2026-10-20 用户反馈已更换 Agent v0.3.20，Fast 按钮仍不可用。实际读取 A6000DEV 的 Codex 0.163 `model/list` 后确认：新版 `serviceTiers` 使用 `{ id: "priority", name: "Fast" }`，同时保留旧的 `additionalSpeedTiers: ["fast"]`。v0.3.20 只识别新版列表中的 `id: "fast"`，导致全部模型误判不支持，未声明 `fast_mode_v1`；错误结果还会进入 24 小时模型缓存。
+
+Agent v0.3.21 同时识别 `priority` 和旧 `fast` 档位，保留模型目录声明的真实 wire id 下发。模型缓存增加 schema v2，旧缓存自动失效并重新发现，避免仅重启后继续沿用误判。根据真实响应补充档位和缓存回归测试；129 项自动化测试通过，原有可选 1 GiB 测试跳过。Linux 独立包运行检查通过，两包 51 个运行文件一致，Mac ARM64 依赖仍仅完成静态验证。
+
+Linux x64/glibc 新包 SHA-256 为 `d798ea330e2c251ecd006e869d71d19f636e33b99fafeb485f29037489674e1e`；macOS ARM64 为 `c76b27c254793fdf201ca50020b1ebe6b5f5ec848933bada6e4b6a98b45e31eb`。发布后清理同目录的 v0.3.20 压缩包，保留安装目录。Control Plane 仅重启以读取新的 Agent 安装包版本，Web v0.3.16 无需重新发布。
+
+确认无活动聊天和文件任务后，在原安装目录更新并重启 A6000DEV，保留原工作目录、节点 ID、注册凭据及 `AGENT_DATA_DIR`；原运行文件和节点状态已备份至 `/var/backups/controller-center/pre-fast-priority-0.3.21-20261020T062349Z/`。节点重新连接后上报 v0.3.21、Fast capability 和 7 个 `priority` 模型。公网实际页面验证桌面及 320 像素下按钮可开启和关闭、刷新后保留选择、模型切换后仍可用；验证未提交任务，无浏览器错误，临时登录已注销。两个新安装包的公网下载 SHA-256 一致，其他节点未操作。模型目录、构建日志、包审计、截图与 `production-fast-check.json` 位于 `/tmp/controller-center-fast-catalog-fix-0rVzZ3/`。未提交或推送 Git。
+
+
+### 10.18 输出速度复核与 Agent v0.3.22
+
+2026-10-20 根据用户“只统计输出速度”的要求复核公式和事件链路。输入 Token、首段回复前的输入处理与等待、推理增量、命令输出均不进入回复速率，最后一段输出之后的结束回调也不延长计时。首段文字只作计时基线，完成后的平均值使用其后新增文字的估算 Token 数除以首末文字流的单调时钟差；此值仍是节点观察到的可见输出估算，不是服务端精确解码速度。
+
+复核发现两项实时采样边界：每 1–5 毫秒一个分块时，旧版按 512 个样本裁剪却保留早期基线，可能把近 3 秒速率拉成长区间平均；长时间暂停后恢复也可能继续使用窗口外的基线。v0.3.22 改为按 25 毫秒合并样本，仅保留最近 3 秒内的基线，样本跨度不足 250 毫秒时不显示速率。最近窗口的内存与消息长度无关，10 万次密集输入检查的峰值为 122 个样本。该修复不补算或改写历史速度，原有消息上报频率、分页和虚拟滚动保持原样。
+
+速度模块 12 项确定性测试、Agent 全部 50 项测试、2 项指标存储测试及四种尺寸的 12 项界面检查通过。以实际 Agent 通知处理函数重放大量输入 Token、推理、工具输出、90 秒首字等待及延迟结束事件，预期与实际均为 100 tok/s；完整文本回填或重建而缺少可信流式计时时不生成速率。
+
+Linux 独立安装包通过真实 PTY、调整尺寸、双终端独立关闭及 1 MiB WebRTC 传输检查；两包 51 个运行文件的哈希一致，并分别执行密集分块和暂停恢复检查。Linux 包为 5868242 字节，SHA-256 为 `f5eddadc2444c0f552af0b0c99dbac19408f00578300836be45e99ccf2511c07`；Mac ARM64 包为 5952447 字节，SHA-256 为 `3988ed0d267a4e47cd7c77eb5557a8dffcd5c0e79d73e6fe2e427d66baad22ed`。Mac 原生能力仍只完成静态检查，未声称本轮实机验证。
+
+两次重启前均确认无活动 Run 和文件任务。A6000DEV 已在原安装目录更新至 v0.3.22，保留工作目录、节点身份、凭据和锁定依赖；替换过程中遇到一次依赖目录复制冲突，核对锁定依赖完全一致后跳过依赖目录复制并恢复运行。Control Plane 仍为 v0.3.16，仅重启刷新启动时缓存的安装包版本；Web release 沿用 20261020T064202Z-3665971，没有重新发布。旧 v0.3.21 归档在新包验证和目录切换成功后清理，已安装目录保留。
+
+备份位于 `/var/backups/controller-center/pre-output-speed-0.3.22-20261020T071623Z`；测试、事件重放、安装包审计及线上检查记录位于 `/tmp/controller-center-output-speed-audit-ZLPz6S`。未提交或推送 Git。
+
+
+### 10.19 Linux 与 macOS 实机反馈及提交前检查
+
+2026-10-26 用户反馈已在 Linux 和 macOS 实机测试，未发现异常。核对在线节点 A6000DEV（Linux x64）及 macmini（macOS ARM64）均运行 Agent v0.3.22；当前两份归档的大小与 SHA-256 均与 2026-10-20 发布记录一致，未重新打包。验收仅绑定这两个目标和这些归档，不外推到 Intel/Rosetta、其他版本或重新生成的文件：
+
+- Linux x64/glibc：`controller-center-agent-v0.3.22-linux-x64-glibc.tar.gz`，5868242 字节，SHA-256 `f5eddadc2444c0f552af0b0c99dbac19408f00578300836be45e99ccf2511c07`。
+- macOS ARM64：`controller-center-agent-v0.3.22-darwin-arm64.tar.gz`，5952447 字节，SHA-256 `3988ed0d267a4e47cd7c77eb5557a8dffcd5c0e79d73e6fe2e427d66baad22ed`。
+
+下载页对本次 Mac 包显示“macOS 已实机测试”，说明来自用户反馈；v0.3.19 精确归档原有的“直连下载已实机验证”范围单独保留。不把本次一般实测反馈扩写成所有原生能力、跨网环境或大文件场景均已覆盖。归档中的 README 和 BUILD-INFO 继续保留构建时的待测试状态，后续验收以本节为准，避免为更新说明改变用户已经测试的包。文档当前版本与安装示例统一为 v0.3.22，Controller Center/Web/Control Plane 保持 v0.3.16，协议保持 v5。
+
+本次提交前核对通过：全项目类型检查；Protocol、node-files、Control Plane、Agent、Web 分别构建；138 项单元/集成及安装包清理测试；四种屏幕尺寸下 131 项 Chromium 会话回归。原有可选 1 GiB 测试未开启，33 项浏览器场景按设备尺寸条件跳过。Linux 已发布独立包再次通过真实 PTY、尺寸变化、双终端独立关闭及 1 MiB WebRTC 传输验证；两包的 51 个运行文件逐个哈希一致，并与本次源码编译结果一致。
+
+此前诊断发现的会话详情重复请求仍属于后续性能优化项：当前主分支原实现已同时从点击处理和选中状态 effect 发起详情刷新，非本次 Fast/输出统计新增。本轮未修复该项，也不把此前统计模块的性能测量当成完整会话打开耗时保证。
+
+本轮更新源码中的验收提示和文档并完成本地检查，按用户确认仅进行本地 Git 提交。生产服务、运行 Agent 和已验收的安装包保持原样，Linux 上正在执行的任务未中断；不创建标签、不推送或重新部署。完整日志与包审计位于 `/tmp/controller-center-precommit-IAbg0F`。

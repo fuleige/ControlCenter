@@ -1,6 +1,6 @@
 # Agent 客户端命令与配置
 
-本文档对应 Agent `v0.3.19`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
+本文档对应 Agent `v0.3.22`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
 
 `AGENT_DATA_DIR` 不是必填项，省略时使用当前用户的 `~/.controller-center-agent`。它保存节点 ID、注册凭证、可靠队列和附件缓存，必须在注册与后续启动之间保持不变。它不决定 Codex 工作空间：Agent 的启动目录才是默认工作空间。正式使用不建议把状态默认放到当前目录，否则从不同项目启动时可能产生不同节点身份；隔离测试时可以显式指定当前目录下的绝对路径，例如先执行 `export AGENT_DATA_DIR="$PWD/test-data"`。
 
@@ -11,11 +11,11 @@
 也可点击“复制下载链接”，在另一台设备直接用 wget 或 curl 下载，无需复制管理员 Cookie 或 Token。链接只允许下载所选安装包，有效期一小时；Control Plane 重启、安装包更新或移除后也会失效，需重新生成。页面提供“复制 wget 命令”；浏览器拒绝剪贴板操作时，可以从只读输入框手动复制链接。macOS 可使用系统 curl，例如：
 
 ```bash
-curl -fL '粘贴页面复制的下载链接' -o controller-center-agent-v0.3.19-darwin-arm64.tar.gz
+curl -fL '粘贴页面复制的下载链接' -o controller-center-agent-v0.3.22-darwin-arm64.tar.gz
 ```
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.19-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.22-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -27,7 +27,9 @@ sudo mv "$cc_agent_directory" /opt/controller-center-agent
 
 每次新包成功生成后自动清理同一输出目录的其他版本安装包与源码归档，保留当前 Agent 版本的各系统/架构包；构建失败不删除原包。已有包可执行 `npm run clean:agent-packages` 清理，未生成当前版本安装包时会拒绝清理。`AGENT_PACKAGE_OUTPUT_DIR` 可指定独立输出目录，清理不会跨目录。
 
-2026-10-08 下载目录提供 v0.3.19 Linux x64/glibc 与 macOS ARM64 包。v0.3.19 放宽 Node 版本检查，允许 Mac 的 Node 26 继续启动。Mac 包复用同版本运行代码与锁定依赖，换入官方 `node-pty@1.1.0`、`node-datachannel@0.33.4` ARM64 预编译模块，并检查 npm 完整性、Mach-O 架构和 helper 执行权限。用户已在 Mac mini 确认当前包可正常使用及直连下载；对应文件 SHA-256 与验证范围见[本轮实机反馈](node-tools-design.md#1015-macos-实机反馈与本轮提交检查)。页面对这一精确产物显示“macOS 直连下载已实机验证”。包内 `nativeVerification: pending-macos-test` 和 README 的待验证说明记录的是构建时状态，后续用户反馈以该记录为准，不为更新说明而重新打包。Intel / Rosetta 的 darwin-x64 包本轮未生成。
+当前安装包为 v0.3.22，2026-10-20 生成，增加会话 Fast 档位与可见回复的估算输出速度，协议继续兼容 v5。2026-10-26 用户反馈 Linux 与 macOS 实机测试未发现异常；本轮核对两个在线节点均运行 v0.3.22，目标分别为 Linux x64/glibc 和 macOS ARM64。验收记录绑定当前归档 SHA-256，见[本轮实机反馈](node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。包内构建元数据和 README 保留生成时的待验证记录，不因后续反馈重新打包。v0.3.21 修正 Codex 0.163 的 `priority` Fast 档位识别，并刷新旧版误判缓存；v0.3.22 修正密集分块和暂停恢复时的实时速度采样，只在最近 3 秒内样本充足时显示速率。输入 Token 和首段输出前的时间不参与速度计算。升级时保留原工作目录及 `AGENT_DATA_DIR`，无需重新注册。
+
+以下为旧版验收记录，不代表新版安装包已实机验收：2026-10-08 下载目录提供 v0.3.19 Linux x64/glibc 与 macOS ARM64 包。v0.3.19 放宽 Node 版本检查，允许 Mac 的 Node 26 继续启动。Mac 包复用同版本运行代码与锁定依赖，换入官方 `node-pty@1.1.0`、`node-datachannel@0.33.4` ARM64 预编译模块，并检查 npm 完整性、Mach-O 架构和 helper 执行权限。用户已在 Mac mini 确认当前包可正常使用及直连下载；对应文件 SHA-256 与验证范围见[本轮实机反馈](node-tools-design.md#1015-macos-实机反馈与本轮提交检查)。页面对这一精确产物显示“macOS 直连下载已实机验证”。包内 `nativeVerification: pending-macos-test` 和 README 的待验证说明记录的是构建时状态，后续用户反馈以该记录为准，不为更新说明而重新打包。Intel / Rosetta 的 darwin-x64 包本轮未生成。
 
 macOS 上运行 ARM64 Node.js 时需要 `darwin-arm64` 包，Intel 或 Rosetta 下的 x64 Node.js 需要 `darwin-x64` 包；以 `node -p 'process.platform + "-" + process.arch'` 输出为准。Linux 包不能直接用于 macOS。Agent 在首次注册和启动前检查系统、架构、libc 和 Node 最低版本，不匹配时明确提示并停止；v0.3.19 起不再拒绝高于 Node 24 的主版本。此检查不会读取或修改注册凭证。
 
@@ -38,12 +40,12 @@ npm ci
 npm run package:agent
 ```
 
-构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.19-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
+构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.22-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
 
 将安装包放入下载目录前，在同一台构建机验证实际压缩包：
 
 ```bash
-node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.19-darwin-arm64.tar.gz
+node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.22-darwin-arm64.tar.gz
 ```
 
 此验证针对 v0.3.16 及后续版本：会解压到独立临时目录，检查版本与目标一致性，实际打开两个终端、验证 TTY 和窗口尺寸、关闭一个终端后确认另一个仍可交互，并确认错误目标会在创建节点状态前停止。验证不会注册测试节点或读取已有节点凭证。源码仓库提供手动触发的 `node-tools-verification.yml`，分别在 Linux x64 与 Mac ARM64 上构建、验证并保存对应目标的产物。旧版 v0.3.15 ARM64 测试包由用户在 Mac 通过网页实际打开终端及操作文件验收，不使用依赖新版启动校验模块的验证脚本。
@@ -216,7 +218,7 @@ Agent v0.3.14 增加真实 PTY 与节点文件能力，旧 Agent 的聊天功能
 
 终端每次新开，不恢复历史；关闭、刷新、连接断开或 Agent 退出后回收 PTY。文件单个最大 1 GiB；页面仍打开时允许分片重试，关闭/刷新页面后结束未完成任务。当前文件字节经 Control Plane 暂存中转，最终下载由 Chrome 下载栏管理。上传临时文件的清理登记保存在 `AGENT_DATA_DIR/node-upload-cleanup.json`，不要在传输中手动删除登记文件。
 
-Agent v0.3.17 的本地实现增加 WebRTC 直连上传、下载和开页协商，原生库成功加载后声明 `node_files_direct_v1`；加载失败或旧 Agent 继续使用中转。上传与下载共用通道、任务上限、权限检查和租约；直连上传复用临时文件及原子提交。控制面用 `NODE_FILES_STUN_URLS` 配置 STUN，默认使用 Cloudflare、Twilio、Google 候选且不使用 TURN；已有 HTTP/WSS 代理参数不自动作用于 WebRTC。本轮未升级运行节点，macOS 原生互通仍需目标机验证。传输方式选择、失败后的用户确认与验证门槛统一见 [节点工具设计](node-tools-design.md)。
+Agent v0.3.17 的本地实现增加 WebRTC 直连上传、下载和开页协商，原生库成功加载后声明 `node_files_direct_v1`；加载失败或旧 Agent 继续使用中转。上传与下载共用通道、任务上限、权限检查和租约；直连上传复用临时文件及原子提交。控制面用 `NODE_FILES_STUN_URLS` 配置 STUN，默认使用 Cloudflare、Twilio、Google 候选且不使用 TURN；已有 HTTP/WSS 代理参数不自动作用于 WebRTC。当前 Linux/macOS 实机反馈见第 10.19 节；原生互通与跨网直连仍以目标设备和实际网络的测试结果为准。传输方式选择、失败后的用户确认与验证门槛统一见 [节点工具设计](node-tools-design.md)。
 
 可选资源参数：`NODE_TERMINAL_LIMIT=8`、`NODE_FILE_CONCURRENCY=2`；建议与控制面的配置保持一致。原生 PTY 加载失败时只停用终端能力，其他 Agent 功能继续运行。
 

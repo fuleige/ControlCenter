@@ -373,6 +373,7 @@ export async function startConversation(input: {
   clientRequestId: string;
   model?: string;
   effort?: ReasoningEffort;
+  fastMode?: boolean;
   attachmentIds?: string[];
   allowWorkspaceConcurrency?: boolean;
 }): Promise<{ conversation: Conversation; run: Run; deduplicated: boolean }> {
@@ -402,6 +403,7 @@ export async function startRun(
   options: {
     model?: string;
     effort?: ReasoningEffort;
+    fastMode?: boolean;
     clientRequestId: string;
     attachmentIds?: string[];
     allowWorkspaceConcurrency?: boolean;
