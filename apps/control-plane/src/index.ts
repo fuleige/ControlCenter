@@ -26,6 +26,7 @@ import { findAgentPackage, listAgentPackages } from "./agent-package.js";
 import { AGENT_PACKAGE_SHARED_PATH, agentPackageLogUrl, registerAgentPackageDownloadLinks } from './agent-package-download.js';
 import { NodeTools, NodeToolError } from "./node-tools.js";
 import { AgentConnections } from "./connections.js";
+import { NodeQuotas, QuotaRequestError } from "./node-quota.js";
 import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type GlobalSettingsRecord, type MessageListCursor, type WorkspaceRecord } from "./database.js";
 import { UiEventBus } from "./event-bus.js";
 import {
@@ -49,6 +50,7 @@ const database = new ControlDatabase(config.databasePath);
 ensureAdminToken(database, config.adminTokenPath, config.adminToken);
 const enrollmentDisplayKey = ensureEnrollmentDisplayKey(config.enrollmentDisplayKeyPath);
 const connections = new AgentConnections();
+const nodeQuotas = new NodeQuotas({ database, connections });
 const events = new UiEventBus();
 const app = Fastify({ logger: { serializers: { req: (request: FastifyRequest) => ({
   method: request.method, url: agentPackageLogUrl(request.url), hostname: request.hostname, remoteAddress: request.ip,
@@ -912,6 +914,10 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
         if (!connections.resolveWorkspaceFileRead(nodeId, message)) {
           app.log.warn({ nodeId, requestId: message.requestId }, "Received an unknown workspace file response");
         }
+      } else if (message.type === "agent.quota" || message.type === "agent.quotaReset") {
+        if (!connections.resolveAgentReply(nodeId, message)) {
+          app.log.warn({ nodeId, requestId: message.requestId, type: message.type }, "Received an unknown quota response");
+        }
       } else if (message.type === "agent.message") {
         processDurableMessage(nodeId, message);
       }
@@ -984,6 +990,34 @@ app.delete<{ Params: { id: string }; Body: { confirmName?: string } }>("/api/nod
   }
   for (const nodeId of nodeIds) publish("node.deleted", nodeId);
   return reply.code(204).send();
+});
+
+// Opening the quota dialog may read the node; refresh is the explicit, cooled-down re-read.
+app.post<{ Params: { id: string }; Body: { refresh?: boolean } }>("/api/nodes/:id/quota", async (request, reply) => {
+  const node = database.listNodes().find((candidate) => candidate.id === request.params.id);
+  if (!node) return reply.code(404).send({ error: "节点不存在或已被删除" });
+  try {
+    return { quota: await nodeQuotas.read(node, request.body?.refresh === true ? "refresh" : "open") };
+  } catch (error) {
+    if (error instanceof QuotaRequestError) return reply.code(error.statusCode).send({ error: error.message, quota: error.quota });
+    throw error;
+  }
+});
+
+// Redeems the reset credit the user picked; the Web asks for confirmation first.
+app.post<{ Params: { id: string }; Body: { creditId?: string; creditLabel?: string } }>("/api/nodes/:id/quota/reset", async (request, reply) => {
+  const node = database.listNodes().find((candidate) => candidate.id === request.params.id);
+  if (!node) return reply.code(404).send({ error: "节点不存在或已被删除" });
+  const creditId = typeof request.body?.creditId === "string" ? request.body.creditId.trim() : "";
+  if (!creditId || creditId.length > 256) return reply.code(400).send({ error: "请选择要使用的重置券" });
+  try {
+    // Display-only: the redeemed credit leaves the runtime's list, so keep how it was shown.
+    const creditLabel = typeof request.body?.creditLabel === "string" ? request.body.creditLabel.trim().slice(0, 200) || null : null;
+    return { quota: await nodeQuotas.reset(node, creditId, creditLabel) };
+  } catch (error) {
+    if (error instanceof QuotaRequestError) return reply.code(error.statusCode).send({ error: error.message, quota: error.quota });
+    throw error;
+  }
 });
 
 app.get<{ Params: { id: string }; Querystring: { includeArchived?: string } }>("/api/nodes/:id/workspaces", async (request, reply) => {

@@ -1,6 +1,6 @@
 {
   "name": "@controller-center/web",
-  "version": "0.3.16",
+  "version": "0.3.18",
   "private": true,
   "type": "module",
   "scripts": {

@@ -51,6 +51,42 @@ export interface NodeRecord {
   capabilities?: string[];
 }
 
+/** A node's stored plan-quota read, as the Control Plane serves it to the quota dialog. */
+export interface NodeQuota {
+  nodeId: string;
+  runtime: NodeRecord["runtime"];
+  online: boolean;
+  /** The node's Agent can answer quota reads. */
+  supported: boolean;
+  /** The last successful report, in the runtime's own shape; see node-quota.ts. */
+  report: NodeQuotaReport | null;
+  succeededAt: string | null;
+  attemptedAt: string | null;
+  /** Why the most recent read failed; null when it succeeded. */
+  error: string | null;
+  refreshWaitMs: number;
+  /** The node's Agent can redeem reset credits; only Codex has them. */
+  resetSupported: boolean;
+  /** A reset is running on this node, possibly started from another browser. */
+  resetting: boolean;
+  lastReset: NodeQuotaReset | null;
+}
+
+export interface NodeQuotaReset {
+  creditId: string;
+  /** How the credit was named when it was picked; redeemed credits leave the list. */
+  creditLabel: string | null;
+  requestedAt: string;
+  finishedAt: string | null;
+  /** The runtime's outcome; null while running or when the result is unknown. */
+  outcome: string | null;
+  error: string | null;
+}
+
+export type NodeQuotaReport =
+  | { runtime: "codex"; account: unknown; rateLimits: unknown }
+  | { runtime: "claude"; account: unknown; usage: unknown };
+
 export interface ConversationAttentionUpdate {
   changed: boolean;
   conversationId: string | null; // null means all conversations were read.

@@ -10,6 +10,7 @@ import type {
   ConversationOpenedFile,
   GlobalSettings,
   EnrollmentToken,
+  NodeQuota,
   NodeRecord,
   ReasoningEffort,
   Run,
@@ -224,6 +225,22 @@ export async function deleteNode(nodeId: string, confirmName: string): Promise<v
     method: "DELETE",
     body: JSON.stringify({ confirmName }),
   });
+}
+
+/** Opening reads the node only when the stored result is stale; refresh is cooled down by the server. */
+export async function readNodeQuota(nodeId: string, refresh: boolean): Promise<NodeQuota> {
+  return (await api<{ quota: NodeQuota }>(`/api/nodes/${encodeURIComponent(nodeId)}/quota`, {
+    method: "POST",
+    body: JSON.stringify({ refresh }),
+  })).quota;
+}
+
+/** Redeems one reset credit the user picked and confirmed; the response includes the reread quota. */
+export async function resetNodeQuota(nodeId: string, creditId: string, creditLabel: string): Promise<NodeQuota> {
+  return (await api<{ quota: NodeQuota }>(`/api/nodes/${encodeURIComponent(nodeId)}/quota/reset`, {
+    method: "POST",
+    body: JSON.stringify({ creditId, creditLabel }),
+  })).quota;
 }
 
 export async function listNodeWorkspaces(nodeId: string, includeArchived = true): Promise<Workspace[]> {

@@ -1,6 +1,8 @@
 import type { WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
 import type {
+  AgentQuotaMessage,
+  AgentQuotaResetMessage,
   AgentWorkspaceFileMessage,
   AgentWorkspaceValidationMessage,
   ControlCommandMessage,
@@ -28,6 +30,16 @@ interface PendingWorkspaceFileRead {
   reject: (error: Error) => void;
 }
 
+type AgentReply = AgentQuotaMessage | AgentQuotaResetMessage;
+
+interface PendingAgentRequest {
+  nodeId: string;
+  replyType: AgentReply["type"];
+  timer: NodeJS.Timeout;
+  resolve: (result: AgentReply) => void;
+  reject: (error: Error) => void;
+}
+
 export class AgentConnections {
   onDisconnect: ((nodeId: string) => void) | null = null;
 
@@ -35,6 +47,7 @@ export class AgentConnections {
   private readonly connections = new Map<string, AgentConnection>();
   private readonly workspaceValidations = new Map<string, PendingWorkspaceValidation>();
   private readonly workspaceFileReads = new Map<string, PendingWorkspaceFileRead>();
+  private readonly agentRequests = new Map<string, PendingAgentRequest>();
 
   private rejectWorkspaceValidations(nodeId: string, message: string): void {
     for (const [requestId, pending] of this.workspaceValidations) {
@@ -54,12 +67,26 @@ export class AgentConnections {
     }
   }
 
+  private rejectAgentRequests(nodeId: string, message: string): void {
+    for (const [requestId, pending] of this.agentRequests) {
+      if (pending.nodeId !== nodeId) continue;
+      clearTimeout(pending.timer);
+      pending.reject(new Error(message));
+      this.agentRequests.delete(requestId);
+    }
+  }
+
+  private rejectPendingRequests(nodeId: string, message: string): void {
+    this.rejectWorkspaceValidations(nodeId, message);
+    this.rejectWorkspaceFileReads(nodeId, message);
+    this.rejectAgentRequests(nodeId, message);
+  }
+
   set(nodeId: string, bootId: string, socket: WebSocket, capabilities: readonly string[] = []): void {
     const previous = this.connections.get(nodeId);
     if (previous && previous.socket !== socket) {
       this.onDisconnect?.(nodeId);
-      this.rejectWorkspaceValidations(nodeId, "节点连接已被新的会话替换");
-      this.rejectWorkspaceFileReads(nodeId, "节点连接已被新的会话替换");
+      this.rejectPendingRequests(nodeId, "节点连接已被新的会话替换");
       previous.socket.close(4001, "Replaced by a newer session");
     }
     this.connections.set(nodeId, { socket, bootId, capabilities: new Set(capabilities) });
@@ -70,8 +97,7 @@ export class AgentConnections {
     if (!connection || connection.socket !== socket) return false;
     this.connections.delete(nodeId);
     this.onDisconnect?.(nodeId);
-    this.rejectWorkspaceValidations(nodeId, "节点已离线");
-    this.rejectWorkspaceFileReads(nodeId, "节点已离线");
+    this.rejectPendingRequests(nodeId, "节点已离线");
     return true;
   }
 
@@ -92,8 +118,7 @@ export class AgentConnections {
     if (!connection) return;
     this.connections.delete(nodeId);
     this.onDisconnect?.(nodeId);
-    this.rejectWorkspaceValidations(nodeId, "节点连接已关闭");
-    this.rejectWorkspaceFileReads(nodeId, "节点连接已关闭");
+    this.rejectPendingRequests(nodeId, "节点连接已关闭");
     connection.socket.close(code, reason);
   }
 
@@ -101,8 +126,7 @@ export class AgentConnections {
     for (const [nodeId, connection] of this.connections) {
       this.connections.delete(nodeId);
       this.onDisconnect?.(nodeId);
-      this.rejectWorkspaceValidations(nodeId, "控制中心正在关闭");
-      this.rejectWorkspaceFileReads(nodeId, "控制中心正在关闭");
+      this.rejectPendingRequests(nodeId, "控制中心正在关闭");
       connection.socket.terminate();
     }
   }
@@ -179,6 +203,49 @@ export class AgentConnections {
         reject(new Error("节点当前离线"));
       }
     });
+  }
+
+  /** Sends a request whose answer the Agent tags with the same requestId. */
+  private requestAgent<T extends AgentReply>(
+    nodeId: string,
+    message: (requestId: string) => ControlToAgentMessage,
+    replyType: T["type"],
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<T> {
+    if (!this.has(nodeId)) return Promise.reject(new Error("节点当前离线"));
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.agentRequests.delete(requestId);
+        reject(new Error(timeoutMessage));
+      }, timeoutMs);
+      this.agentRequests.set(requestId, { nodeId, replyType, timer, resolve: resolve as (result: AgentReply) => void, reject });
+      if (!this.send(nodeId, message(requestId))) {
+        clearTimeout(timer);
+        this.agentRequests.delete(requestId);
+        reject(new Error("节点当前离线"));
+      }
+    });
+  }
+
+  readQuota(nodeId: string, timeoutMs: number): Promise<AgentQuotaMessage> {
+    return this.requestAgent(nodeId, (requestId) => ({ type: "control.quotaRead", requestId }), "agent.quota", timeoutMs,
+      `节点未在 ${Math.round(timeoutMs / 1000)} 秒内返回额度信息`);
+  }
+
+  resetQuota(nodeId: string, idempotencyKey: string, creditId: string, timeoutMs: number): Promise<AgentQuotaResetMessage> {
+    return this.requestAgent(nodeId, (requestId) => ({ type: "control.quotaReset", requestId, idempotencyKey, creditId }), "agent.quotaReset",
+      timeoutMs, `节点未在 ${Math.round(timeoutMs / 1000)} 秒内返回重置结果，结果未知`);
+  }
+
+  resolveAgentReply(nodeId: string, message: AgentReply): boolean {
+    const pending = this.agentRequests.get(message.requestId);
+    if (!pending || pending.nodeId !== nodeId || pending.replyType !== message.type) return false;
+    clearTimeout(pending.timer);
+    this.agentRequests.delete(message.requestId);
+    pending.resolve(message);
+    return true;
   }
 
   resolveWorkspaceFileRead(nodeId: string, message: AgentWorkspaceFileMessage): boolean {

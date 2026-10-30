@@ -3,6 +3,8 @@ import type { AgentNodeToolMessage, ControlNodeToolMessage } from './node-tools.
 export const CONTROL_PROTOCOL_VERSION = 5 as const;
 export const WORKSPACE_FILE_READ_CAPABILITY = "workspace_file_read_v1" as const;
 export const FAST_MODE_CAPABILITY = "fast_mode_v1" as const;
+export const QUOTA_READ_CAPABILITY = "quota_read_v1" as const;
+export const QUOTA_RESET_CAPABILITY = "quota_reset_v1" as const;
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -153,6 +155,33 @@ export interface AgentWorkspaceFileMessage {
   size?: number;
   contentBase64?: string;
   errorCode?: WorkspaceFileReadErrorCode;
+  error?: string;
+}
+
+/**
+ * Plan quota exactly as the runtime reported it. The Agent forwards the runtime's
+ * own shapes so the Control Plane and Web can follow format changes without an
+ * Agent release.
+ */
+export type RuntimeQuotaReport =
+  | { runtime: "codex"; account: JsonValue | null; rateLimits: JsonValue | null }
+  | { runtime: "claude"; account: JsonValue | null; usage: JsonValue | null };
+
+export interface AgentQuotaMessage {
+  type: "agent.quota";
+  requestId: string;
+  ok: boolean;
+  report?: RuntimeQuotaReport;
+  error?: string;
+}
+
+/** Redeems one reset credit the user picked; only Codex ChatGPT logins have them. */
+export interface AgentQuotaResetMessage {
+  type: "agent.quotaReset";
+  requestId: string;
+  ok: boolean;
+  /** The runtime's outcome, e.g. Codex `reset`, `nothingToReset`, `noCredit` or `alreadyRedeemed`. */
+  outcome?: string;
   error?: string;
 }
 
@@ -335,6 +364,8 @@ export type AgentToControlMessage =
   | AgentCommandAckMessage
   | AgentWorkspaceValidationMessage
   | AgentWorkspaceFileMessage
+  | AgentQuotaMessage
+  | AgentQuotaResetMessage
   | AgentDurableMessage;
 
 export interface CreateConversationCommand {
@@ -466,6 +497,19 @@ export interface ControlWorkspaceFileReadMessage {
   maxBytes: number;
 }
 
+export interface ControlQuotaReadMessage {
+  type: "control.quotaRead";
+  requestId: string;
+}
+
+export interface ControlQuotaResetMessage {
+  type: "control.quotaReset";
+  requestId: string;
+  /** Reused when retrying an attempt whose result is unknown, so a credit is never spent twice. */
+  idempotencyKey: string;
+  creditId: string;
+}
+
 export interface ControlWorkspaceSyncMessage {
   type: "control.workspaceSync";
   workspaces: ManagedWorkspaceDescriptor[];
@@ -479,6 +523,8 @@ export type ControlToAgentMessage =
   | ControlWorkspaceValidateMessage
   | ControlWorkspaceFileReadMessage
   | ControlWorkspaceSyncMessage
+  | ControlQuotaReadMessage
+  | ControlQuotaResetMessage
   | ControlErrorMessage;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -497,6 +543,8 @@ export function parseAgentMessage(input: string): AgentToControlMessage {
     value.type !== "agent.commandAck" &&
     value.type !== "agent.workspaceValidation" &&
     value.type !== "agent.workspaceFile" &&
+    value.type !== "agent.quota" &&
+    value.type !== "agent.quotaReset" &&
     value.type !== "agent.message"
   ) {
     throw new Error(`Unsupported agent message type: ${value.type}`);
@@ -517,6 +565,8 @@ export function parseControlMessage(input: string): ControlToAgentMessage {
     value.type !== "control.workspaceValidate" &&
     value.type !== "control.workspaceFileRead" &&
     value.type !== "control.workspaceSync" &&
+    value.type !== "control.quotaRead" &&
+    value.type !== "control.quotaReset" &&
     value.type !== "control.error"
   ) {
     throw new Error(`Unsupported control message type: ${value.type}`);

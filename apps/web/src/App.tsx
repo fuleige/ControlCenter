@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { NodeToolButtons } from "./NodeToolButtons";
+import { NodeQuotaDialog } from "./NodeQuotaDialog";
 import { runtimeDefaults, runtimeLabel, supportsFastMode } from "./conversation-options";
 import { OutputSpeed } from "./OutputSpeed";
 import { RuntimeIcon } from "./RuntimeIcon";
@@ -412,6 +413,10 @@ function WorkspaceConcurrencyDialog({
       </section>
     </div>
   );
+}
+
+function GaugeIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4a7 7 0 0 0-5.6 11.2l1.2-.9A5.5 5.5 0 1 1 15.5 11c0 1.2-.4 2.4-1.1 3.3l1.2.9A7 7 0 0 0 10 4Zm3.6 3.4-4.4 3a1.3 1.3 0 1 0 1.7 1.8l2.7-4.8Z" /></svg>;
 }
 
 function PencilIcon() {
@@ -1798,6 +1803,9 @@ function NodePanel({
   const [draftName, setDraftName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [quotaNodeId, setQuotaNodeId] = useState<string | null>(null);
+  const closeQuota = useCallback(() => setQuotaNodeId(null), []);
+  const quotaNode = quotaNodeId ? nodes.find((node) => node.id === quotaNodeId) ?? null : null;
 
   async function saveName(event: FormEvent, node: NodeRecord) {
     event.preventDefault();
@@ -1849,18 +1857,29 @@ function NodePanel({
                 <span className="node-load">{node.activeRuns}/{node.maxConcurrentRuns}</span>
                 {nodeAttention > 0 && <span className="node-unread-badge" aria-label={`${nodeAttention} 个未读会话`}>{nodeAttention > 9 ? "9+" : nodeAttention}</span>}
               </button>
-              <button
-                className="row-action"
-                title="修改节点名称"
-                aria-label={`修改 ${node.name} 的名称`}
-                onClick={() => {
-                  setEditingId(node.id);
-                  setDraftName(node.name);
-                  setError(null);
-                }}
-              >
-                <PencilIcon />
-              </button>
+              <div className="node-row-actions">
+                <button
+                  className="row-action"
+                  title="修改节点名称"
+                  aria-label={`修改 ${node.name} 的名称`}
+                  onClick={() => {
+                    setEditingId(node.id);
+                    setDraftName(node.name);
+                    setError(null);
+                  }}
+                >
+                  <PencilIcon />
+                </button>
+                <button
+                  className="row-action quota-action"
+                  title={node.capabilities?.includes("quota_read_v1") ? "查看额度" : "需升级 Agent 才能查询额度"}
+                  aria-label={`查看 ${node.name} 的额度`}
+                  disabled={!node.capabilities?.includes("quota_read_v1")}
+                  onClick={() => setQuotaNodeId(node.id)}
+                >
+                  <GaugeIcon />
+                </button>
+              </div>
             </div>
             {!collapsed && selectedId === node.id && <NodeToolButtons nodeId={node.id} online={node.status === "online"} />}
             {editingId === node.id && (
@@ -1892,6 +1911,7 @@ function NodePanel({
         )})}
         {nodes.length === 0 && <div className="empty compact">还没有 Agent 注册到控制中心。</div>}
       </div>
+      {quotaNode && <NodeQuotaDialog key={quotaNode.id} node={quotaNode} onClose={closeQuota} />}
       <div className="node-footer">
         <button type="button" onClick={onOpenSwitcher} title="快速切换节点或会话"><SearchIcon /><span>快速切换</span><kbd>⌘K</kbd></button>
         <button className={taskCenterActive ? "active" : ""} type="button" onClick={onOpenTasks} title="全局任务中心"><BellIcon /><span>任务中心</span>{unreadCount > 0 && <b>{unreadCount > 99 ? "99+" : unreadCount}</b>}</button>

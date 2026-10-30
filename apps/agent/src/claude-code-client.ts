@@ -498,6 +498,8 @@ export class ClaudeCodeClient extends EventEmitter implements RuntimeClient {
         return this.interruptTurn(input) as Promise<T>;
       case "model/list":
         return { data: await this.listModels(timeoutMs) } as T;
+      case "claude/usage/read":
+        return this.readUsage(timeoutMs) as Promise<T>;
       default:
         throw new AppServerRpcError(`Claude Code runtime does not support ${method}`, -32601, null);
     }
@@ -1068,6 +1070,20 @@ export class ClaudeCodeClient extends EventEmitter implements RuntimeClient {
   }
 
   private async listModels(timeoutMs: number): Promise<Record<string, unknown>[]> {
+    const models = await this.withIdleQuery("model list", timeoutMs, (query) => query.supportedModels());
+    return models.map(modelCatalogEntry);
+  }
+
+  /** The account and the data behind `/usage`: plan rate-limit windows when the login has them. */
+  private readUsage(timeoutMs: number) {
+    return this.withIdleQuery("usage read", timeoutMs, async (query) => ({
+      account: await query.accountInfo(),
+      usage: await query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
+    }));
+  }
+
+  /** Runs control requests on a Claude Code process that never receives a prompt, so no turn is billed. */
+  private async withIdleQuery<T>(label: string, timeoutMs: number, read: (query: Query) => Promise<T>): Promise<T> {
     const input = new MessageQueue();
     const query = this.sdk!.query({
       prompt: input,
@@ -1081,13 +1097,12 @@ export class ClaudeCodeClient extends EventEmitter implements RuntimeClient {
     });
     let timer: NodeJS.Timeout | null = null;
     try {
-      const models = await Promise.race([
-        query.supportedModels(),
+      return await Promise.race([
+        read(query),
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("Claude Code model list timed out")), timeoutMs);
+          timer = setTimeout(() => reject(new Error(`Claude Code ${label} timed out`)), timeoutMs);
         }),
       ]);
-      return models.map(modelCatalogEntry);
     } finally {
       if (timer) clearTimeout(timer);
       input.close();

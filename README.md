@@ -26,7 +26,7 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 
 - Web 使用随机管理员 Token 登录，服务端建立 HttpOnly 会话；管理员原始 Token 不进入前端构建、Local Storage 或 URL。
 - Web 可生成 10 分钟有效的节点注册 Token；有效期内可在列表查看、复制和确认注册状态，到期自动删除；Agent 首次注册后使用与固定节点 ID 绑定的独立长期凭证。
-- “设置 → 节点接入”按系统和架构展示已准备的 Agent 安装包，选择后可下载，并查看 Agent 版本、文件大小与 SHA-256；当前下载目录提供 v0.3.24 Linux x64/glibc 与 macOS ARM64 包，并保留 v0.3.23 用于回退；用户已于 2026-10-30 反馈 Linux 包实测通过，macOS 包尚待实机验证；安装包不能跨系统使用。普通下载接口沿用管理员登录态，也支持复制一小时有效的安装包专用下载链接；验证范围见[本轮实机反馈](docs/node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。
+- “设置 → 节点接入”按系统和架构展示已准备的 Agent 安装包，选择后可下载，并查看 Agent 版本、文件大小与 SHA-256；当前下载目录提供 v0.3.26 Linux x64/glibc 与 macOS ARM64 包（两者均待实机验证），并保留 v0.3.25 用于回退（用户已于 2026-10-30 确认其额度查询正常）；安装包不能跨系统使用。普通下载接口沿用管理员登录态，也支持复制一小时有效的安装包专用下载链接；验证范围见[本轮实机反馈](docs/node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。
 - Agent 注册、心跳、断线检测和自动重连；凭据被拒绝（未注册、已撤销或节点已删除）时停止重连并以退出码 78 退出。旧共享 Token 仅在显式设置 `AGENT_SHARED_TOKEN` 时兼容。
 - Agent 启动参数必须写明运行时 `codex` 或 `claude`（例如 `./agent.sh start claude`），没有默认值；未写、写错或同时写两个时拒绝启动，且不创建节点状态。Claude 运行时的行为与限制见 [Agent 客户端命令与配置](docs/agent-cli.md#5-claude-code-运行时)。
 - Agent 可在启动时显式传入 `--yolo`，以关闭 Codex 审批和沙箱（Claude 运行时对应 `bypassPermissions`）；节点会把当前权限模式上报给中心，Web 在节点名称旁持续显示“全权限”。
@@ -35,6 +35,8 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 - Web 添加工作空间时由对应 Agent 验证目录存在、可读写并返回规范路径；每次创建会话或新任务前再次验证。
 - 每个会话固定绑定一个工作空间；Agent 更换启动目录后，新目录成为默认，仍被会话使用的旧默认目录作为历史工作空间保留。
 - 节点默认使用主机名，也可以在 Web 中设置持久化显示名称。
+- 节点栏的额度按钮按需查询该节点登录账号的套餐额度：Codex 通过 app-server `account/rateLimits/read`，按窗口时长（5 小时、每周等）命名，不假设 primary/secondary 的含义；Claude 通过 Agent SDK 的 `/usage` 数据（实验接口），优先展示服务端下发的额度行。只有点击时才查询，没有后台轮询或自动重试：成功结果 15 分钟内再次打开直接复用，手动刷新在成功后 1 分钟、失败后 10 秒内不可用（失败后 10 秒内重新打开也只显示失败），同节点并发请求合并为一次。最后有效数据与查询时间存入 Control Plane 数据库，离线节点可查看并标明数据时间；API Key 或云厂商登录显示“没有套餐额度”。需要 Agent v0.3.25 及以上。
+- Codex（ChatGPT 登录）节点的额度弹窗列出额度重置券：可用张数及每张的获得时间、到期时间与状态，按到期先后排列。可自行选择一张点“使用”，确认框默认焦点为“不使用”，回车或 Esc 只会取消；确认后经 app-server `account/rateLimitResetCredit/consume` 兑换，并立即重新查询一次额度（不受刷新冷却限制）。每次尝试的 ID 即幂等号：超时、断线或控制中心重启导致结果未知时，对同一张券重试会沿用原请求，不会重复扣券；同一节点同时只允许一个重置操作。每次重置的券、时间与结果存入 Control Plane 数据库并在弹窗显示。Claude 没有对应接口。需要 Agent v0.3.26 及以上。
 - 节点、工作区、Conversation/Thread 和 Run/Turn 管理；历史会话支持搜索、重命名、置顶、筛选和删除。
 - 多节点、多对话；单个节点默认最多并行 5 个顶层任务。工作区已有任务时由用户确认是否仍要并发，确认后不再强制排队。
 - 新会话在首次发送时原子创建，使用持久化幂等号避免双击、刷新和重试产生重复会话。
@@ -177,7 +179,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可选择并下载匹配系统/CPU 架构/libc 的客户端安装包；该包已经包含编译结果、生产依赖和 PTY 原生模块，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.24-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.26-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent

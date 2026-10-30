@@ -45,6 +45,23 @@ describe("wire protocol", () => {
     }
   });
 
+  it("parses quota read messages", () => {
+    expect(parseControlMessage(JSON.stringify({ type: "control.quotaRead", requestId: "quota-1" })).type).toBe("control.quotaRead");
+    const message = parseAgentMessage(JSON.stringify({
+      type: "agent.quota",
+      requestId: "quota-1",
+      ok: true,
+      report: { runtime: "codex", account: { type: "chatgpt", planType: "plus" }, rateLimits: null },
+    }));
+    expect(message.type).toBe("agent.quota");
+    if (message.type === "agent.quota") expect(message.report?.runtime).toBe("codex");
+    expect(parseControlMessage(JSON.stringify({
+      type: "control.quotaReset", requestId: "reset-1", idempotencyKey: "key-1", creditId: "credit-1",
+    })).type).toBe("control.quotaReset");
+    expect(parseAgentMessage(JSON.stringify({ type: "agent.quotaReset", requestId: "reset-1", ok: true, outcome: "reset" })).type)
+      .toBe("agent.quotaReset");
+  });
+
   it("parses workspace validation messages", () => {
     expect(parseControlMessage(JSON.stringify({
       type: "control.workspaceValidate",

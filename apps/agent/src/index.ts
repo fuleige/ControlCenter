@@ -11,6 +11,8 @@ import {
   NODE_FILES_DIRECT_CAPABILITY,
   WORKSPACE_FILE_READ_CAPABILITY,
   FAST_MODE_CAPABILITY,
+  QUOTA_READ_CAPABILITY,
+  QUOTA_RESET_CAPABILITY,
   isRecord,
   parseControlMessage,
   toJsonValue,
@@ -24,6 +26,7 @@ import {
   type ModelDescriptor,
   type ReasoningEffort,
   type RunErrorCode,
+  type RuntimeQuotaReport,
   type RunProgressPhase,
   type WorkspaceDescriptor,
 } from "@controller-center/protocol";
@@ -48,6 +51,7 @@ import { readWorkspaceFile } from "./workspace-files.js";
 import { agentPackageVersion, requireAgentPackageRuntime } from "./package-runtime.js";
 import { MODEL_CACHE_SCHEMA_VERSION, parseCachedModelCatalog, parseModelCatalog, turnServiceTier } from "./model-catalog.js";
 import { OutputSpeedTracker } from "./output-speed.js";
+import { quotaErrorMessage, readRuntimeQuota, resetRuntimeQuota } from "./runtime-quota.js";
 
 requireAgentPackageRuntime();
 
@@ -899,6 +903,32 @@ async function startTurnForConversation(input: {
   }
 }
 
+let quotaRead: Promise<RuntimeQuotaReport> | null = null;
+
+/** Answers a Control Plane quota request; requests that arrive together share one runtime read. */
+async function handleQuotaRead(requestId: string): Promise<void> {
+  quotaRead ??= readRuntimeQuota(config.runtime, appServer).finally(() => { quotaRead = null; });
+  try {
+    send({ type: "agent.quota", requestId, ok: true, report: await quotaRead });
+  } catch (error) {
+    const message = quotaErrorMessage(config.runtime, error);
+    console.warn(`[agent] quota read failed: ${error instanceof Error ? error.message : String(error)}`);
+    send({ type: "agent.quota", requestId, ok: false, error: message });
+  }
+}
+
+/** Redeems a reset credit; the Control Plane serializes resets per node and owns the idempotency key. */
+async function handleQuotaReset(requestId: string, idempotencyKey: string, creditId: string): Promise<void> {
+  try {
+    const outcome = await resetRuntimeQuota(config.runtime, appServer, idempotencyKey, creditId);
+    console.log(`[agent] quota reset credit ${creditId}: ${outcome}`);
+    send({ type: "agent.quotaReset", requestId, ok: true, outcome });
+  } catch (error) {
+    console.warn(`[agent] quota reset failed: ${error instanceof Error ? error.message : String(error)}`);
+    send({ type: "agent.quotaReset", requestId, ok: false, error: quotaErrorMessage(config.runtime, error, "额度重置") });
+  }
+}
+
 async function executeCommand(commandId: string, command: ControlCommand): Promise<void> {
   await appServer.start();
   switch (command.type) {
@@ -1108,7 +1138,7 @@ function connect(): void {
         maxConcurrentRuns: config.maxConcurrentRuns,
         workspaces: config.workspaces,
         models: availableModels,
-        capabilities: [WORKSPACE_FILE_READ_CAPABILITY, ...(availableModels.some((model) => model.supportsFastMode) ? [FAST_MODE_CAPABILITY] : []), ...(nodeTerminals.available ? [TERMINAL_PTY_CAPABILITY] : []), ...(nodeFiles ? [NODE_FILES_CAPABILITY] : []), ...(nodeFiles?.direct.available ? [NODE_FILES_DIRECT_CAPABILITY] : [])],
+        capabilities: [WORKSPACE_FILE_READ_CAPABILITY, QUOTA_READ_CAPABILITY, ...(config.runtime === "codex" ? [QUOTA_RESET_CAPABILITY] : []), ...(availableModels.some((model) => model.supportsFastMode) ? [FAST_MODE_CAPABILITY] : []), ...(nodeTerminals.available ? [TERMINAL_PTY_CAPABILITY] : []), ...(nodeFiles ? [NODE_FILES_CAPABILITY] : []), ...(nodeFiles?.direct.available ? [NODE_FILES_DIRECT_CAPABILITY] : [])],
       },
     });
   });
@@ -1171,6 +1201,10 @@ function connect(): void {
             suggestedName: path.basename(result.canonicalPath) || result.canonicalPath,
           }),
         });
+      } else if (message.type === "control.quotaRead") {
+        void handleQuotaRead(message.requestId);
+      } else if (message.type === "control.quotaReset") {
+        void handleQuotaReset(message.requestId, message.idempotencyKey, message.creditId);
       } else if (message.type === "control.workspaceFileRead") {
         try {
           const workspace = workspaceFor(message.workspaceId);

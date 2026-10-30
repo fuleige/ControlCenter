@@ -1,6 +1,6 @@
 # Agent 客户端命令与配置
 
-本文档对应 Agent `v0.3.24`，适用于 Linux 和 macOS 上直接运行的 Node Agent。v0.3.23 起日常运行必须写明运行时 `codex` 或 `claude`，没有默认值；Claude 运行时见[第 5 节](#5-claude-code-运行时)。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
+本文档对应 Agent `v0.3.26`，适用于 Linux 和 macOS 上直接运行的 Node Agent。v0.3.23 起日常运行必须写明运行时 `codex` 或 `claude`，没有默认值；Claude 运行时见[第 5 节](#5-claude-code-运行时)。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
 
 `AGENT_DATA_DIR` 不是必填项，省略时使用当前用户的 `~/.controller-center-agent`。它保存节点 ID、注册凭证、可靠队列和附件缓存，必须在注册与后续启动之间保持不变。它不决定 Codex 工作空间：Agent 的启动目录才是默认工作空间。正式使用不建议把状态默认放到当前目录，否则从不同项目启动时可能产生不同节点身份；隔离测试时可以显式指定当前目录下的绝对路径，例如先执行 `export AGENT_DATA_DIR="$PWD/test-data"`。
 
@@ -11,11 +11,11 @@
 也可点击“复制下载链接”，在另一台设备直接用 wget 或 curl 下载，无需复制管理员 Cookie 或 Token。链接只允许下载所选安装包，有效期一小时；Control Plane 重启、安装包更新或移除后也会失效，需重新生成。页面提供“复制 wget 命令”；浏览器拒绝剪贴板操作时，可以从只读输入框手动复制链接。macOS 可使用系统 curl，例如：
 
 ```bash
-curl -fL '粘贴页面复制的下载链接' -o controller-center-agent-v0.3.24-darwin-arm64.tar.gz
+curl -fL '粘贴页面复制的下载链接' -o controller-center-agent-v0.3.26-darwin-arm64.tar.gz
 ```
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.24-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.26-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -26,6 +26,10 @@ sudo mv "$cc_agent_directory" /opt/controller-center-agent
 源码仓库执行 `npm run build` 时会自动生成 `artifacts/controller-center-agent-v<版本>-<系统架构>.tar.gz`；只构建客户端包可执行 `npm run package:agent`。常规构建只生成当前构建机目标的包，并在打包后实际启动 PTY 与调整尺寸。正式 macOS 发布需在 macOS 验证；Linux 包也需要匹配 libc。`BUILD-INFO.json` 记录构建目标、Node.js 与 glibc 版本。下载页同时展示 SHA-256，可在节点上用 `sha256sum`（Linux）或 `shasum -a 256`（macOS）核对。
 
 每次新包成功生成后自动清理同一输出目录的其他版本安装包与源码归档，保留当前 Agent 版本和上一个版本（便于回退）的各系统/架构包；构建失败不删除原包。已有包可执行 `npm run clean:agent-packages` 清理，未生成当前版本安装包时会拒绝清理。`AGENT_PACKAGE_OUTPUT_DIR` 可指定独立输出目录，清理不会跨目录。
+
+v0.3.26 增加 Codex 额度重置券（能力标记 `quota_reset_v1`，仅 Codex 运行时上报，协议仍为 v5）：额度查询改为同时读取重置券明细；收到 Control Plane 的重置请求后，以其给定的幂等号和用户所选券 ID 调用 app-server `account/rateLimitResetCredit/consume`，原样回传结果（`reset`、`nothingToReset`、`noCredit`、`alreadyRedeemed`）。旧版 Codex CLI 不支持时提示升级 Codex。2026-10-30 生成，Linux x64/glibc 包 SHA-256 `4ad950d86037aba1217fe3816b50aca6fa79e2ea05e00591f005f77da679b9d2`（已通过打包 PTY 与 WebRTC 检查），macOS ARM64 包 SHA-256 `0ae19a398c8f77b28ddcf0e7d195f145632e857c0f4bf833f8fbb0764a063eb1`，两者均待实机验证；真实兑换尚未实测。
+
+v0.3.25 增加节点额度查询（能力标记 `quota_read_v1`，协议仍为 v5）：Codex 节点经 app-server 读取账号与 `account/rateLimits/read`，Claude 节点在不发送提示词、不保存会话的 Claude Code 进程上读取账号与 `/usage` 数据；Agent 只转发运行时原始结构并去掉探测会话的费用字段，展示逻辑在 Web。旧版 CLI 不支持时提示升级 Codex 或 Claude Code。2026-10-30 生成，Linux x64/glibc 包 SHA-256 `c02d947d59d8c748791ffcbd026d0bdd6fffdc55aa168b07805def4bb48d6cc4`（已通过打包 PTY 与 WebRTC 检查），macOS ARM64 包 SHA-256 `cf5922978c74448a2ae3efb39a7dca8cf771168cd8fa8329178dc06d713f7003`，两者均待实机验证。升级时保留原工作目录及 `AGENT_DATA_DIR`，无需重新注册。
 
 v0.3.23 增加 Claude Code 运行时并要求显式选择运行时；v0.3.24 起同一数据目录可同时运行 Codex 与 Claude（共用一次注册，Claude 本地状态保存在 `runtimes/claude/`），凭据被拒时停止重连并以退出码 78 退出。2026-10-30 用户反馈 Linux x64/glibc 包（SHA-256 `bbad1bea66ee2e131ac2137b488f7b10e4fd2aa0ed52ff229ab1216b04901980`）实测通过，Codex 与 Claude 同机运行及对话正常；macOS ARM64 包（SHA-256 `7c3a3da6b7d9fb886301deb0c707e54b13908d198a93bbb34aed7f443e89bbf1`）尚未实机验证；升级已有 Codex 节点时在启动命令写上 `codex`（如 `./agent.sh start codex`），注册凭证与数据目录无需变动；未升级的 Codex Agent 仍可连接新版 Control Plane。
 
@@ -42,12 +46,12 @@ npm ci
 npm run package:agent
 ```
 
-构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.24-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
+构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.26-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
 
 将安装包放入下载目录前，在同一台构建机验证实际压缩包：
 
 ```bash
-node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.24-darwin-arm64.tar.gz
+node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.26-darwin-arm64.tar.gz
 ```
 
 此验证针对 v0.3.16 及后续版本：会解压到独立临时目录，检查版本与目标一致性，实际打开两个终端、验证 TTY 和窗口尺寸、关闭一个终端后确认另一个仍可交互，并确认错误目标会在创建节点状态前停止。验证不会注册测试节点或读取已有节点凭证。源码仓库提供手动触发的 `node-tools-verification.yml`，分别在 Linux x64 与 Mac ARM64 上构建、验证并保存对应目标的产物。旧版 v0.3.15 ARM64 测试包由用户在 Mac 通过网页实际打开终端及操作文件验收，不使用依赖新版启动校验模块的验证脚本。

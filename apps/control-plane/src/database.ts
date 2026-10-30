@@ -18,6 +18,7 @@ import type {
   RunFinishedPayload,
   RunStartedPayload,
   RunErrorCode,
+  RuntimeQuotaReport,
   WorkspaceSource,
   WorkspaceStatus,
 } from "@controller-center/protocol";
@@ -47,6 +48,33 @@ export interface NodeRecord {
   workspaces: WorkspaceRecord[];
   models: ModelDescriptor[];
   capabilities?: string[];
+}
+
+/** The last plan-quota read of a node, kept so any browser sees the same data and cooldowns. */
+export interface NodeQuotaRecord {
+  nodeId: string;
+  /** The last successful report; a later failure keeps it. */
+  report: RuntimeQuotaReport | null;
+  succeededAt: string | null;
+  /** When the most recent read finished, successful or not. */
+  attemptedAt: string;
+  /** Why the most recent read failed; null when it succeeded. */
+  error: string | null;
+}
+
+/** One attempt to redeem a reset credit; retries of an unknown result reuse it. */
+export interface NodeQuotaResetRecord {
+  /** Also the idempotency key sent to the runtime. */
+  id: string;
+  nodeId: string;
+  creditId: string;
+  /** How the Web named the credit when it was picked; redeemed credits leave the list. */
+  creditLabel: string | null;
+  requestedAt: string;
+  finishedAt: string | null;
+  /** The runtime's outcome; null while running or when the result is unknown. */
+  outcome: string | null;
+  error: string | null;
 }
 
 export interface WorkspaceRecord {
@@ -319,6 +347,19 @@ function machineEntriesSql(nodeIdSql: string): string {
  */
 const workspaceConversationCountSql = `(SELECT COUNT(*) FROM conversations c WHERE c.workspace_id = w.id
   AND (c.node_id = w.node_id OR (w.source = 'web' AND c.node_id IN (${machineEntriesSql("w.node_id")})))) AS conversation_count`;
+
+function nodeQuotaReset(row: Row): NodeQuotaResetRecord {
+  return {
+    id: text(row, "id"),
+    nodeId: text(row, "node_id"),
+    creditId: text(row, "credit_id"),
+    creditLabel: nullableText(row, "credit_label"),
+    requestedAt: text(row, "requested_at"),
+    finishedAt: nullableText(row, "finished_at"),
+    outcome: nullableText(row, "outcome"),
+    error: nullableText(row, "error"),
+  };
+}
 
 function parseJson(value: unknown): unknown {
   return JSON.parse(String(value));
@@ -646,6 +687,24 @@ export class ControlDatabase {
         revoked_at TEXT
       );
       CREATE INDEX IF NOT EXISTS node_credentials_node_idx ON node_credentials(node_id, revoked_at);
+      CREATE TABLE IF NOT EXISTS node_quotas (
+        node_id TEXT PRIMARY KEY,
+        report_json TEXT,
+        succeeded_at TEXT,
+        attempted_at TEXT NOT NULL,
+        error TEXT
+      );
+      CREATE TABLE IF NOT EXISTS node_quota_resets (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        credit_id TEXT NOT NULL,
+        credit_label TEXT,
+        requested_at TEXT NOT NULL,
+        finished_at TEXT,
+        outcome TEXT,
+        error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS node_quota_resets_node_idx ON node_quota_resets(node_id, requested_at);
     `);
     this.ensureColumn("nodes", "display_name", "TEXT");
     this.ensureColumn("nodes", "model_catalog_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -2498,6 +2557,66 @@ export class ControlDatabase {
     `).run(revokedAt, nodeId).changes);
   }
 
+  getNodeQuota(nodeId: string): NodeQuotaRecord | null {
+    const row = this.sqlite.prepare("SELECT * FROM node_quotas WHERE node_id = ?").get(nodeId) as Row | undefined;
+    if (!row) return null;
+    let report: RuntimeQuotaReport | null = null;
+    try {
+      report = row.report_json === null ? null : parseJson(row.report_json) as RuntimeQuotaReport;
+    } catch {
+      report = null;
+    }
+    return {
+      nodeId,
+      report,
+      succeededAt: nullableText(row, "succeeded_at"),
+      attemptedAt: text(row, "attempted_at"),
+      error: nullableText(row, "error"),
+    };
+  }
+
+  recordNodeQuotaSuccess(nodeId: string, report: RuntimeQuotaReport, at: string): void {
+    this.sqlite.prepare(`
+      INSERT INTO node_quotas (node_id, report_json, succeeded_at, attempted_at, error) VALUES (?, ?, ?, ?, NULL)
+      ON CONFLICT(node_id) DO UPDATE SET
+        report_json = excluded.report_json, succeeded_at = excluded.succeeded_at, attempted_at = excluded.attempted_at, error = NULL
+    `).run(nodeId, JSON.stringify(report), at, at);
+  }
+
+  recordNodeQuotaFailure(nodeId: string, error: string, at: string): void {
+    this.sqlite.prepare(`
+      INSERT INTO node_quotas (node_id, attempted_at, error) VALUES (?, ?, ?)
+      ON CONFLICT(node_id) DO UPDATE SET attempted_at = excluded.attempted_at, error = excluded.error
+    `).run(nodeId, at, error);
+  }
+
+  latestNodeQuotaReset(nodeId: string): NodeQuotaResetRecord | null {
+    const row = this.sqlite.prepare("SELECT * FROM node_quota_resets WHERE node_id = ? ORDER BY requested_at DESC LIMIT 1").get(nodeId) as Row | undefined;
+    return row ? nodeQuotaReset(row) : null;
+  }
+
+  /** The latest attempt on this credit that never got an outcome; retrying must reuse its key. */
+  unresolvedNodeQuotaReset(nodeId: string, creditId: string): NodeQuotaResetRecord | null {
+    const row = this.sqlite.prepare(`
+      SELECT * FROM node_quota_resets WHERE node_id = ? AND credit_id = ? AND outcome IS NULL ORDER BY requested_at DESC LIMIT 1
+    `).get(nodeId, creditId) as Row | undefined;
+    return row ? nodeQuotaReset(row) : null;
+  }
+
+  startNodeQuotaReset(input: { id: string; nodeId: string; creditId: string; creditLabel?: string | null; requestedAt: string }): void {
+    this.sqlite.prepare(`
+      INSERT INTO node_quota_resets (id, node_id, credit_id, credit_label, requested_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        credit_label = COALESCE(excluded.credit_label, credit_label), requested_at = excluded.requested_at,
+        finished_at = NULL, outcome = NULL, error = NULL
+    `).run(input.id, input.nodeId, input.creditId, input.creditLabel ?? null, input.requestedAt);
+  }
+
+  finishNodeQuotaReset(id: string, result: { outcome: string } | { error: string }, at: string): void {
+    this.sqlite.prepare("UPDATE node_quota_resets SET finished_at = ?, outcome = ?, error = ? WHERE id = ?")
+      .run(at, "outcome" in result ? result.outcome : null, "error" in result ? result.error : null, id);
+  }
+
   /** The machine a node-list entry belongs to, or null when the entry does not exist. */
   machineIdOf(nodeId: string): string | null {
     const row = this.sqlite.prepare("SELECT COALESCE(machine_id, id) AS machine_id FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
@@ -2539,7 +2658,7 @@ export class ControlDatabase {
         attachmentStorageKeys = (this.sqlite.prepare(`SELECT storage_key ${nodeAttachments}`).all(...nodeIds) as Row[])
           .map((row) => text(row, "storage_key"));
         this.sqlite.prepare(`DELETE ${nodeAttachments}`).run(...nodeIds);
-        for (const table of ["events", "approvals", "commands", "conversations", "deliveries"]) {
+        for (const table of ["events", "approvals", "commands", "conversations", "deliveries", "node_quotas", "node_quota_resets"]) {
           this.sqlite.prepare(`DELETE FROM ${table} WHERE node_id IN ${entries}`).run(...nodeIds);
         }
         this.sqlite.prepare(`DELETE FROM nodes WHERE id IN ${entries}`).run(...nodeIds);

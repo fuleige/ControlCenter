@@ -40,6 +40,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
       close: () => { void iterator.return?.(); },
       supportedModels: async () => [],
       getContextUsage: async () => ({ totalTokens: 0 }),
+      accountInfo: async () => ({ email: "dev@example.com", subscriptionType: "Claude Pro" }),
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async (opts: unknown) => ({ rate_limits_available: true, requested: opts }),
     });
   },
   getSessionInfo: async (sessionId: string) => sdk.sessions.has(sessionId)
@@ -116,6 +118,16 @@ afterEach(() => {
 });
 
 describe("Claude Code runtime client", () => {
+  it("reads account and plan usage from a process that never receives a prompt", async () => {
+    sdk.script = async function* () {};
+    const { client } = createClient();
+    await expect(client.request("claude/usage/read", {})).resolves.toEqual({
+      account: { email: "dev@example.com", subscriptionType: "Claude Pro" },
+      usage: { rate_limits_available: true, requested: { skipBehaviors: true } },
+    });
+    expect(sdk.options[0]).toMatchObject({ persistSession: false, settingSources: ["user"] });
+  });
+
   it("translates a streamed turn, permission prompts and usage into Codex notifications", async () => {
     const decisions: unknown[] = [];
     sdk.script = async function* (session) {

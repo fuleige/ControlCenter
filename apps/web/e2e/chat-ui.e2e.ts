@@ -2698,3 +2698,173 @@ test("Claude 节点的新会话使用 Claude 默认模型和思考强度", async
   await expect(page.getByRole("combobox", { name: "选择模型" })).toHaveValue("opus");
   await expect(page.getByRole("combobox", { name: "选择思考强度" })).toHaveValue("xhigh");
 });
+
+test("节点额度弹窗只在点击时查询并按服务端冷却禁用刷新", async ({ page }, testInfo) => {
+  await mockControlCenter(page, { unopenedNode: true });
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [{ ...node, capabilities: ["quota_read_v1"] }] } });
+  });
+  const requests: Array<{ refresh?: boolean }> = [];
+  const report = {
+    runtime: "codex",
+    account: { type: "chatgpt", email: "dev@example.com", planType: "prolite" },
+    rateLimits: {
+      ordinaryUsageAllowed: true,
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 3 * 86400 },
+        secondary: { usedPercent: 92, windowDurationMins: 300, resetsAt: Math.floor(Date.now() / 1000) + 2 * 3600 },
+        credits: { hasCredits: false, unlimited: false, balance: "0" },
+      },
+      rateLimitsByLimitId: null,
+    },
+  };
+  const succeededAt = new Date(Date.now() - 3 * 60_000).toISOString();
+  await page.route(`**/api/nodes/${node.id}/quota`, async (route) => {
+    const body = route.request().postDataJSON() as { refresh?: boolean };
+    requests.push(body);
+    const failed = requests.length > 1;
+    await route.fulfill({ json: { quota: {
+      nodeId: node.id, runtime: "codex", online: true, supported: true, report, succeededAt,
+      attemptedAt: failed ? new Date().toISOString() : succeededAt,
+      error: failed ? "Codex 额度查询超时，请稍后重试" : null,
+      refreshWaitMs: failed ? 0 : 42_000,
+    } } });
+  });
+  await page.goto("/");
+  expect(requests).toHaveLength(0);
+  // Narrow layouts open on the selected node's history; go back to the node list.
+  const backToNodes = page.getByRole("button", { name: "返回节点" });
+  if (await backToNodes.isVisible()) await backToNodes.click();
+  await page.locator(".node-row").first().hover();
+  await page.locator(".node-entry").first().screenshot({ path: `test-results/node-quota-row-${testInfo.project.name}.png` });
+  await page.getByRole("button", { name: `查看 ${node.name} 的额度` }).click();
+  const dialog = page.getByRole("dialog", { name: /额度/ });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("dev@example.com · prolite");
+  await expect(dialog.locator(".node-quota-meter-head strong")).toHaveText(["5 小时", "每周"]);
+  await expect(dialog).toContainText("已用 92%");
+  await expect(dialog).toContainText("Credits 余额：0");
+  await expect(dialog).toContainText("最后有效数据");
+  const refresh = dialog.getByRole("button", { name: /刷新/ });
+  await expect(refresh).toBeDisabled();
+  await expect(refresh).toHaveText(/刷新（4\ds）/);
+  expect(requests).toEqual([{ refresh: false }]);
+  await page.screenshot({ path: `test-results/node-quota-${testInfo.project.name}.png` });
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole("button", { name: `查看 ${node.name} 的额度` }).click();
+  await expect(dialog.locator(".node-quota-alert")).toContainText("Codex 额度查询超时");
+  await expect(dialog).toContainText("已用 40%");
+  await expect(refresh).toBeEnabled();
+  await refresh.click();
+  await expect.poll(() => requests).toEqual([{ refresh: false }, { refresh: false }, { refresh: true }]);
+});
+
+test("Codex 重置券需选择并确认，默认焦点为不使用", async ({ page }, testInfo) => {
+  await mockControlCenter(page, { unopenedNode: true });
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [{ ...node, capabilities: ["quota_read_v1", "quota_reset_v1"] }] } });
+  });
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const credits = [
+    { id: "credit-never", resetType: "codexRateLimits", status: "available", grantedAt: nowSeconds - 86400, expiresAt: null, title: "长期重置券", description: null },
+    { id: "credit-soon", resetType: "codexRateLimits", status: "available", grantedAt: nowSeconds - 3600, expiresAt: nowSeconds + 2 * 86400, title: "限时重置券", description: "活动赠送" },
+  ];
+  const quota = (remaining: typeof credits, lastReset: unknown = null) => ({
+    nodeId: node.id, runtime: "codex", online: true, supported: true, resetSupported: true, resetting: false, lastReset,
+    report: {
+      runtime: "codex",
+      account: { type: "chatgpt", email: "dev@example.com", planType: "pro" },
+      rateLimits: {
+        ordinaryUsageAllowed: true,
+        rateLimits: { limitId: "codex", primary: { usedPercent: 97, windowDurationMins: 10080, resetsAt: nowSeconds + 3 * 86400 }, secondary: null },
+        rateLimitsByLimitId: null,
+        rateLimitResetCredits: { availableCount: remaining.length, credits: remaining },
+      },
+    },
+    succeededAt: new Date().toISOString(), attemptedAt: new Date().toISOString(), error: null, refreshWaitMs: 60_000,
+  });
+  await page.route(`**/api/nodes/${node.id}/quota`, (route) => route.fulfill({ json: { quota: quota(credits) } }));
+  const resets: Array<{ creditId?: string; creditLabel?: string }> = [];
+  await page.route(`**/api/nodes/${node.id}/quota/reset`, async (route) => {
+    const body = route.request().postDataJSON() as { creditId?: string; creditLabel?: string };
+    resets.push(body);
+    const finishedAt = new Date().toISOString();
+    await route.fulfill({ json: { quota: quota([credits[1]!], {
+      creditId: "credit-never", creditLabel: body.creditLabel, requestedAt: finishedAt, finishedAt, outcome: "reset", error: null,
+    }) } });
+  });
+
+  await page.goto("/");
+  const backToNodes = page.getByRole("button", { name: "返回节点" });
+  if (await backToNodes.isVisible()) await backToNodes.click();
+  await page.getByRole("button", { name: `查看 ${node.name} 的额度` }).click();
+  const dialog = page.getByRole("dialog", { name: /额度/ });
+  const section = dialog.getByRole("region", { name: /额度重置券/ });
+  await expect(section).toContainText("可用 2 张");
+  // Soonest to expire first.
+  await expect(section.locator(".node-quota-credits strong")).toHaveText(["限时重置券", "长期重置券"]);
+  await expect(section).toContainText("永不过期");
+
+  const useNever = section.locator("li", { hasText: "长期重置券" }).getByRole("button", { name: "使用" });
+  const confirm = page.getByRole("alertdialog", { name: "确认使用这张重置券？" });
+  await useNever.click();
+  await expect(confirm).toBeVisible();
+  await expect(confirm).toContainText("当前用量：每周 97%");
+  await expect(confirm.getByRole("button", { name: "不使用" })).toBeFocused();
+  await page.screenshot({ path: `test-results/node-quota-reset-confirm-${testInfo.project.name}.png` });
+  await page.keyboard.press("Enter");
+  await expect(confirm).toHaveCount(0);
+  await useNever.click();
+  await page.keyboard.press("Escape");
+  await expect(confirm).toHaveCount(0);
+  await expect(dialog).toBeVisible();
+  expect(resets).toEqual([]);
+
+  await useNever.click();
+  await confirm.getByRole("button", { name: "确认使用" }).click();
+  await expect(section).toContainText("长期重置券）：已重置额度");
+  await expect(section).toContainText("可用 1 张");
+  expect(resets).toEqual([{ creditId: "credit-never", creditLabel: "长期重置券" }]);
+  await page.screenshot({ path: `test-results/node-quota-reset-done-${testInfo.project.name}.png` });
+});
+
+test("重置结果未知时按券是否仍在列表给出提示", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "提示文案与布局无关");
+  await mockControlCenter(page, { unopenedNode: true });
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [{ ...node, capabilities: ["quota_read_v1", "quota_reset_v1"] }] } });
+  });
+  const requestedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  const listed = { id: "credit-a", resetType: "codexRateLimits", status: "available", grantedAt: null, expiresAt: null, title: "保留的券", description: null };
+  const quota = (credits: unknown[], succeededAt: string) => ({
+    nodeId: node.id, runtime: "codex", online: true, supported: true, resetSupported: true, resetting: false,
+    lastReset: { creditId: "credit-a", creditLabel: "保留的券", requestedAt, finishedAt: requestedAt, outcome: null, error: "节点未在 30 秒内返回重置结果，结果未知" },
+    report: {
+      runtime: "codex",
+      account: { type: "chatgpt", planType: "pro" },
+      rateLimits: { rateLimits: {}, rateLimitsByLimitId: null, rateLimitResetCredits: { availableCount: credits.length, credits } },
+    },
+    succeededAt, attemptedAt: succeededAt, error: null, refreshWaitMs: 0,
+  });
+  let answer = quota([listed], new Date().toISOString());
+  await page.route(`**/api/nodes/${node.id}/quota`, (route) => route.fulfill({ json: { quota: answer } }));
+  await page.goto("/");
+  const open = page.getByRole("button", { name: `查看 ${node.name} 的额度` });
+  const section = page.getByRole("region", { name: /额度重置券/ });
+  await open.click();
+  await expect(section.locator(".node-quota-alert")).toContainText("对同一张券再次使用会沿用原请求");
+  await page.keyboard.press("Escape");
+
+  answer = quota([], new Date().toISOString());
+  await open.click();
+  await expect(section.locator(".node-quota-alert")).toContainText("这张券已不在可用列表中，可能已兑换成功");
+  await page.keyboard.press("Escape");
+
+  // Data older than the attempt cannot tell whether the credit was spent.
+  answer = quota([], new Date(Date.parse(requestedAt) - 60_000).toISOString());
+  await open.click();
+  await expect(section.locator(".node-quota-alert")).toContainText("对同一张券再次使用会沿用原请求");
+});
