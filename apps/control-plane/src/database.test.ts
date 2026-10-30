@@ -37,6 +37,7 @@ describe("ControlDatabase", () => {
       platform: "linux",
       arch: "x64",
       agentVersion: "0.1.0",
+      runtime: "codex",
       codexVersion: "codex-cli 0.153.0",
       permissionMode: "danger-full-access",
       maxConcurrentRuns: 2,
@@ -55,6 +56,7 @@ describe("ControlDatabase", () => {
     expect(database.listNodes()[0]?.status).toBe("online");
     expect(database.listNodes()[0]?.permissionMode).toBe("danger-full-access");
     expect(database.listNodes()[0]?.models[0]?.id).toBe("gpt-test");
+    expect(database.listNodes()[0]?.runtime).toBe("codex");
     expect(database.getWorkspace("node-1", "repo")?.path).toBe("/repo");
     expect(database.updateNodeName("node-1", "我的构建机", at)).toBe(true);
     expect(database.listNodes()[0]?.name).toBe("我的构建机");
@@ -311,7 +313,7 @@ describe("ControlDatabase", () => {
     database.resolveApproval("approval-1", { decision: "accept" }, at);
     expect(database.getApproval("approval-1")?.status).toBe("resolved");
     expect(database.listNotifications().some((notification) => notification.kind === "waiting_user")).toBe(false);
-    expect(database.updateGlobalSettings({ defaultModel: "gpt-test", defaultEffort: "medium" }, at).defaultModel).toBe("gpt-test");
+    expect(database.updateGlobalSettings({ ...database.getGlobalSettings(), defaultModel: "gpt-test", defaultEffort: "medium" }, at).defaultModel).toBe("gpt-test");
     database.createNotification({ nodeId: "node-1", conversationId: "conversation-1", runId: "run-1", kind: "completed", title: "任务已完成", createdAt: at });
     expect(database.listTaskCenter().some((entry) => entry.unread)).toBe(true);
     expect(database.listTaskCenter()[0]?.replyPreview).toBe("done");
@@ -391,6 +393,7 @@ describe("ControlDatabase", () => {
       platform: "linux",
       arch: "x64",
       agentVersion: "0.2.0",
+      runtime: "codex",
       codexVersion: "codex-cli 0.154.0",
       maxConcurrentRuns: 2,
       models: [],
@@ -401,6 +404,20 @@ describe("ControlDatabase", () => {
     }, "boot-a", firstAt);
     expect(database.listNodes()[0]?.permissionMode).toBe("workspace-write");
     expect(database.getWorkspace(descriptor.id, "default-a")?.isDefault).toBe(true);
+    database.upsertNode({
+      ...descriptor,
+      runtime: "claude",
+      codexVersion: "2.1.310 (Claude Code)",
+      workspaces: [{ id: "default-a", name: "Project A", path: "/projects/a", source: "default", isDefault: true }],
+    }, "boot-a", firstAt);
+    expect(database.listNodes()[0]).toMatchObject({ runtime: "claude", codexVersion: "2.1.310 (Claude Code)" });
+    // Codex Agents released before runtime selection do not report it.
+    const { runtime: _runtime, ...codexAgentBeforeRuntime } = descriptor;
+    database.upsertNode({
+      ...codexAgentBeforeRuntime,
+      workspaces: [{ id: "default-a", name: "Project A", path: "/projects/a", source: "default", isDefault: true }],
+    }, "boot-a", firstAt);
+    expect(database.listNodes()[0]?.runtime).toBe("codex");
 
     const managed = database.createWebWorkspace({
       id: "managed-b",
@@ -488,6 +505,7 @@ describe("ControlDatabase", () => {
       platform: "linux",
       arch: "x64",
       agentVersion: "0.3.7",
+      runtime: "codex",
       codexVersion: "codex-cli 0.154.0",
       permissionMode: "workspace-write",
       maxConcurrentRuns: 1,
@@ -659,6 +677,320 @@ describe("ControlDatabase", () => {
     expect(database.cleanupEnrollmentTokens("2026-09-10T08:09:59.999Z")).toBe(0);
     expect(database.cleanupEnrollmentTokens(expiresAt)).toBe(1);
     expect(database.getEnrollmentToken("enrollment-1")).toBeNull();
+    database.close();
+  });
+
+  it("deletes every runtime entry of a machine with its conversations, history and credentials", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "control-plane-node-delete-test-"));
+    directories.push(directory);
+    const database = new ControlDatabase(path.join(directory, "test.db"), { recoverRuntimeState: false });
+    const at = "2026-10-30T08:00:00.000Z";
+    for (const nodeId of ["node-1", "node-2"]) {
+      database.upsertNode({
+        id: nodeId,
+        name: nodeId,
+        platform: "linux",
+        arch: "x64",
+        agentVersion: "0.3.23",
+        runtime: "codex",
+        codexVersion: "codex-cli 0.164.0",
+        maxConcurrentRuns: 1,
+        workspaces: [{ id: "repo", name: "Repository", path: "/repo", source: "default", isDefault: true }],
+      }, "boot-1", at);
+      database.createConversation({
+        id: `${nodeId}-conversation`,
+        nodeId,
+        workspaceId: "repo",
+        title: "Task",
+        model: null,
+        effort: null,
+        clientRequestId: `${nodeId}-request`,
+        remoteThreadId: `${nodeId}-thread`,
+        status: "ready",
+        error: null,
+        pinnedAt: null,
+        latestRunStatus: null,
+        tokenUsage: null,
+        compaction: null,
+        createdAt: at,
+        updatedAt: at,
+      });
+      database.createRun({
+        id: `${nodeId}-run`,
+        conversationId: `${nodeId}-conversation`,
+        prompt: "Run tests",
+        model: null,
+        effort: null,
+        clientRequestId: `${nodeId}-run-request`,
+        remoteTurnId: null,
+        status: "queued",
+        progressPhase: null,
+        progressLabel: null,
+        progressUpdatedAt: null,
+        recoveryDeadlineAt: null,
+        error: null,
+        errorCode: null,
+        errorDismissedAt: null,
+        createdAt: at,
+        startedAt: null,
+        finishedAt: null,
+      });
+      database.insertUserMessage({ id: `${nodeId}-message`, conversationId: `${nodeId}-conversation`, runId: `${nodeId}-run`, content: "Run tests", createdAt: at });
+      database.insertApproval(nodeId, {
+        type: "interaction.requested",
+        approvalId: `${nodeId}-approval`,
+        conversationId: `${nodeId}-conversation`,
+        runId: `${nodeId}-run`,
+        threadId: `${nodeId}-thread`,
+        turnId: "turn-1",
+        method: "item/commandExecution/requestApproval",
+        requestId: "1",
+        summary: "执行测试命令",
+        risk: "将在本地工作区执行",
+        details: { kind: "command" },
+        requestedAt: at,
+      });
+      database.createNotification({ nodeId, conversationId: `${nodeId}-conversation`, runId: `${nodeId}-run`, kind: "waiting_user", title: "等待你的操作", createdAt: at });
+      database.createCommand(`${nodeId}-command`, nodeId, {
+        type: "run.interrupt",
+        conversationId: `${nodeId}-conversation`,
+        runId: `${nodeId}-run`,
+        threadId: `${nodeId}-thread`,
+        turnId: "turn-1",
+      }, at);
+      database.recordDelivery(nodeId, "boot-1", 1, at);
+      database.createAttachment({
+        id: `${nodeId}-attachment`,
+        conversationId: `${nodeId}-conversation`,
+        messageClientId: `${nodeId}-run-request`,
+        name: "design.png",
+        mediaType: "image/png",
+        size: 4,
+        receivedSize: 4,
+        sha256: "abcd",
+        status: "ready",
+        storageKey: `${nodeId}-attachment.bin`,
+        downloadToken: "download-token",
+        expiresAt: "2026-11-06T08:00:00.000Z",
+        createdAt: at,
+      });
+      database.createEnrollmentToken({
+        id: `${nodeId}-enrollment`,
+        tokenHash: "enrollment-hash",
+        tokenCiphertext: null,
+        createdAt: at,
+        expiresAt: "2026-10-30T08:10:00.000Z",
+        usedAt: null,
+        revokedAt: null,
+        nodeId: null,
+        credentialId: null,
+      });
+      database.consumeEnrollmentToken({
+        id: `${nodeId}-enrollment`,
+        nodeId,
+        credentialId: `${nodeId}-credential`,
+        credentialHash: "credential-hash",
+        usedAt: at,
+      });
+    }
+    // A Claude runtime started from node-1's data directory shares its machine and credential.
+    database.upsertNode({
+      id: "node-1-claude",
+      machineId: "node-1",
+      name: "node-1",
+      platform: "linux",
+      arch: "x64",
+      agentVersion: "0.3.23",
+      runtime: "claude",
+      codexVersion: "2.1.310 (Claude Code)",
+      maxConcurrentRuns: 1,
+      workspaces: [{ id: "repo", name: "Repository", path: "/repo", source: "default", isDefault: true }],
+    }, "boot-2", at);
+    database.createConversation({
+      id: "node-1-claude-conversation",
+      nodeId: "node-1-claude",
+      workspaceId: "repo",
+      title: "Claude task",
+      model: null,
+      effort: null,
+      clientRequestId: "node-1-claude-request",
+      remoteThreadId: null,
+      status: "ready",
+      error: null,
+      pinnedAt: null,
+      latestRunStatus: null,
+      tokenUsage: null,
+      compaction: null,
+      createdAt: at,
+      updatedAt: at,
+    });
+    expect(database.listNodes().find((node) => node.id === "node-1-claude")).toMatchObject({ machineId: "node-1", accessMode: "enrolled" });
+    database.updateNodeName("node-1", "构建机", at);
+    expect(database.listNodes().find((node) => node.id === "node-1-claude")?.name).toBe("构建机");
+    database.updateNodeName("node-1-claude", "构建机 Claude", at);
+    expect(database.listNodes().find((node) => node.id === "node-1-claude")?.name).toBe("构建机 Claude");
+    expect(database.machineIdOf("node-1-claude")).toBe("node-1");
+    expect(database.machineNodeIds("node-1")).toEqual(["node-1", "node-1-claude"]);
+
+    expect(database.countActiveMachineRuns("node-1")).toBe(1);
+    expect(database.deleteMachine("node-1")).toEqual({ nodeIds: ["node-1", "node-1-claude"], attachmentStorageKeys: ["node-1-attachment.bin"] });
+    expect(database.deleteMachine("node-1")).toEqual({ nodeIds: [], attachmentStorageKeys: [] });
+    expect(database.countActiveMachineRuns("node-1")).toBe(0);
+    expect(database.listNodes().map((node) => node.id)).toEqual(["node-2"]);
+    expect(database.getConversation("node-1-claude-conversation")).toBeNull();
+    expect(database.getConversation("node-1-conversation")).toBeNull();
+    expect(database.getRun("node-1-run")).toBeNull();
+    expect(database.getApproval("node-1-approval")).toBeNull();
+    expect(database.getWorkspace("node-1", "repo")).toBeNull();
+    expect(database.listPendingCommands("node-1", true)).toEqual([]);
+    expect(database.getNodeCredential("node-1-credential")).toBeNull();
+    expect(database.nodeHasCredentials("node-1")).toBe(false);
+    expect(database.getEnrollmentToken("node-1-enrollment")).toBeNull();
+    expect(database.listNotifications(true).map((notification) => notification.nodeId)).toEqual(["node-2"]);
+
+    expect(database.getConversation("node-2-conversation")?.nodeId).toBe("node-2");
+    expect(database.getRun("node-2-run")).not.toBeNull();
+    expect(database.getApproval("node-2-approval")).not.toBeNull();
+    expect(database.listPendingCommands("node-2").map((command) => command.id)).toEqual(["node-2-command"]);
+    expect(database.getNodeCredential("node-2-credential")?.nodeId).toBe("node-2");
+    expect(database.listConversationAttachments("node-2-conversation").map((attachment) => attachment.id)).toEqual(["node-2-attachment"]);
+    expect(database.countActiveMachineRuns("node-2")).toBe(1);
+    database.close();
+  });
+
+  it("warns about concurrent work in a directory across the runtimes of one machine only", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "control-plane-machine-workspace-test-"));
+    directories.push(directory);
+    const database = new ControlDatabase(path.join(directory, "test.db"), { recoverRuntimeState: false });
+    const at = "2026-10-30T09:00:00.000Z";
+    const entries = [
+      { id: "machine-1", machineId: "machine-1", runtime: "codex" as const },
+      { id: "machine-1-claude", machineId: "machine-1", runtime: "claude" as const },
+      { id: "machine-2", machineId: "machine-2", runtime: "codex" as const },
+    ];
+    for (const entry of entries) {
+      database.upsertNode({
+        ...entry,
+        name: entry.machineId,
+        platform: "linux",
+        arch: "x64",
+        agentVersion: "0.3.23",
+        codexVersion: "test",
+        maxConcurrentRuns: 1,
+        workspaces: [{ id: "repo", name: "Repository", path: "/repo", source: "default", isDefault: true }],
+      }, `${entry.id}-boot`, at);
+    }
+    database.createConversation({
+      id: "codex-conversation",
+      nodeId: "machine-1",
+      workspaceId: "repo",
+      title: "Codex task",
+      model: null,
+      effort: null,
+      clientRequestId: "codex-request",
+      remoteThreadId: "thread",
+      status: "ready",
+      error: null,
+      pinnedAt: null,
+      latestRunStatus: null,
+      tokenUsage: null,
+      compaction: null,
+      createdAt: at,
+      updatedAt: at,
+    });
+    database.createRun({
+      id: "codex-run",
+      conversationId: "codex-conversation",
+      prompt: "Refactor",
+      model: null,
+      effort: null,
+      clientRequestId: "codex-run-request",
+      remoteTurnId: null,
+      status: "running",
+      progressPhase: null,
+      progressLabel: null,
+      progressUpdatedAt: null,
+      recoveryDeadlineAt: null,
+      error: null,
+      errorCode: null,
+      errorDismissedAt: null,
+      createdAt: at,
+      startedAt: at,
+      finishedAt: null,
+    });
+
+    expect(database.hasActiveRunInWorkspace("machine-1-claude", "repo")).toBe(true);
+    expect(database.hasActiveRunInWorkspace("machine-2", "repo")).toBe(false);
+    expect(database.countActiveMachineRuns("machine-1")).toBe(1);
+    // Runs on a disconnected entry cannot be orphaned by deleting it.
+    database.markNodeOffline("machine-1", at);
+    expect(database.countActiveMachineRuns("machine-1")).toBe(0);
+    database.close();
+  });
+
+  it("shares Web workspaces among the runtimes of a machine while startup directories stay per runtime", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "control-plane-shared-workspace-test-"));
+    directories.push(directory);
+    const database = new ControlDatabase(path.join(directory, "test.db"), { recoverRuntimeState: false });
+    const at = "2026-10-30T10:00:00.000Z";
+    const join = (id: string, machineId: string, runtime: "codex" | "claude", startup: string) => database.upsertNode({
+      id, machineId, runtime, name: machineId, platform: "linux", arch: "x64", agentVersion: "0.3.24",
+      codexVersion: "test", maxConcurrentRuns: 1,
+      workspaces: [{ id: startup.slice(1), name: startup.slice(1), path: startup, source: "default", isDefault: true }],
+    }, `${id}-boot`, at);
+    const listed = (nodeId: string) => database.listWorkspaces(nodeId, true)
+      .map((workspace) => [workspace.id, workspace.source, workspace.archivedAt ? "archived" : "active"]);
+    join("machine-1", "machine-1", "codex", "/codex-dir");
+    join("machine-2", "machine-2", "codex", "/other-machine");
+    database.createWebWorkspace({ id: "web-shared", nodeId: "machine-1", name: "Shared", path: "/shared", now: at });
+    database.createWebWorkspace({ id: "web-claude-dir", nodeId: "machine-1", name: "Claude dir", path: "/claude-dir", now: at });
+
+    // A Claude entry joining later lists the machine's Web workspaces, except a
+    // directory it already lists as its own startup directory.
+    join("machine-1-claude", "machine-1", "claude", "/claude-dir");
+    expect(listed("machine-1-claude")).toEqual([["claude-dir", "default", "active"], ["web-shared", "web", "active"]]);
+    expect(listed("machine-2").map(([id]) => id)).toEqual(["other-machine"]);
+    database.createWebWorkspace({ id: "web-later", nodeId: "machine-1-claude", name: "Later", path: "/later", now: at });
+    expect(listed("machine-1").map(([id]) => id)).toEqual(["codex-dir", "web-claude-dir", "web-later", "web-shared"]);
+    expect(database.listManagedWorkspacesForAgent("machine-1-claude").map((workspace) => workspace.id)).toEqual(["web-later", "web-shared"]);
+
+    // Changes made through either runtime apply to every copy.
+    database.updateWorkspace({ nodeId: "machine-1-claude", id: "web-shared", name: "Renamed", now: at });
+    expect(database.getWorkspace("machine-1", "web-shared")?.name).toBe("Renamed");
+    database.updateWorkspaceValidation("machine-1", "web-shared", false, "missing", at);
+    expect(database.getWorkspace("machine-1-claude", "web-shared")).toMatchObject({ status: "invalid", validationError: "missing" });
+    expect(database.workspaceCopyNodeIds("machine-1", "web-shared")).toEqual(["machine-1", "machine-1-claude"]);
+    expect(database.workspaceCopyNodeIds("machine-1", "codex-dir")).toEqual(["machine-1"]);
+
+    // A conversation of one runtime keeps the shared workspace for both.
+    database.createConversation({
+      id: "claude-conversation", nodeId: "machine-1-claude", workspaceId: "web-shared", title: "Claude task",
+      model: null, effort: null, clientRequestId: "claude-request", remoteThreadId: null, status: "ready", error: null,
+      pinnedAt: null, latestRunStatus: null, tokenUsage: null, compaction: null, createdAt: at, updatedAt: at,
+    });
+    expect(database.getWorkspace("machine-1", "web-shared")?.conversationCount).toBe(1);
+    expect(database.deleteUnusedWorkspace("machine-1", "web-shared")).toBe(false);
+    database.updateWorkspace({ nodeId: "machine-1", id: "web-shared", archived: true, now: at });
+    expect(database.getWorkspace("machine-1-claude", "web-shared")?.archivedAt).toBe(at);
+    expect(database.deleteUnusedWorkspace("machine-1-claude", "web-later")).toBe(true);
+    expect(listed("machine-1").map(([id]) => id)).not.toContain("web-later");
+    expect(listed("machine-1-claude").map(([id]) => id)).not.toContain("web-later");
+    database.close();
+  });
+
+  it("keeps conversation defaults per runtime and starts Claude on Opus at extra-high effort", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "control-plane-runtime-defaults-test-"));
+    directories.push(directory);
+    const database = new ControlDatabase(path.join(directory, "test.db"), { recoverRuntimeState: false });
+    const at = "2026-10-30T10:00:00.000Z";
+    expect(database.getGlobalSettings()).toEqual({
+      defaultModel: null, defaultEffort: null, claudeDefaultModel: "opus", claudeDefaultEffort: "xhigh",
+    });
+    // Clearing a Claude default is kept rather than replaced by the initial one.
+    database.updateGlobalSettings({ defaultModel: "gpt-test", defaultEffort: "high", claudeDefaultModel: null, claudeDefaultEffort: "max" }, at);
+    expect(database.getGlobalSettings()).toEqual({
+      defaultModel: "gpt-test", defaultEffort: "high", claudeDefaultModel: null, claudeDefaultEffort: "max",
+    });
     database.close();
   });
 });

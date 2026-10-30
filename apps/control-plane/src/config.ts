@@ -10,7 +10,8 @@ export interface ControlPlaneConfig {
   port: number;
   dataDirectory: string;
   databasePath: string;
-  agentToken: string;
+  /** Shared token for Agents that predate enrollment; null disables that access path. */
+  agentToken: string | null;
   adminToken: string | null;
   adminTokenPath: string;
   enrollmentDisplayKeyPath: string;
@@ -34,7 +35,9 @@ export function loadConfig(): ControlPlaneConfig {
     port: integerEnv("CONTROL_PORT", 8787),
     dataDirectory,
     databasePath: process.env.CONTROL_DATABASE_PATH ?? path.join(dataDirectory, "control-center.db"),
-    agentToken: process.env.AGENT_SHARED_TOKEN ?? "dev-agent-token",
+    // There is no default: an unset token must not leave a publicly known value
+    // able to register nodes.
+    agentToken: process.env.AGENT_SHARED_TOKEN?.trim() || null,
     adminToken: process.env.ADMIN_TOKEN || null,
     adminTokenPath: process.env.ADMIN_TOKEN_FILE ?? path.join(dataDirectory, "secrets", "admin-token"),
     enrollmentDisplayKeyPath: process.env.ENROLLMENT_DISPLAY_KEY_FILE ?? path.join(dataDirectory, "secrets", "enrollment-display-key"),

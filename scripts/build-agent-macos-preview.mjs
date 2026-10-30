@@ -116,7 +116,7 @@ try {
   chmodSync(finalArtifact, 0o644);
   const sha256 = createHash("sha256").update(readFileSync(finalArtifact)).digest("hex");
   const cleanup = cleanupAgentPackages(artifactDirectory, version);
-  process.stdout.write(`macOS ARM64 test package: ${finalArtifact}\nSize: ${statSync(finalArtifact).size} bytes\nSHA-256: ${sha256}\nRemoved previous Agent packages: ${cleanup.removed.length}\nNative runtime verification: pending macOS test\n`);
+  process.stdout.write(`macOS ARM64 test package: ${finalArtifact}\nSize: ${statSync(finalArtifact).size} bytes\nSHA-256: ${sha256}\nKept rollback version: ${cleanup.previousVersion ? `v${cleanup.previousVersion}` : 'none'}\nRemoved older Agent packages: ${cleanup.removed.length}\nNative runtime verification: pending macOS test\n`);
 } finally {
   rmSync(temporaryArtifact, { force: true });
   rmSync(temporary, { recursive: true, force: true });

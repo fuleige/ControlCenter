@@ -22,7 +22,7 @@ function fixture() {
   const database = new ControlDatabase(filename);
   databases.push(database);
   database.upsertNode({
-    id: "node", name: "Host", platform: "linux", arch: "x64", agentVersion: "0.1.0",
+    id: "node", name: "Host", platform: "linux", arch: "x64", agentVersion: "0.1.0", runtime: "codex",
     codexVersion: "test", permissionMode: "workspace-write", maxConcurrentRuns: 5,
     workspaces: [{ id: "repo", name: "Repo", path: "/repo", source: "default", isDefault: true }], models: [],
   }, "boot", at);

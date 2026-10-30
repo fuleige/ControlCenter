@@ -13,6 +13,7 @@ describe("wire protocol", () => {
         platform: "linux",
         arch: "x64",
         agentVersion: "0.1.0",
+        runtime: "codex",
         codexVersion: "codex-cli 0.153.0",
         permissionMode: "danger-full-access",
         maxConcurrentRuns: 2,

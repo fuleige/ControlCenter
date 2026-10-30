@@ -38,6 +38,7 @@ import {
   type AppServerRequest,
   type RpcRequestId,
 } from "./app-server-client.js";
+import { ClaudeCodeClient, classifyClaudeCodeError, type RuntimeClient } from "./claude-code-client.js";
 import { NodeTerminals } from "./node-terminals.js";
 import { NodeFiles } from "./node-files.js";
 import { loadConfig } from "./config.js";
@@ -103,10 +104,24 @@ interface ModelListResult {
   data?: unknown[];
 }
 
-const config = loadConfig();
+function loadConfigOrExit(): ReturnType<typeof loadConfig> {
+  try {
+    return loadConfig();
+  } catch (error) {
+    console.error(`[agent] 启动配置无效：${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+}
+
+const config = loadConfigOrExit();
 const bootId = randomUUID();
-const state = new AgentStateStore(config.dataDirectory);
-const appServer = new AppServerClient(config.codexBinary, config.yolo, config.dataDirectory);
+const state = new AgentStateStore(config.stateDirectory);
+const appServer: RuntimeClient = config.runtime === "claude"
+  ? new ClaudeCodeClient(config.claudeBinary, config.yolo, config.stateDirectory)
+  : new AppServerClient(config.codexBinary, config.yolo, config.stateDirectory);
+// User-facing name of the local CLI this Agent drives.
+const runtimeLabel = config.runtime === "claude" ? "Claude" : "Codex";
+const classifyRuntimeError = config.runtime === "claude" ? classifyClaudeCodeError : classifyAppServerError;
 const outboundNetwork = new OutboundNetwork(config.codexProxyOnly);
 const conversationByThread = new Map<string, string>();
 const loadedThreads = new Set<string>();
@@ -154,7 +169,7 @@ function timestamp(): string {
 function codexVersion(): string {
   if (detectedCodexVersion !== null) return detectedCodexVersion;
   try {
-    detectedCodexVersion = execFileSync(config.codexBinary, ["--version"], { encoding: "utf8" }).trim();
+    detectedCodexVersion = execFileSync(config.runtime === "claude" ? config.claudeBinary : config.codexBinary, ["--version"], { encoding: "utf8" }).trim();
   } catch {
     detectedCodexVersion = "unavailable";
   }
@@ -221,7 +236,7 @@ function nestedString(value: unknown, objectKey: string, key: string): string | 
 const MODEL_CACHE_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 function readModelCache(): { models: ModelDescriptor[]; fresh: boolean } | null {
-  const cachePath = path.join(config.dataDirectory, "model-cache.json");
+  const cachePath = path.join(config.stateDirectory, "model-cache.json");
   if (!existsSync(cachePath)) return null;
   try {
     const cached = parseCachedModelCatalog(JSON.parse(readFileSync(cachePath, "utf8")), codexVersion());
@@ -237,7 +252,7 @@ function readModelCache(): { models: ModelDescriptor[]; fresh: boolean } | null 
 }
 
 function writeModelCache(models: ModelDescriptor[]): void {
-  writeFileSync(path.join(config.dataDirectory, "model-cache.json"), `${JSON.stringify({
+  writeFileSync(path.join(config.stateDirectory, "model-cache.json"), `${JSON.stringify({
     schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
     codexVersion: codexVersion(),
     fetchedAt: timestamp(),
@@ -364,7 +379,7 @@ function handleNotification(notification: AppServerNotification): void {
   }
 
   if (notification.method === "error") {
-    const classified = classifyAppServerError(notification.params);
+    const classified = classifyRuntimeError(notification.params);
     if (context.run) {
       if (classified.willRetry) {
         reportProgress(context.run, "retrying", classified.retryMessage);
@@ -432,9 +447,9 @@ function handleNotification(notification: AppServerNotification): void {
     const turn = isRecord(notification.params) && isRecord(notification.params.turn) ? notification.params.turn : undefined;
     const classified = context.run.lastError
       ?? (status === "failed" && turn && isRecord(turn.error)
-        ? classifyAppServerError({ error: turn.error, willRetry: false })
+        ? classifyRuntimeError({ error: turn.error, willRetry: false })
         : status === "failed"
-          ? { code: "unknown" as const, message: "Codex 任务执行失败，未返回具体原因" }
+          ? { code: "unknown" as const, message: `${runtimeLabel} 任务执行失败，未返回具体原因` }
           : undefined);
     emitDurable({
       type: "run.finished",
@@ -454,11 +469,11 @@ function handleNotification(notification: AppServerNotification): void {
     const turn = isRecord(notification.params) && isRecord(notification.params.turn) ? notification.params.turn : undefined;
     const classified = context.compaction.lastError
       ?? (statusValue === "failed" && turn && isRecord(turn.error)
-        ? classifyAppServerError({ error: turn.error, willRetry: false })
+        ? classifyRuntimeError({ error: turn.error, willRetry: false })
         : statusValue === "interrupted"
           ? { code: "unknown" as const, message: "上下文压缩已中止" }
           : statusValue !== "completed"
-            ? { code: "unknown" as const, message: "上下文压缩失败，Codex 未返回具体原因" }
+            ? { code: "unknown" as const, message: `上下文压缩失败，${runtimeLabel} 未返回具体原因` }
             : undefined);
     const usage = context.threadId ? tokenUsageByThread.get(context.threadId) : null;
     emitDurable({
@@ -513,7 +528,7 @@ function interactionPresentation(request: AppServerRequest): { summary: string; 
   }
   if (request.method === "item/fileChange/requestApproval") {
     return {
-      summary: "允许 Codex 修改工作区文件",
+      summary: `允许 ${runtimeLabel} 修改工作区文件`,
       risk: oneLine(params.reason, "修改只发生在当前节点的所选工作区。"),
       details: { kind: "fileChange" },
     };
@@ -536,11 +551,11 @@ function interactionPresentation(request: AppServerRequest): { summary: string; 
         options,
       };
     }) : [];
-    return { summary: "Codex 需要你补充信息", details: toJsonValue({ kind: "userInput", questions }) };
+    return { summary: `${runtimeLabel} 需要你补充信息`, details: toJsonValue({ kind: "userInput", questions }) };
   }
   if (request.method === "item/permissions/requestApproval") {
     return {
-      summary: "Codex 请求额外权限",
+      summary: `${runtimeLabel} 请求额外权限`,
       risk: oneLine(params.reason, "请确认该权限是否是完成当前任务所必需的。"),
       details: toJsonValue({ kind: "permissions", permissions: params.permissions ?? {} }),
     };
@@ -557,7 +572,7 @@ function interactionPresentation(request: AppServerRequest): { summary: string; 
     };
   }
   return {
-    summary: "Codex 需要你的确认",
+    summary: `${runtimeLabel} 需要你的确认`,
     risk: "请仅在确认当前任务需要该操作时继续。",
     details: { kind: "confirmation" },
   };
@@ -600,7 +615,7 @@ function handleServerRequest(request: AppServerRequest): void {
 
 appServer.on("notification", (notification: AppServerNotification) => handleNotification(notification));
 appServer.on("serverRequest", (request: AppServerRequest) => handleServerRequest(request));
-appServer.on("stderr", (message: string) => process.stderr.write(`[codex] ${message}`));
+appServer.on("stderr", (message: string) => process.stderr.write(`[${config.runtime}] ${message}`));
 appServer.on("clientError", (error: Error) => console.error("[agent] app-server error", error.message));
 appServer.on("exit", (error: Error) => {
   loadedThreads.clear();
@@ -698,10 +713,10 @@ async function compactConversation(command: Extract<ControlCommand, { type: "con
     activeCompactionsByThread.delete(command.threadId);
     if (compaction.turnId) activeCompactionsByTurn.delete(compaction.turnId);
     if (error instanceof AppServerRpcError && error.code === -32601) {
-      throw categorizedError("当前节点的 Codex 版本不支持手动压缩，请升级 Codex 后重试", "invalid_request");
+      throw categorizedError(`当前节点的 ${runtimeLabel} 版本不支持手动压缩，请升级 ${runtimeLabel} 后重试`, "invalid_request");
     }
     if (error instanceof AppServerRpcError) {
-      const classified = classifyAppServerError(isRecord(error.data)
+      const classified = classifyRuntimeError(isRecord(error.data)
         ? error.data
         : { error: { message: error.message }, willRetry: false });
       throw categorizedError(classified.message, classified.code);
@@ -776,7 +791,7 @@ function attachmentDownloadUrl(attachment: AttachmentDescriptor): string {
 
 async function prepareAttachmentInputs(attachments: AttachmentDescriptor[] = []): Promise<AppServerUserInput[]> {
   if (attachments.length === 0) return [];
-  const directory = path.join(config.dataDirectory, "attachments");
+  const directory = path.join(config.stateDirectory, "attachments");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const inputs: AppServerUserInput[] = [];
   for (const attachment of attachments) {
@@ -808,7 +823,7 @@ async function prepareAttachmentInputs(attachments: AttachmentDescriptor[] = [])
 }
 
 function cleanupAttachmentCache(): void {
-  const directory = path.join(config.dataDirectory, "attachments");
+  const directory = path.join(config.stateDirectory, "attachments");
   if (!existsSync(directory)) return;
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const name of readdirSync(directory)) {
@@ -1082,10 +1097,12 @@ function connect(): void {
       bootId,
       node: {
         id: config.nodeId,
+        machineId: config.machineId,
         name: config.nodeName,
         platform: os.platform(),
         arch: os.arch(),
         agentVersion: AGENT_VERSION,
+        runtime: config.runtime,
         codexVersion: codexVersion(),
         permissionMode: config.yolo ? "danger-full-access" : "workspace-write",
         maxConcurrentRuns: config.maxConcurrentRuns,
@@ -1190,13 +1207,21 @@ function connect(): void {
     if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
     reconnectStabilityTimer = null;
     if (shuttingDown) return;
+    if (code === 4401) {
+      // Unregistered, revoked or deleted: retrying cannot succeed, and stopping
+      // also ends any turn that would otherwise keep running unattended.
+      console.error(
+        "[agent] 控制中心拒绝了节点凭据（未注册、已撤销或节点已被删除）。Agent 已停止，不再重连；"
+          + "如需重新接入，请在 Web 生成注册 Token，执行 agent.sh login 后重新启动",
+      );
+      shutdownAndExit(CREDENTIAL_REJECTED_EXIT_CODE);
+      return;
+    }
     const baseDelay = Math.min(30_000, 1_000 * 2 ** reconnectAttempt++);
     const delay = baseDelay + Math.floor(Math.random() * 500);
     const diagnostic = code === 4400
       ? `Agent 使用 control-protocol/v${CONTROL_PROTOCOL_VERSION}，请升级并重启 Control Plane 后再连接`
-      : code === 4401
-        ? "节点凭据无效或已撤销，请在 Web 重新生成注册 Token 并执行 agent.sh login"
-        : code === 4403
+      : code === 4403
           ? "节点身份与注册凭据不匹配，请确认 login 和 start 使用相同的 AGENT_DATA_DIR"
           : null;
     console.warn(
@@ -1222,27 +1247,31 @@ function shutdown(): void {
   state.close();
 }
 
-function shutdownAndExit(): void {
+/** EX_CONFIG; the systemd unit's RestartPreventExitStatus keeps a rejected node stopped. */
+const CREDENTIAL_REJECTED_EXIT_CODE = 78;
+
+function shutdownAndExit(exitCode = 0): void {
   if (shuttingDown) return;
   shutdown();
   // PTY foreground cleanup includes bounded ps checks and a delayed SIGKILL.
   // Keep both service-stop and interactive-stop paths alive long enough to finish.
-  setTimeout(() => process.exit(0), 4_000);
+  setTimeout(() => process.exit(exitCode), 4_000);
 }
-process.on("SIGINT", shutdownAndExit);
-process.on("SIGTERM", shutdownAndExit);
+process.on("SIGINT", () => shutdownAndExit());
+process.on("SIGTERM", () => shutdownAndExit());
 
 console.log(`[agent] node ${config.nodeName} (${config.nodeId})`);
+console.log(`[agent] runtime: ${config.runtime === "claude" ? "Claude Code" : "Codex"} (${codexVersion()})`);
 console.log(`[agent] workspaces: ${config.workspaces.map((workspace) => `${workspace.name}=${workspace.path}`).join(", ")}`);
-if (config.yolo) console.warn("[agent] 全权限模式已启用：Codex 命令不经过审批或沙箱隔离");
+if (config.yolo) console.warn(`[agent] 全权限模式已启用：${runtimeLabel} 命令不经过审批或沙箱隔离`);
 if (config.codexProxyOnly) {
-  console.log(`[agent] 代理模式：仅 Codex 使用系统代理${hasProxyEnvironment() ? "" : "（当前未检测到代理环境变量）"}`);
+  console.log(`[agent] 代理模式：仅 ${runtimeLabel} 使用系统代理${hasProxyEnvironment() ? "" : "（当前未检测到代理环境变量）"}`);
 }
 
 async function bootstrap(): Promise<void> {
   await nodeTerminals.initialize();
   if (process.platform === "linux" || process.platform === "darwin") {
-    try { nodeFiles = new NodeFiles(config.dataDirectory, defaultDirectory, outboundNetwork, config.controlUrl, emitNodeTool, Number(process.env.NODE_FILE_CONCURRENCY) || 2); }
+    try { nodeFiles = new NodeFiles(config.stateDirectory, defaultDirectory, outboundNetwork, config.controlUrl, emitNodeTool, Number(process.env.NODE_FILE_CONCURRENCY) || 2); }
     catch (error) { console.warn("[agent] node files unavailable:", error instanceof Error ? error.message : "初始化失败"); }
     await nodeFiles?.direct.initialize();
   }

@@ -18,7 +18,8 @@ Controller Center Agent
 
 用法：
   ./agent.sh login [控制中心地址] [注册参数]
-  ./agent.sh start [快捷参数] [Agent 参数]
+  ./agent.sh start <codex|claude> [快捷参数] [Agent 参数]
+  ./agent.sh <codex|claude> [快捷参数] [Agent 参数]    # 等同于 start
   ./agent.sh status
   ./agent.sh version
   ./agent.sh help
@@ -26,17 +27,27 @@ Controller Center Agent
 默认行为：
   login 默认连接 https://c.llmdev.cn，并自动传入 --codex-proxy-only。
   start 自动传入 --yolo --codex-proxy-only。
+  start 必须选择 codex 或 claude，没有默认值。
+  同一台机器可同时运行 codex 和 claude（各开一个终端或服务），共用一次注册；
+  节点列表中各显示一个节点，撤销或删除时作用于整台机器。
 
-自动参数对照：
-  命令                                 实际 Agent 行为
-  ./agent.sh start                     --yolo --codex-proxy-only
-  ./agent.sh start --safe              --codex-proxy-only
-  ./agent.sh start --all-proxy         --yolo
-  ./agent.sh start --safe --all-proxy  不自动传入以上两个参数
+自动参数对照（以 claude 为例，codex 同理）：
+  命令                                        实际 Agent 行为
+  ./agent.sh start claude                     claude --yolo --codex-proxy-only
+  ./agent.sh start claude --safe              claude --codex-proxy-only
+  ./agent.sh start claude --all-proxy         claude --yolo
+  ./agent.sh start claude --safe --all-proxy  claude
+
+必选运行时（二选一）：
+  codex
+      驱动本机已登录的 Codex CLI（codex app-server）。
+  claude
+      驱动本机已登录的 Claude Code CLI（claude），通过 Claude Agent SDK 调用。
 
 快捷参数：
   --safe
-      不传入 --yolo，保留 Codex 审批和工作空间沙箱。
+      不传入 --yolo，保留审批。Codex 使用工作空间沙箱；Claude 自动允许
+      工作区内的文件修改，命令和其他工具需在 Web 确认。
 
   --all-proxy（别名：--via-proxy）
       不传入 --codex-proxy-only。注册、WSS 控制通道和附件请求按照
@@ -45,10 +56,11 @@ Controller Center Agent
 
 底层参数说明：
   --yolo
-      Codex 使用 approvalPolicy=never 和 dangerFullAccess；Web 显示“全权限”。
+      Codex 使用 approvalPolicy=never 和 dangerFullAccess；Claude 使用
+      bypassPermissions。Web 显示“全权限”。
 
   --codex-proxy-only
-      注册、WSS 控制通道和附件请求强制直连；Codex App Server 仍继承
+      注册、WSS 控制通道和附件请求强制直连；Codex 或 Claude Code 子进程仍继承
       当前进程的代理环境变量。这不是清空全部代理环境变量。
 
 常见示例：
@@ -58,21 +70,24 @@ Controller Center Agent
   # 使用其他控制中心注册
   ./agent.sh login https://control.example.com
 
-  # 日常启动：全权限；控制中心直连；Codex 可使用系统代理
-  ./agent.sh start
+  # 日常启动：驱动 Codex；全权限；控制中心直连；Codex 可使用系统代理
+  ./agent.sh start codex
 
-  # 安全模式：启用审批与工作空间沙箱；控制中心仍直连
-  ./agent.sh start --safe
+  # 驱动 Claude Code；全权限；控制中心直连（简写 ./agent.sh claude）
+  ./agent.sh start claude
 
-  # 全部网络都遵循系统代理/NO_PROXY；Codex 仍为全权限
-  ./agent.sh start --all-proxy
+  # 安全模式：保留审批；控制中心仍直连
+  ./agent.sh start codex --safe
+
+  # 全部网络都遵循系统代理/NO_PROXY；仍为全权限
+  ./agent.sh start claude --all-proxy
 
   # 安全模式，并让控制中心也遵循系统代理/NO_PROXY
-  ./agent.sh start --safe --all-proxy
+  ./agent.sh start codex --safe --all-proxy
 
   # 把指定项目作为默认工作空间
   cd /path/to/project
-  /opt/controller-center-agent/agent.sh start
+  /opt/controller-center-agent/agent.sh start claude
 
   # 查看是否注册、控制中心地址及进程状态
   ./agent.sh status
@@ -164,11 +179,16 @@ run_start() {
   local use_direct=true
   local explicit_yolo=false
   local explicit_direct=false
+  local has_runtime=false
   local -a forwarded=()
   while (($# > 0)); do
     case "$1" in
       --safe)
         safe=true
+        ;;
+      codex|claude)
+        has_runtime=true
+        forwarded+=("$1")
         ;;
       --all-proxy|--via-proxy)
         use_direct=false
@@ -188,6 +208,12 @@ run_start() {
     shift
   done
 
+  if [[ "$has_runtime" == false ]]; then
+    echo "错误：请选择节点运行时，没有默认值：" >&2
+    echo "  ./agent.sh start codex    # 驱动本机 Codex CLI" >&2
+    echo "  ./agent.sh start claude   # 驱动本机 Claude Code CLI" >&2
+    exit 1
+  fi
   if [[ "$safe" == true && "$explicit_yolo" == true ]]; then
     echo "错误：--safe 与 --yolo 不能同时使用。" >&2
     exit 1
@@ -233,7 +259,17 @@ show_status() {
     running="$(pgrep -f "$agent_dir/dist/index.js" || true)"
   fi
   if [[ -n "$running" ]]; then
-    echo "运行状态：运行中（PID ${running//$'\n'/, }）"
+    local summary="" pid args label
+    for pid in $running; do
+      args=" $(ps -o args= -p "$pid" 2>/dev/null || true) "
+      case "$args" in
+        *" claude "*) label="Claude" ;;
+        *" codex "*) label="Codex" ;;
+        *) label="未知运行时" ;;
+      esac
+      summary+="${summary:+；}${label}（PID ${pid}）"
+    done
+    echo "运行状态：运行中 · ${summary}"
   else
     echo "运行状态：未运行"
   fi
@@ -253,6 +289,9 @@ case "$command_name" in
     ;;
   start)
     run_start "$@"
+    ;;
+  codex|claude)
+    run_start "$command_name" "$@"
     ;;
   status)
     show_status

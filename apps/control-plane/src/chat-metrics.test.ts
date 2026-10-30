@@ -19,7 +19,7 @@ function fixture() {
   const filename = path.join(directory, "test.db");
   const database = new ControlDatabase(filename, { recoverRuntimeState: false });
   databases.push(database);
-  database.upsertNode({ id: "node", name: "Host", platform: "linux", arch: "x64", agentVersion: "test", codexVersion: "test",
+  database.upsertNode({ id: "node", name: "Host", platform: "linux", arch: "x64", agentVersion: "test", runtime: "codex", codexVersion: "test",
     maxConcurrentRuns: 2, workspaces: [], capabilities: ["fast_mode_v1"] }, "boot", at);
   database.createConversation({ id: "chat", nodeId: "node", workspaceId: "repo", title: "Chat", model: "test", effort: null, fastMode: true,
     clientRequestId: null, remoteThreadId: "thread", status: "ready", error: null, pinnedAt: null, latestRunStatus: null,

@@ -15,8 +15,10 @@ import {
   type ReactNode,
 } from "react";
 import { NodeToolButtons } from "./NodeToolButtons";
-import { supportsFastMode } from "./conversation-options";
+import { runtimeDefaults, runtimeLabel, supportsFastMode } from "./conversation-options";
 import { OutputSpeed } from "./OutputSpeed";
+import { RuntimeIcon } from "./RuntimeIcon";
+import { groupNodeMachines, machineRuntimeLabels, mergeMachineWorkspaces, type MachineWorkspace, type NodeMachine } from "./node-machines";
 import { agentPackageTargetLabel, macOSPackageVerification, selectAgentPackage } from "./agent-package-ui";
 const NodeToolsPage = lazy(() => import("./NodeToolsPage"));
 import "./node-tools.css";
@@ -38,6 +40,7 @@ import {
   dismissTaskError,
   createEnrollmentToken,
   createNodeWorkspace,
+  deleteNode,
   deleteNodeWorkspace,
   createAttachmentUpload,
   deleteAttachmentUpload,
@@ -1815,7 +1818,7 @@ function NodePanel({
     <aside className="pane nodes-pane">
       <div className="brand">
         <div className="brand-mark">CC</div>
-        <div className="brand-copy"><strong>Controller Center</strong><span>Codex 节点控制台</span></div>
+        <div className="brand-copy"><strong>Controller Center</strong><span>Codex / Claude 节点控制台</span></div>
       </div>
       <button
         className="sidebar-toggle node-toggle"
@@ -1834,11 +1837,14 @@ function NodePanel({
           <div className={`node-entry ${!collapsed && selectedId === node.id ? "node-entry-with-tools" : ""}`} key={node.id}>
             <div className="node-row">
               <button className={`node-card ${selectedId === node.id ? "selected" : ""}`} onClick={() => onSelect(node)}>
-                <span className={`node-identity ${node.permissionMode === "danger-full-access" ? "full-access" : ""}`} title={`${node.name}${node.permissionMode === "danger-full-access" ? " · 全权限" : ""}`}>{nodeShortLabel(node.name)}</span>
+                <span className={`node-identity ${node.permissionMode === "danger-full-access" ? "full-access" : ""}`} title={`${node.name} · ${runtimeLabel(node)}${node.accessMode === "revoked" ? " · 已撤销" : ""}${node.permissionMode === "danger-full-access" ? " · 全权限" : ""}`}>{nodeShortLabel(node.name)}<span className="node-identity-runtime"><RuntimeIcon runtime={node.runtime} size={10} /></span></span>
                 <span className={`presence ${node.status}`} />
                 <span className="node-main">
-                  <span className="node-title"><strong>{node.name}</strong>{node.permissionMode === "danger-full-access" && <em className="node-permission-badge" title="此节点启动时启用了 --yolo，不经过审批或 Codex 沙箱">全权限</em>}</span>
-                  <small>{node.platform} · {node.arch}</small>
+                  <span className="node-title"><strong>{node.name}</strong>
+                    {node.accessMode === "revoked" && <em className="node-revoked-badge" title="接入凭证已撤销，Agent 无法再连接；可在设置 → 节点接入中删除该节点">已撤销</em>}
+                    {node.accessMode !== "revoked" && node.permissionMode === "danger-full-access" && <em className="node-permission-badge" title={`此节点启动时启用了 --yolo，${runtimeLabel(node)} 操作不经过审批或沙箱`}>全权限</em>}
+                  </span>
+                  <small><RuntimeIcon runtime={node.runtime} />{runtimeLabel(node)} · {node.platform} · {node.arch}</small>
                 </span>
                 <span className="node-load">{node.activeRuns}/{node.maxConcurrentRuns}</span>
                 {nodeAttention > 0 && <span className="node-unread-badge" aria-label={`${nodeAttention} 个未读会话`}>{nodeAttention > 9 ? "9+" : nodeAttention}</span>}
@@ -1890,7 +1896,7 @@ function NodePanel({
         <button type="button" onClick={onOpenSwitcher} title="快速切换节点或会话"><SearchIcon /><span>快速切换</span><kbd>⌘K</kbd></button>
         <button className={taskCenterActive ? "active" : ""} type="button" onClick={onOpenTasks} title="全局任务中心"><BellIcon /><span>任务中心</span>{unreadCount > 0 && <b>{unreadCount > 99 ? "99+" : unreadCount}</b>}</button>
         <button type="button" onClick={onOpenSettings} title="设置"><SettingsIcon /><span>设置</span></button>
-        <p className="agent-hint">节点凭据与 Codex 登录信息始终保留在本机。</p>
+        <p className="agent-hint">节点凭据与 Codex / Claude Code 登录信息始终保留在本机。</p>
       </div>
     </aside>
   );
@@ -1984,7 +1990,7 @@ function ConversationPanel({
   }
 
   async function remove(conversation: Conversation) {
-    if (!window.confirm(`确定删除“${conversation.title}”吗？此操作会同时删除节点上的 Codex 会话。`)) return;
+    if (!window.confirm(`确定删除“${conversation.title}”吗？此操作会同时删除节点上的${node ? ` ${runtimeLabel(node)} ` : ""}会话。`)) return;
     setDeletingId(conversation.id);
     setError(null);
     try {
@@ -2033,7 +2039,7 @@ function ConversationPanel({
         {collapsed ? "›" : "‹"}
       </button>
       <div className="pane-heading">
-        <div><span>{node?.name ?? "选择节点"}</span>{node && <small>{total} 个{query || filter !== "all" ? "匹配" : "历史"}会话</small>}</div>
+        <div><span>{node?.name ?? "选择节点"}</span>{node && <small><RuntimeIcon runtime={node.runtime} />{runtimeLabel(node)} · {total} 个{query || filter !== "all" ? "匹配" : "历史"}会话</small>}</div>
         <span className="history-rail-label" aria-hidden="true">历史会话</span>
         <button className={`new-button ${node && !selectedId ? "active" : ""}`} disabled={!node} onClick={onNew} aria-label="新建会话" title="新建会话">＋</button>
       </div>
@@ -2235,6 +2241,11 @@ const effortLabels: Record<ReasoningEffort, string> = {
   max: "max · 最大",
 };
 
+const conversationDefaultRuntimes = [
+  { runtime: "codex", label: "Codex", modelKey: "defaultModel", effortKey: "defaultEffort" },
+  { runtime: "claude", label: "Claude", modelKey: "claudeDefaultModel", effortKey: "claudeDefaultEffort" },
+] as const;
+
 const workspaceSourceLabels: Record<Workspace["source"], string> = {
   default: "默认目录",
   config: "启动配置",
@@ -2250,8 +2261,10 @@ const workspaceStatusLabels: Record<Workspace["status"], string> = {
 };
 
 function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRecord[]; initialNodeId: string | null; onChanged: () => Promise<void> | void }) {
-  const [nodeId, setNodeId] = useState(nodes.find((node) => node.id === initialNodeId)?.id ?? nodes[0]?.id ?? "");
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  // Workspaces are managed per machine: its runtimes share Web workspaces.
+  const machines = useMemo(() => groupNodeMachines(nodes), [nodes]);
+  const [machineId, setMachineId] = useState(nodes.find((node) => node.id === initialNodeId)?.machineId ?? machines[0]?.id ?? "");
+  const [workspaces, setWorkspaces] = useState<MachineWorkspace[]>([]);
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -2263,29 +2276,34 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
   const [editPath, setEditPath] = useState("");
   const [confirmation, setConfirmation] = useState<{
     kind: "migration" | "archive" | "delete";
-    workspace: Workspace;
+    item: MachineWorkspace;
     name?: string;
     path?: string;
   } | null>(null);
   const requestRevision = useRef(0);
-  const selectedNode = nodes.find((node) => node.id === nodeId) ?? null;
+  const selectedMachine = machines.find((machine) => machine.id === machineId) ?? null;
+  const machineOnline = (machine: NodeMachine) => machine.entries.some((node) => node.status === "online");
+  // New workspaces are validated by a connected runtime of the machine.
+  const addingNode = selectedMachine?.entries.find((node) => node.status === "online") ?? null;
+  const entryIds = selectedMachine?.entries.map((node) => node.id).join(",") ?? "";
 
   useEffect(() => {
-    if (nodes.length === 0) setNodeId("");
-    else if (!nodes.some((node) => node.id === nodeId)) setNodeId(nodes[0]!.id);
-  }, [nodeId, nodes]);
+    if (machines.length === 0) setMachineId("");
+    else if (!machines.some((machine) => machine.id === machineId)) setMachineId(machines[0]!.id);
+  }, [machineId, machines]);
 
   const refresh = useCallback(async () => {
-    if (!nodeId) {
+    const entries = machines.find((machine) => machine.id === machineId)?.entries ?? [];
+    if (entries.length === 0) {
       setWorkspaces([]);
       return;
     }
     const revision = ++requestRevision.current;
     setLoading(true);
     try {
-      const result = await listNodeWorkspaces(nodeId, true);
+      const lists = await Promise.all(entries.map(async (node) => ({ node, workspaces: await listNodeWorkspaces(node.id, true) })));
       if (revision === requestRevision.current) {
-        setWorkspaces(result);
+        setWorkspaces(mergeMachineWorkspaces(lists));
         setError(null);
       }
     } catch (reason) {
@@ -2293,7 +2311,8 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
     } finally {
       if (revision === requestRevision.current) setLoading(false);
     }
-  }, [nodeId]);
+    // Re-read when the machine or its entries change, not on every node status update.
+  }, [machineId, entryIds]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -2319,9 +2338,9 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
 
   async function addWorkspace(event: FormEvent) {
     event.preventDefault();
-    if (!nodeId || !newPath.trim()) return;
+    if (!addingNode || !newPath.trim()) return;
     const added = await finishMutation(
-      () => createNodeWorkspace(nodeId, { path: newPath.trim(), ...(newName.trim() ? { name: newName.trim() } : {}) }),
+      () => createNodeWorkspace(addingNode.id, { path: newPath.trim(), ...(newName.trim() ? { name: newName.trim() } : {}) }),
       "add",
       "添加工作空间",
     );
@@ -2331,65 +2350,62 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
     setAdding(false);
   }
 
-  function startEditing(workspace: Workspace) {
-    setEditingId(workspace.id);
+  function startEditing({ key, workspace }: MachineWorkspace) {
+    setEditingId(key);
     setEditName(workspace.name);
     setEditPath(workspace.path);
     setError(null);
   }
 
-  async function saveEditing(workspace: Workspace) {
+  async function saveEditing(item: MachineWorkspace) {
+    const { workspace } = item;
     const name = editName.trim();
     const workspacePath = editPath.trim();
     if (!name || !workspacePath) return setError("名称和路径不能为空");
     if (workspacePath !== workspace.path) {
-      setConfirmation({ kind: "migration", workspace, name, path: workspacePath });
+      setConfirmation({ kind: "migration", item, name, path: workspacePath });
       return;
     }
     if (name === workspace.name) {
       setEditingId(null);
       return;
     }
-    await finishMutation(
-      () => updateNodeWorkspace(nodeId, workspace.id, {
-        ...(name !== workspace.name ? { name } : {}),
-        ...(workspacePath !== workspace.path ? { path: workspacePath } : {}),
-      }),
-      workspace.id,
-      "更新工作空间",
-    );
+    await finishMutation(() => updateNodeWorkspace(item.nodes[0]!.id, workspace.id, { name }), item.key, "更新工作空间");
   }
 
   async function confirmAction() {
     if (!confirmation) return;
-    const { workspace } = confirmation;
+    const { item } = confirmation;
+    const nodeId = item.nodes[0]!.id;
     if (confirmation.kind === "migration") {
       await finishMutation(
-        () => updateNodeWorkspace(nodeId, workspace.id, {
+        () => updateNodeWorkspace(nodeId, item.workspace.id, {
           name: confirmation.name,
           path: confirmation.path,
           confirmMigration: true,
         }),
-        workspace.id,
+        item.key,
         "迁移工作空间路径",
       );
     } else if (confirmation.kind === "archive") {
-      await finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: true }), workspace.id, "停用工作空间");
+      await finishMutation(() => updateNodeWorkspace(nodeId, item.workspace.id, { archived: true }), item.key, "停用工作空间");
     } else {
-      await finishMutation(() => deleteNodeWorkspace(nodeId, workspace.id), workspace.id, "删除工作空间");
+      await finishMutation(() => deleteNodeWorkspace(nodeId, item.workspace.id), item.key, "删除工作空间");
     }
   }
 
+  const multipleRuntimes = (selectedMachine?.entries.length ?? 0) > 1;
+  const confirmed = confirmation?.item.workspace;
   return <section className="workspace-settings" aria-label="工作空间管理">
-    <div className="settings-copy"><h3>工作空间</h3><p>管理节点的任务目录，默认目录为 Agent 启动目录。</p></div>
+    <div className="settings-copy"><h3>工作空间</h3><p>按机器管理任务目录。手动添加的工作空间由这台机器上的 Codex、Claude 共用；默认目录是各自的 Agent 启动目录。</p></div>
     <div className="workspace-settings-toolbar">
-      <label className="workspace-node-select"><span>节点</span><select aria-label="管理节点" value={nodeId} disabled={Boolean(busyId) || nodes.length === 0} onChange={(event) => { setNodeId(event.target.value); setAdding(false); setEditingId(null); setConfirmation(null); setError(null); }}>
-        {nodes.length === 0 && <option value="">没有节点</option>}
-        {nodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.status === "online" ? "在线" : "离线"}</option>)}
+      <label className="workspace-node-select"><span>节点</span><select aria-label="管理节点" value={machineId} disabled={Boolean(busyId) || machines.length === 0} onChange={(event) => { setMachineId(event.target.value); setAdding(false); setEditingId(null); setConfirmation(null); setError(null); }}>
+        {machines.length === 0 && <option value="">没有节点</option>}
+        {machines.map((machine) => <option key={machine.id} value={machine.id}>{machine.primary.name} · {machineOnline(machine) ? "在线" : "离线"}</option>)}
       </select></label>
-      <button type="button" className="primary-button" disabled={!selectedNode || selectedNode.status !== "online" || adding} onClick={() => setAdding(true)}>添加工作空间</button>
+      <button type="button" className="primary-button" disabled={!addingNode || adding} onClick={() => setAdding(true)}>添加工作空间</button>
     </div>
-    <p className="workspace-list-summary">{loading ? '读取中…' : `${workspaces.filter((workspace) => !workspace.archivedAt && workspace.source !== "history").length} 个可用于新会话`}</p>
+    <p className="workspace-list-summary">{loading ? '读取中…' : `${workspaces.filter(({ workspace }) => !workspace.archivedAt && workspace.source !== "history").length} 个可用于新会话`}</p>
     {adding && <form className="workspace-add-form" onSubmit={(event) => void addWorkspace(event)}>
       <label><span>名称（可选）</span><input value={newName} maxLength={64} onChange={(event) => setNewName(event.target.value)} placeholder="默认使用目录名称" /></label>
       <label><span>该节点上的路径</span><input value={newPath} onChange={(event) => setNewPath(event.target.value)} placeholder="例如 /root/codes/project-a" autoFocus /></label>
@@ -2398,16 +2414,22 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
     </form>}
     {error && <p className="form-error workspace-settings-error">{error}</p>}
     <div className="workspace-list">
-      {loading && workspaces.length === 0 ? <div className="empty compact">正在读取工作空间…</div> : workspaces.map((workspace) => {
+      {loading && workspaces.length === 0 ? <div className="empty compact">正在读取工作空间…</div> : workspaces.map((item) => {
+        const { key, workspace } = item;
+        const actingOnline = item.nodes[0]!.status === "online";
         const editable = !workspace.isDefault && workspace.source !== "config" && workspace.status !== "archived";
-        const isEditing = editingId === workspace.id;
-        return <article className={`workspace-card workspace-${workspace.status}${isEditing ? ' workspace-editing' : ''}`} key={workspace.id}>
+        const isEditing = editingId === key;
+        // On a machine running several runtimes, name the runtimes a non-shared directory belongs to.
+        const owners = multipleRuntimes && workspace.source !== "web"
+          ? <span className="workspace-runtimes">{item.nodes.map((node) => <span key={node.id}><RuntimeIcon runtime={node.runtime} />{runtimeLabel(node)}</span>)}</span>
+          : null;
+        return <article className={`workspace-card workspace-${workspace.status}${isEditing ? ' workspace-editing' : ''}`} key={key}>
           <div className="workspace-card-main">
             {isEditing ? <div className="workspace-edit-fields">
               <input aria-label="工作空间名称" value={editName} maxLength={64} onChange={(event) => setEditName(event.target.value)} />
               <input aria-label="工作空间路径" value={editPath} onChange={(event) => setEditPath(event.target.value)} />
             </div> : <div className="workspace-card-copy">
-              <div><strong title={workspace.name}>{workspace.name}</strong>{workspace.isDefault ? <b>默认</b> : <span>{workspaceSourceLabels[workspace.source]}</span>}</div>
+              <div><strong title={workspace.name}>{workspace.name}</strong>{workspace.isDefault ? <b>默认</b> : <span>{workspaceSourceLabels[workspace.source]}</span>}{owners}</div>
               <code title={workspace.path}>{workspace.path}</code>
               {workspace.validationError && <small>{workspace.validationError}</small>}
             </div>}
@@ -2416,27 +2438,27 @@ function WorkspaceSettings({ nodes, initialNodeId, onChanged }: { nodes: NodeRec
           <div className="workspace-card-actions">
             {isEditing ? <>
               <button type="button" onClick={() => setEditingId(null)}>取消</button>
-              <button type="button" className="primary-button" disabled={busyId === workspace.id} onClick={() => void saveEditing(workspace)}>保存</button>
+              <button type="button" className="primary-button" disabled={busyId === key} onClick={() => void saveEditing(item)}>保存</button>
             </> : <>
-              {!workspace.archivedAt && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => validateNodeWorkspace(nodeId, workspace.id), workspace.id, "验证工作空间")}>验证</button>}
-              {editable && <button type="button" onClick={() => startEditing(workspace)}>编辑</button>}
-              {editable && <button type="button" className="danger-text" onClick={() => setConfirmation({ kind: workspace.conversationCount > 0 ? "archive" : "delete", workspace })}>{workspace.conversationCount > 0 ? "停用" : "删除"}</button>}
-              {workspace.archivedAt && workspace.source !== "config" && <button type="button" disabled={busyId === workspace.id || selectedNode?.status !== "online"} onClick={() => void finishMutation(() => updateNodeWorkspace(nodeId, workspace.id, { archived: false }), workspace.id, "恢复工作空间")}>恢复</button>}
+              {!workspace.archivedAt && <button type="button" disabled={busyId === key || !actingOnline} onClick={() => void finishMutation(() => validateNodeWorkspace(item.nodes[0]!.id, workspace.id), key, "验证工作空间")}>验证</button>}
+              {editable && <button type="button" onClick={() => startEditing(item)}>编辑</button>}
+              {editable && <button type="button" className="danger-text" onClick={() => setConfirmation({ kind: workspace.conversationCount > 0 ? "archive" : "delete", item })}>{workspace.conversationCount > 0 ? "停用" : "删除"}</button>}
+              {workspace.archivedAt && workspace.source !== "config" && <button type="button" disabled={busyId === key || !actingOnline} onClick={() => void finishMutation(() => updateNodeWorkspace(item.nodes[0]!.id, workspace.id, { archived: false }), key, "恢复工作空间")}>恢复</button>}
             </>}
           </div>
         </article>;
       })}
       {!loading && workspaces.length === 0 && <div className="empty compact">该节点还没有工作空间</div>}
     </div>
-    {confirmation && <div className="workspace-confirm" role="alertdialog" aria-label="确认工作空间操作">
+    {confirmation && confirmed && <div className="workspace-confirm" role="alertdialog" aria-label="确认工作空间操作">
       <strong>{confirmation.kind === "migration" ? "确认迁移路径" : confirmation.kind === "archive" ? "确认停用工作空间" : "确认删除工作空间"}</strong>
       <p>{confirmation.kind === "migration"
-        ? confirmation.workspace.conversationCount > 0
-          ? `这会影响 ${confirmation.workspace.conversationCount} 个历史会话，之后它们将在新路径中继续执行。`
-          : `路径将从“${confirmation.workspace.path}”迁移到“${confirmation.path}”。`
+        ? confirmed.conversationCount > 0
+          ? `这会影响 ${confirmed.conversationCount} 个历史会话，之后它们将在新路径中继续执行。`
+          : `路径将从“${confirmed.path}”迁移到“${confirmation.path}”。`
         : confirmation.kind === "archive"
-          ? `“${confirmation.workspace.name}”已有 ${confirmation.workspace.conversationCount} 个会话。停用后历史仍可查看，但不能继续执行。`
-          : `“${confirmation.workspace.name}”尚未绑定会话，删除后不会保留。`}</p>
+          ? `“${confirmed.name}”已有 ${confirmed.conversationCount} 个会话。停用后历史仍可查看，但不能继续执行。`
+          : `“${confirmed.name}”尚未绑定会话，删除后不会保留。`}</p>
       <div><button type="button" disabled={Boolean(busyId)} onClick={() => setConfirmation(null)}>取消</button><button type="button" className="danger-button" disabled={Boolean(busyId)} onClick={() => void confirmAction()}>{busyId ? "处理中…" : "确认"}</button></div>
     </div>}
   </section>;
@@ -2459,6 +2481,88 @@ function formatFileSize(size: number): string {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function DeleteNodeDialog({ machine, onCancel, onDeleted }: { machine: NodeMachine; onCancel: () => void; onDeleted: () => void }) {
+  const node = machine.primary;
+  const runtimes = machineRuntimeLabels(machine);
+  const [typedName, setTypedName] = useState("");
+  const [conversationCount, setConversationCount] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const nameMatches = typedName.trim() === node.name;
+
+  useEffect(() => {
+    let active = true;
+    Promise.all(machine.entries.map((entry) => listConversations({ nodeId: entry.id, limit: 1 })))
+      .then((results) => { if (active) setConversationCount(results.reduce((total, result) => total + result.total, 0)); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [machine]);
+
+  async function copyName(): Promise<void> {
+    await copyToClipboard(node.name);
+    setCopied(true);
+  }
+
+  async function confirmDelete(): Promise<void> {
+    if (!nameMatches || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteNode(node.id, typedName.trim());
+      onDeleted();
+    } catch (reason) {
+      setError(formatErrorMessage(reason, "删除节点"));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="compact-confirm-backdrop" role="presentation">
+      <section
+        className="compact-confirm delete-node-confirm"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="delete-node-title"
+        onKeyDown={(event) => {
+          if (event.key !== "Escape") return;
+          // Keep the settings panel open; only this dialog closes.
+          event.stopPropagation();
+          if (!busy) onCancel();
+        }}
+      >
+        <span className="compact-confirm-icon" aria-hidden="true">!</span>
+        <div>
+          <h2 id="delete-node-title">删除节点“{node.name}”？</h2>
+          <p>删除会先撤销这台机器的接入凭证{machine.entries.length > 1 ? `，${runtimes} 节点都会` : "并"}立即断开，然后永久删除{machine.entries.length > 1 ? "它们" : "它"}在控制中心的全部会话{conversationCount === null ? "" : `（${conversationCount} 个）`}、消息、审批、任务与附件记录，无法恢复。</p>
+          <p className="compact-confirm-note">机器上的 Agent 程序和 {runtimes} 本地会话文件不受影响；之后要重新接入，需在 Web 生成新的注册 Token 并重新执行 login。</p>
+          <div className="delete-node-name">
+            <span id="delete-node-name-hint">请输入节点名称 <code>{node.name}</code> <button type="button" aria-label="复制节点名称" onClick={() => void copyName()}>{copied ? "已复制" : "复制"}</button> 以确认删除</span>
+            <input
+              autoFocus
+              value={typedName}
+              disabled={busy}
+              aria-label="输入节点名称以确认删除"
+              aria-describedby="delete-node-name-hint"
+              autoComplete="off"
+              spellCheck={false}
+              onChange={(event) => setTypedName(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") void confirmDelete(); }}
+            />
+          </div>
+          {error && <p className="form-error">{error}</p>}
+          <div className="compact-confirm-actions">
+            <button type="button" disabled={busy} onClick={onCancel}>取消</button>
+            <button className="danger-button" type="button" disabled={!nameMatches || busy} onClick={() => void confirmDelete()}>
+              {busy ? "正在删除…" : "撤销并删除"}
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; onNodesChanged: () => Promise<void> | void }) {
   const [entries, setEntries] = useState<EnrollmentToken[]>([]);
   const [busy, setBusy] = useState(false);
@@ -2466,6 +2570,8 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
   const [error, setError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [confirmNodeId, setConfirmNodeId] = useState<string | null>(null);
+  const [deletingMachine, setDeletingMachine] = useState<NodeMachine | null>(null);
+  const machines = useMemo(() => groupNodeMachines(nodes), [nodes]);
   const [clock, setClock] = useState(Date.now());
   const [agentPackage, setAgentPackage] = useState<AgentPackageInfo | null>(null);
   const [packageTarget, setPackageTarget] = useState<string>("");
@@ -2608,6 +2714,13 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
     }
   }
 
+  async function nodeDeleted(): Promise<void> {
+    setDeletingMachine(null);
+    // Registration Tokens used by the node were deleted with it.
+    void refresh().catch(() => undefined);
+    await onNodesChanged();
+  }
+
   return <section className="enrollment-settings">
     <div className="settings-copy enrollment-heading">
       <div><h3>节点接入</h3><p>Token 有效期 10 分钟，注册一次即失效。</p></div>
@@ -2646,14 +2759,25 @@ function EnrollmentSettings({ nodes, onNodesChanged }: { nodes: NodeRecord[]; on
       </div>}
     </div>
     {(error ?? refreshError ?? packageError) && <p className="form-error workspace-settings-error">{error ?? refreshError ?? packageError}</p>}
-    {nodes.length > 0 && <div className="enrollment-nodes">
-      <header><strong>已登记节点 <small>{nodes.length}</small></strong></header>
-      {nodes.map((node) => <article key={node.id}>
-        <div><strong>{node.name}</strong><small>{node.accessMode === "enrolled" ? "独立凭证" : node.accessMode === "revoked" ? "接入已撤销" : "旧共享凭证"} · {node.status === "online" ? "在线" : "离线"}{node.permissionMode === "danger-full-access" ? " · 全权限" : ""}</small></div>
-        {confirmNodeId === node.id ? <div className="enrollment-node-confirm"><span>撤销后 Agent 会立即断开</span><button type="button" onClick={() => setConfirmNodeId(null)}>取消</button><button type="button" className="danger-text" disabled={busy} onClick={() => void revokeAccess(node)}>确认撤销</button></div>
-          : <button type="button" className="danger-text" disabled={busy || node.accessMode !== "enrolled"} onClick={() => setConfirmNodeId(node.id)}>撤销接入</button>}
-      </article>)}
+    {machines.length > 0 && <div className="enrollment-nodes">
+      <header><strong>已登记节点 <small>{machines.length}</small></strong></header>
+      {machines.map((machine) => {
+        const node = machine.primary;
+        return <article key={machine.id}>
+          <div>
+            <strong>{node.name}</strong>
+            <small>{node.accessMode === "enrolled" ? "独立凭证" : node.accessMode === "revoked" ? "接入已撤销" : "旧共享凭证"}{machine.entries.length > 1 ? ` · ${machine.entries.length} 个运行时` : ""}</small>
+            {machine.entries.map((entry) => <small key={entry.id} className="enrollment-node-runtime" title={entry.codexVersion}><RuntimeIcon runtime={entry.runtime} />{runtimeLabel(entry)}{entry.codexVersion && entry.codexVersion !== "unavailable" ? ` ${entry.codexVersion}` : ""} · {entry.status === "online" ? "在线" : "离线"}{entry.permissionMode === "danger-full-access" ? " · 全权限" : ""}</small>)}
+          </div>
+          {confirmNodeId === machine.id ? <div className="enrollment-node-confirm"><span>{machine.entries.length > 1 ? `这台机器上的 ${machineRuntimeLabels(machine)} 节点都会立即断开` : "Agent 会立即断开"}，节点与会话记录保留</span><button type="button" onClick={() => setConfirmNodeId(null)}>取消</button><button type="button" className="danger-text" disabled={busy} onClick={() => void revokeAccess(node)}>确认撤销</button></div>
+            : <div className="enrollment-node-actions">
+              <button type="button" className="danger-text" disabled={busy || node.accessMode !== "enrolled"} onClick={() => setConfirmNodeId(machine.id)}>仅撤销</button>
+              <button type="button" className="danger-text" disabled={busy} onClick={() => { setConfirmNodeId(null); setDeletingMachine(machine); }}>删除</button>
+            </div>}
+        </article>;
+      })}
     </div>}
+    {deletingMachine && <DeleteNodeDialog machine={deletingMachine} onCancel={() => setDeletingMachine(null)} onDeleted={() => void nodeDeleted()} />}
     {entries.length > 0 && <div className="enrollment-history">
       <header><strong>注册 Token</strong><span>到期自动清理</span></header>
       {entries.map((entry) => {
@@ -2700,13 +2824,17 @@ function SettingsPanel({
   onLogout: () => Promise<void> | void;
   selectedNodeId: string | null;
 }) {
-  const models = useMemo(() => {
-    const catalog = new Map<string, string>();
-    for (const node of nodes) for (const model of node.models) catalog.set(model.id, model.displayName);
-    return [...catalog].sort((left, right) => left[1].localeCompare(right[1]));
-  }, [nodes]);
-  const [model, setModel] = useState(settings.defaultModel ?? "");
-  const [effort, setEffort] = useState<ReasoningEffort | "">(settings.defaultEffort ?? "");
+  // Each runtime offers the models and efforts its own nodes report.
+  const catalogs = useMemo(() => new Map(conversationDefaultRuntimes.map(({ runtime }) => {
+    const models = new Map<string, string>();
+    const efforts = new Set<ReasoningEffort>();
+    for (const node of nodes) if (node.runtime === runtime) for (const model of node.models) {
+      models.set(model.id, model.displayName);
+      for (const option of model.supportedReasoningEfforts) efforts.add(option.reasoningEffort);
+    }
+    return [runtime, { models: [...models].sort((left, right) => left[1].localeCompare(right[1])), efforts }];
+  })), [nodes]);
+  const [defaults, setDefaults] = useState<GlobalSettings>(settings);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [section, setSection] = useState<"defaults" | "workspaces" | "enrollment">("defaults");
@@ -2716,7 +2844,7 @@ function SettingsPanel({
     setBusy(true);
     setError(null);
     try {
-      onSaved(await updateSettings({ defaultModel: model || null, defaultEffort: effort || null }));
+      onSaved(await updateSettings(defaults));
       onClose();
     } catch (reason) {
       setError(formatErrorMessage(reason, "保存设置"));
@@ -2749,11 +2877,26 @@ function SettingsPanel({
           <div className="settings-version"><span>Controller Center</span><strong>v{__APP_VERSION__}</strong></div>
         </nav>
         {section === "defaults" ? <form className="settings-form" onSubmit={(event) => void save(event)}>
-          <div className="settings-copy"><h3>对话默认值</h3><p>仅影响新会话；模型不可用时使用节点默认模型。</p></div>
-          <div className="settings-default-fields">
-            <label><span>默认模型</span><select aria-label="默认模型" value={model} onChange={(event) => setModel(event.target.value)}><option value="">各节点本机默认</option>{models.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
-            <label><span>默认思考强度</span><select aria-label="默认思考强度" value={effort} onChange={(event) => setEffort(event.target.value as ReasoningEffort | "")}><option value="">模型默认</option>{Object.entries(effortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-          </div>
+          <div className="settings-copy"><h3>对话默认值</h3><p>仅影响新会话；Codex 和 Claude 节点分别设置，模型不可用时使用节点默认模型。</p></div>
+          {conversationDefaultRuntimes.map(({ runtime, label, modelKey, effortKey }) => {
+            const catalog = catalogs.get(runtime)!;
+            const model = defaults[modelKey] ?? "";
+            const effort = defaults[effortKey] ?? "";
+            return <section className="settings-default-fields" key={runtime} aria-label={`${label} 对话默认值`}>
+              <h4><RuntimeIcon runtime={runtime} size={14} />{label}</h4>
+              <label><span>默认模型</span><select aria-label={`${label} 默认模型`} value={model} onChange={(event) => setDefaults((current) => ({ ...current, [modelKey]: event.target.value || null }))}>
+                <option value="">各节点本机默认</option>
+                {model && !catalog.models.some(([id]) => id === model) && <option value={model}>{model}</option>}
+                {catalog.models.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+              </select></label>
+              <label><span>默认思考强度</span><select aria-label={`${label} 默认思考强度`} value={effort} onChange={(event) => setDefaults((current) => ({ ...current, [effortKey]: (event.target.value || null) as ReasoningEffort | null }))}>
+                <option value="">模型默认</option>
+                {(Object.entries(effortLabels) as Array<[ReasoningEffort, string]>)
+                  .filter(([value]) => catalog.efforts.size === 0 || catalog.efforts.has(value) || value === effort)
+                  .map(([value, name]) => <option key={value} value={value}>{name}</option>)}
+              </select></label>
+            </section>;
+          })}
           {error && <p className="form-error">{error}</p>}
           <div className="settings-actions"><button type="button" onClick={onClose}>取消</button><button className="primary-button" disabled={busy}>{busy ? "保存中…" : "保存设置"}</button></div>
         </form> : section === "workspaces"
@@ -2847,7 +2990,7 @@ function QuickSwitcher({ nodes, conversations, loading, error, onClose, onSearch
             onClick={() => activate(result)}
           >
             <span className="switcher-avatar">{nodeShortLabel(result.node.name)}</span>
-            <span className="switcher-main"><strong>{result.node.name}</strong><small>节点 · {result.node.workspaces.filter((workspace) => workspace.source !== "history" && !workspace.archivedAt).length} 个工作空间</small></span>
+            <span className="switcher-main"><strong>{result.node.name}</strong><small>节点 · <RuntimeIcon runtime={result.node.runtime} />{runtimeLabel(result.node)} · {result.node.workspaces.filter((workspace) => workspace.source !== "history" && !workspace.archivedAt).length} 个工作空间</small></span>
             <span className={`switcher-status ${result.node.status}`}>{result.node.status === "online" ? "在线" : "离线"}</span>
           </button>;
           const workspace = result.node?.workspaces.find((candidate) => candidate.id === result.conversation.workspaceId);
@@ -2859,7 +3002,7 @@ function QuickSwitcher({ nodes, conversations, loading, error, onClose, onSearch
             onClick={() => activate(result)}
           >
             <span className="switcher-avatar conversation">聊</span>
-            <span className="switcher-main"><strong>{result.conversation.title}</strong><small>{result.node?.name ?? "未知节点"} · {workspace?.name ?? "工作空间"}</small></span>
+            <span className="switcher-main"><strong>{result.conversation.title}</strong><small>{result.node ? <>{result.node.name} · <RuntimeIcon runtime={result.node.runtime} />{runtimeLabel(result.node)}</> : "未知节点"} · {workspace?.name ?? "工作空间"}</small></span>
             <time>{relativeTime(result.conversation.updatedAt)}</time>
           </button>;
         })}
@@ -2867,6 +3010,10 @@ function QuickSwitcher({ nodes, conversations, loading, error, onClose, onSearch
       <footer><span>↑↓ 选择</span><span>Enter 打开</span><span>Esc 关闭</span></footer>
     </section>
   </div>;
+}
+
+function replyPreviewLabel(preview: string, node: NodeRecord | undefined): string {
+  return node ? `${runtimeLabel(node)}：${preview}` : preview;
 }
 
 function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, onMarkAllRead, onRetry }: {
@@ -2938,7 +3085,7 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
           <label className="task-search"><SearchIcon /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="按会话名称或节点名称搜索" aria-label="搜索全局任务" /></label>
           <select value={nodeId} onChange={(event) => setNodeId(event.target.value)} aria-label="按节点筛选">
             <option value="all">全部节点</option>
-            {nodes.map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
+            {nodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {runtimeLabel(node)}</option>)}
           </select>
           <button type="button" disabled={unreadCount === 0 || busyAction !== null} onClick={() => void runAction("read-all", "标记全部通知为已读", onMarkAllRead)}>{busyAction === "read-all" ? "处理中…" : "全部标为已读"}</button>
         </div>
@@ -2952,7 +3099,7 @@ function TaskCenterPage({ entries, nodes, unreadCount, policy, onBack, onOpen, o
             <i className={`task-state-dot task-state-${entry.status}`} />
             <span className="task-center-main">
               <strong>{entry.conversationTitle}</strong>
-              <span className="task-reply-preview">{entry.replyPreview ? `Codex：${entry.replyPreview}` : entry.progressLabel ?? statusText[entry.status] ?? entry.status}</span>
+              <span className="task-reply-preview">{entry.replyPreview ? replyPreviewLabel(entry.replyPreview, nodes.find((candidate) => candidate.id === entry.nodeId)) : entry.progressLabel ?? statusText[entry.status] ?? entry.status}</span>
               <small>{entry.nodeName} · {entry.manualUnread ? "待回看 · " : ""}{entry.progressLabel ?? statusText[entry.status] ?? entry.status}</small>
             </span>
             <span className="task-center-side"><StatusBadge status={entry.status} /><time title={`${entry.runId ? "任务时间" : "会话活动时间"}：${new Date(entry.occurredAt).toLocaleString()}`}>{entry.manualUnread ? "标记于 " : ""}{relativeTime(entry.manualUnreadAt ?? entry.occurredAt)}</time></span>
@@ -3273,16 +3420,17 @@ function ChatPanel({
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [fileHistoryOpen]);
 
+  const defaults = runtimeDefaults(settings, node?.runtime);
   useEffect(() => {
-    const preferredModel = settings.defaultModel && node?.models.some((candidate) => candidate.id === settings.defaultModel)
-      ? settings.defaultModel
+    const preferredModel = defaults.model && node?.models.some((candidate) => candidate.id === defaults.model)
+      ? defaults.model
       : null;
     const initialModel = detail?.conversation.model
       ?? preferredModel
       ?? node?.models.find((candidate) => candidate.isDefault)?.id
       ?? "";
     const descriptor = node?.models.find((candidate) => candidate.id === initialModel);
-    const preferredEffort = detail?.conversation.effort ?? settings.defaultEffort;
+    const preferredEffort = detail?.conversation.effort ?? defaults.effort;
     const resolvedEffort = preferredEffort && (!descriptor || descriptor.supportedReasoningEfforts.length === 0 || descriptor.supportedReasoningEfforts.some((option) => option.reasoningEffort === preferredEffort))
       ? preferredEffort
       : descriptor?.defaultReasoningEffort ?? "";
@@ -3307,7 +3455,7 @@ function ChatPanel({
     setShowCompactConfirm(false);
     setShowWorkspaceConcurrencyConfirm(false);
     setCompactSubmitting(false);
-  }, [node?.id, detail?.conversation.id, settings.defaultModel, settings.defaultEffort]);
+  }, [node?.id, detail?.conversation.id, defaults.model, defaults.effort]);
 
   useEffect(() => {
     if (!showCompactConfirm) return;
@@ -3727,7 +3875,7 @@ function ChatPanel({
       <h1 className="chat-title visually-hidden"><strong>{detail?.conversation.title ?? "新会话"}</strong></h1>
       <header className="mobile-chat-topbar">
         <button type="button" onClick={() => { setFileHistoryOpen(false); onBack(); }} aria-label="打开历史会话"><HistoryIcon /><span>历史</span></button>
-        <div><strong>{conversation?.title ?? "新会话"}</strong><small>{node.name}</small></div>
+        <div><strong>{conversation?.title ?? "新会话"}</strong><small>{node.name} · <RuntimeIcon runtime={node.runtime} />{runtimeLabel(node)}</small></div>
         <button type="button" onClick={() => { setFileHistoryOpen(false); onNew(); }} aria-label="新建会话"><span className="mobile-chat-new-mark">＋</span><span>新建</span></button>
         <button
           type="button"
@@ -3890,7 +4038,7 @@ function ChatPanel({
           onChange={(event) => updatePrompt(event.target.value)}
           onCompositionStart={() => { promptComposing.current = true; }}
           onCompositionEnd={() => { promptComposing.current = false; }}
-          placeholder={compactionActive ? "正在压缩上下文…" : activeRun ? "向正在执行的任务追加指令…" : "描述你希望 Codex 完成的任务…"}
+          placeholder={compactionActive ? "正在压缩上下文…" : activeRun ? "向正在执行的任务追加指令…" : `描述你希望 ${runtimeLabel(node)} 完成的任务…`}
           rows={2}
           disabled={!canCompose}
           onPaste={(event) => {
@@ -3991,7 +4139,7 @@ function ChatPanel({
               <span className="compact-confirm-icon" aria-hidden="true">↙↗</span>
               <div>
                 <h2 id="compact-confirm-title">压缩当前会话？</h2>
-                <p>Codex 会概括当前有效上下文以释放空间。聊天记录仍会保留，但后续对话使用的是压缩后的摘要。</p>
+                <p>{runtimeLabel(node)} 会概括当前有效上下文以释放空间。聊天记录仍会保留，但后续对话使用的是压缩后的摘要。</p>
                 <p className="compact-confirm-note">压缩会消耗一定 Token，完成后不能直接撤销。</p>
                 <div className="compact-confirm-actions">
                   <button type="button" autoFocus disabled={compactSubmitting} onClick={() => setShowCompactConfirm(false)}>取消</button>
@@ -4038,7 +4186,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [viewingHistoricalMessages, setViewingHistoricalMessages] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState<Approval[]>([]);
-  const [settings, setSettings] = useState<GlobalSettings>({ defaultModel: null, defaultEffort: null });
+  const [settings, setSettings] = useState<GlobalSettings>({ defaultModel: null, defaultEffort: null, claudeDefaultModel: null, claudeDefaultEffort: null });
   const [taskEntries, setTaskEntries] = useState<TaskCenterEntry[]>([]);
   const [unreadTaskCount, setUnreadTaskCount] = useState(0);
   const [nodeUnreadCounts, setNodeUnreadCounts] = useState<Record<string, number>>({});
@@ -4626,7 +4774,10 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => Promise<void> | void }
         const conversationId = data.conversationId
           ?? (data.type.startsWith("conversation.") ? data.resourceId : null);
         const selectedConversationAffected = !conversationId || conversationId === selectedConversationIdRef.current;
-        if (data.type.startsWith("node.")) {
+        if (data.type === "node.deleted") {
+          // The node's conversations, approvals and tasks went with it.
+          schedule("all", refreshAll, 250);
+        } else if (data.type.startsWith("node.")) {
           schedule("nodes", () => void refreshNodes(), 250);
         } else if (data.type.startsWith("workspace-file-history.")) {
           window.dispatchEvent(new CustomEvent("controller-center:workspace-file-history", { detail: { conversationId } }));
@@ -4949,7 +5100,7 @@ function LoginScreen({ initialError, onAuthenticated, onRetry }: {
 
   return <main className="login-page">
     <section className="login-card">
-      <div className="login-brand"><span>CC</span><div><strong>Controller Center</strong><small>集中调度你的 Codex 节点</small></div></div>
+      <div className="login-brand"><span>CC</span><div><strong>Controller Center</strong><small>集中调度你的 Codex / Claude 节点</small></div></div>
       <div className="login-copy"><span>ADMIN ACCESS</span><h1>登录控制中心</h1><p>输入部署机器上保存的管理员 Token。验证通过后，浏览器只保存安全会话 Cookie，不保存原始 Token。</p></div>
       <form onSubmit={(event) => void submit(event)}>
         <label><span>管理员 Token</span><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="cca_…" autoComplete="current-password" autoFocus /></label>

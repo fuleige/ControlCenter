@@ -9,9 +9,12 @@ User=controller-agent
 Group=controller-agent
 WorkingDirectory=/opt/controller-center
 EnvironmentFile=/etc/controller-center/agent.env
-ExecStart=/usr/bin/node /opt/controller-center/apps/agent/dist/index.js --yolo --codex-proxy-only
+# 将 <codex|claude> 换成该节点的运行时；保留占位符时 Agent 会拒绝启动。
+ExecStart=/usr/bin/node /opt/controller-center/apps/agent/dist/index.js <codex|claude> --yolo --codex-proxy-only
 Restart=always
 RestartSec=3
+# 78：节点凭据被拒绝（未注册、已撤销或已删除），重启也无法恢复，需重新注册。
+RestartPreventExitStatus=78
 NoNewPrivileges=true
 
 [Install]

@@ -30,11 +30,15 @@ export interface ModelDescriptor {
 
 export interface NodeRecord {
   id: string;
+  /** Shared by the Codex and Claude entries started from one Agent data directory. */
+  machineId: string;
   name: string;
   reportedName: string;
   platform: string;
   arch: string;
   agentVersion: string;
+  runtime: "codex" | "claude";
+  /** Version string reported by the runtime's CLI. */
   codexVersion: string;
   permissionMode: "workspace-write" | "danger-full-access";
   maxConcurrentRuns: number;
@@ -212,9 +216,12 @@ export interface ConversationDetail {
   approvals: Approval[];
 }
 
+/** New-conversation defaults; the unprefixed pair predates Claude and applies to Codex. */
 export interface GlobalSettings {
   defaultModel: string | null;
   defaultEffort: ReasoningEffort | null;
+  claudeDefaultModel: string | null;
+  claudeDefaultEffort: ReasoningEffort | null;
 }
 
 export interface EnrollmentToken {

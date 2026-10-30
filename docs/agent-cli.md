@@ -1,6 +1,6 @@
 # Agent 客户端命令与配置
 
-本文档对应 Agent `v0.3.22`，适用于 Linux 和 macOS 上直接运行的 Node Agent。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
+本文档对应 Agent `v0.3.24`，适用于 Linux 和 macOS 上直接运行的 Node Agent。v0.3.23 起日常运行必须写明运行时 `codex` 或 `claude`，没有默认值；Claude 运行时见[第 5 节](#5-claude-code-运行时)。Controller Center 与 Agent 独立发布，只有 Agent 运行代码、安装内容或协议兼容性变化时才需要升级 Agent。客户端包含首次注册和日常运行两个独立命令；除共同支持的 `--codex-proxy-only` 外，应按各自的参数表使用。
 
 `AGENT_DATA_DIR` 不是必填项，省略时使用当前用户的 `~/.controller-center-agent`。它保存节点 ID、注册凭证、可靠队列和附件缓存，必须在注册与后续启动之间保持不变。它不决定 Codex 工作空间：Agent 的启动目录才是默认工作空间。正式使用不建议把状态默认放到当前目录，否则从不同项目启动时可能产生不同节点身份；隔离测试时可以显式指定当前目录下的绝对路径，例如先执行 `export AGENT_DATA_DIR="$PWD/test-data"`。
 
@@ -11,23 +11,25 @@
 也可点击“复制下载链接”，在另一台设备直接用 wget 或 curl 下载，无需复制管理员 Cookie 或 Token。链接只允许下载所选安装包，有效期一小时；Control Plane 重启、安装包更新或移除后也会失效，需重新生成。页面提供“复制 wget 命令”；浏览器拒绝剪贴板操作时，可以从只读输入框手动复制链接。macOS 可使用系统 curl，例如：
 
 ```bash
-curl -fL '粘贴页面复制的下载链接' -o controller-center-agent-v0.3.22-darwin-arm64.tar.gz
+curl -fL '粘贴页面复制的下载链接' -o controller-center-agent-v0.3.24-darwin-arm64.tar.gz
 ```
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.22-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.24-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
 /opt/controller-center-agent/agent.sh login
-/opt/controller-center-agent/agent.sh start
+/opt/controller-center-agent/agent.sh start codex   # 或 start claude
 ```
 
 源码仓库执行 `npm run build` 时会自动生成 `artifacts/controller-center-agent-v<版本>-<系统架构>.tar.gz`；只构建客户端包可执行 `npm run package:agent`。常规构建只生成当前构建机目标的包，并在打包后实际启动 PTY 与调整尺寸。正式 macOS 发布需在 macOS 验证；Linux 包也需要匹配 libc。`BUILD-INFO.json` 记录构建目标、Node.js 与 glibc 版本。下载页同时展示 SHA-256，可在节点上用 `sha256sum`（Linux）或 `shasum -a 256`（macOS）核对。
 
-每次新包成功生成后自动清理同一输出目录的其他版本安装包与源码归档，保留当前 Agent 版本的各系统/架构包；构建失败不删除原包。已有包可执行 `npm run clean:agent-packages` 清理，未生成当前版本安装包时会拒绝清理。`AGENT_PACKAGE_OUTPUT_DIR` 可指定独立输出目录，清理不会跨目录。
+每次新包成功生成后自动清理同一输出目录的其他版本安装包与源码归档，保留当前 Agent 版本和上一个版本（便于回退）的各系统/架构包；构建失败不删除原包。已有包可执行 `npm run clean:agent-packages` 清理，未生成当前版本安装包时会拒绝清理。`AGENT_PACKAGE_OUTPUT_DIR` 可指定独立输出目录，清理不会跨目录。
 
-当前安装包为 v0.3.22，2026-10-20 生成，增加会话 Fast 档位与可见回复的估算输出速度，协议继续兼容 v5。2026-10-26 用户反馈 Linux 与 macOS 实机测试未发现异常；本轮核对两个在线节点均运行 v0.3.22，目标分别为 Linux x64/glibc 和 macOS ARM64。验收记录绑定当前归档 SHA-256，见[本轮实机反馈](node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。包内构建元数据和 README 保留生成时的待验证记录，不因后续反馈重新打包。v0.3.21 修正 Codex 0.163 的 `priority` Fast 档位识别，并刷新旧版误判缓存；v0.3.22 修正密集分块和暂停恢复时的实时速度采样，只在最近 3 秒内样本充足时显示速率。输入 Token 和首段输出前的时间不参与速度计算。升级时保留原工作目录及 `AGENT_DATA_DIR`，无需重新注册。
+v0.3.23 增加 Claude Code 运行时并要求显式选择运行时；v0.3.24 起同一数据目录可同时运行 Codex 与 Claude（共用一次注册，Claude 本地状态保存在 `runtimes/claude/`），凭据被拒时停止重连并以退出码 78 退出。2026-10-30 用户反馈 Linux x64/glibc 包（SHA-256 `bbad1bea66ee2e131ac2137b488f7b10e4fd2aa0ed52ff229ab1216b04901980`）实测通过，Codex 与 Claude 同机运行及对话正常；macOS ARM64 包（SHA-256 `7c3a3da6b7d9fb886301deb0c707e54b13908d198a93bbb34aed7f443e89bbf1`）尚未实机验证；升级已有 Codex 节点时在启动命令写上 `codex`（如 `./agent.sh start codex`），注册凭证与数据目录无需变动；未升级的 Codex Agent 仍可连接新版 Control Plane。
+
+此前的安装包为 v0.3.22，2026-10-20 生成，增加会话 Fast 档位与可见回复的估算输出速度，协议继续兼容 v5。2026-10-26 用户反馈 Linux 与 macOS 实机测试未发现异常；本轮核对两个在线节点均运行 v0.3.22，目标分别为 Linux x64/glibc 和 macOS ARM64。验收记录绑定当前归档 SHA-256，见[本轮实机反馈](node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。包内构建元数据和 README 保留生成时的待验证记录，不因后续反馈重新打包。v0.3.21 修正 Codex 0.163 的 `priority` Fast 档位识别，并刷新旧版误判缓存；v0.3.22 修正密集分块和暂停恢复时的实时速度采样，只在最近 3 秒内样本充足时显示速率。输入 Token 和首段输出前的时间不参与速度计算。升级时保留原工作目录及 `AGENT_DATA_DIR`，无需重新注册。
 
 以下为旧版验收记录，不代表新版安装包已实机验收：2026-10-08 下载目录提供 v0.3.19 Linux x64/glibc 与 macOS ARM64 包。v0.3.19 放宽 Node 版本检查，允许 Mac 的 Node 26 继续启动。Mac 包复用同版本运行代码与锁定依赖，换入官方 `node-pty@1.1.0`、`node-datachannel@0.33.4` ARM64 预编译模块，并检查 npm 完整性、Mach-O 架构和 helper 执行权限。用户已在 Mac mini 确认当前包可正常使用及直连下载；对应文件 SHA-256 与验证范围见[本轮实机反馈](node-tools-design.md#1015-macos-实机反馈与本轮提交检查)。页面对这一精确产物显示“macOS 直连下载已实机验证”。包内 `nativeVerification: pending-macos-test` 和 README 的待验证说明记录的是构建时状态，后续用户反馈以该记录为准，不为更新说明而重新打包。Intel / Rosetta 的 darwin-x64 包本轮未生成。
 
@@ -40,12 +42,12 @@ npm ci
 npm run package:agent
 ```
 
-构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.22-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
+构建完成并通过实际 PTY 与 WebRTC 原生模块检查后，将 `artifacts/controller-center-agent-v0.3.24-darwin-arm64.tar.gz`（或 Intel 对应文件）提供给控制中心。保留原 `AGENT_DATA_DIR` 与启动工作目录，更换安装目录无需重新注册。
 
 将安装包放入下载目录前，在同一台构建机验证实际压缩包：
 
 ```bash
-node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.22-darwin-arm64.tar.gz
+node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.24-darwin-arm64.tar.gz
 ```
 
 此验证针对 v0.3.16 及后续版本：会解压到独立临时目录，检查版本与目标一致性，实际打开两个终端、验证 TTY 和窗口尺寸、关闭一个终端后确认另一个仍可交互，并确认错误目标会在创建节点状态前停止。验证不会注册测试节点或读取已有节点凭证。源码仓库提供手动触发的 `node-tools-verification.yml`，分别在 Linux x64 与 Mac ARM64 上构建、验证并保存对应目标的产物。旧版 v0.3.15 ARM64 测试包由用户在 Mac 通过网页实际打开终端及操作文件验收，不使用依赖新版启动校验模块的验证脚本。
@@ -58,26 +60,26 @@ node scripts/verify-agent-package.mjs artifacts/controller-center-agent-v0.3.22-
 
 ```bash
 ./agent.sh login
-./agent.sh start
+./agent.sh start codex   # 或 ./agent.sh start claude；简写 ./agent.sh codex / ./agent.sh claude
 ./agent.sh status
 ```
 
-`login` 默认使用 `https://c.llmdev.cn`、交互读取注册 Token，并自动传入 `--codex-proxy-only`；也可以使用 `./agent.sh login https://其他控制中心域名`。快捷启动参数与实际行为如下：
+`start` 必须带 `codex` 或 `claude`，否则脚本直接提示两种选择并退出。`login` 默认使用 `https://c.llmdev.cn`、交互读取注册 Token，并自动传入 `--codex-proxy-only`；也可以使用 `./agent.sh login https://其他控制中心域名`。快捷启动参数与实际行为如下（表中命令以 Claude 为例，换成 `codex` 同理）：
 
 | 快捷命令 | 自动传入的底层参数 | 行为 |
 | --- | --- | --- |
-| `./agent.sh start` | `--yolo --codex-proxy-only` | 全权限；控制中心直连；Codex 继承系统代理 |
-| `./agent.sh start --safe` | `--codex-proxy-only` | 保留审批与沙箱；控制中心直连 |
-| `./agent.sh start --all-proxy` | `--yolo` | 全权限；所有连接遵循代理环境变量和 `NO_PROXY` |
-| `./agent.sh start --safe --all-proxy` | 无 | 保留审批与沙箱；所有连接遵循代理环境变量和 `NO_PROXY` |
+| `./agent.sh start claude` | `--yolo --codex-proxy-only` | 全权限；控制中心直连；Codex / Claude Code 继承系统代理 |
+| `./agent.sh start claude --safe` | `--codex-proxy-only` | 保留审批与沙箱；控制中心直连 |
+| `./agent.sh start claude --all-proxy` | `--yolo` | 全权限；所有连接遵循代理环境变量和 `NO_PROXY` |
+| `./agent.sh start claude --safe --all-proxy` | 无 | 保留审批与沙箱；所有连接遵循代理环境变量和 `NO_PROXY` |
 
-`--all-proxy` 只是取消控制中心强制直连，并不会自行配置代理；没有设置代理环境变量时仍然直连。`--codex-proxy-only` 也不会删除代理变量，它只强制注册、WSS 控制通道和附件请求直连，Codex App Server 继续继承代理变量。
+`--all-proxy` 只是取消控制中心强制直连，并不会自行配置代理；没有设置代理环境变量时仍然直连。`--codex-proxy-only` 也不会删除代理变量，它只强制注册、WSS 控制通道和附件请求直连，Codex App Server 或 Claude Code 子进程继续继承代理变量。
 
 脚本根据自身位置查找 `dist`，所以可以在希望作为默认工作空间的目录中，通过绝对路径执行它：
 
 ```bash
 cd /path/to/workspace
-/opt/controller-center-agent/agent.sh start
+/opt/controller-center-agent/agent.sh start claude
 ```
 
 下面的 npm/Node 命令保留作为源码开发、排障和 systemd 配置参考。
@@ -100,16 +102,17 @@ npm --prefix /path/to/controller-center-agent start -- [参数]
 
 | 参数 | 默认行为 | 作用范围 | 说明 |
 | --- | --- | --- | --- |
-| `--yolo` | 不启用 | 整个 Agent 进程中的所有 Codex 会话 | 关闭 Codex 审批与沙箱，使用 `approvalPolicy: never` 和 `dangerFullAccess`。Web 会把节点标为“全权限”。 |
-| `--codex-proxy-only` | 不启用 | Agent 自身的控制中心网络 | Agent 注册后的 WSS 控制通道和附件下载强制直连；Codex App Server 仍继承代理环境变量。未配置代理时传不传都相同。 |
+| `codex` / `claude` | 无默认值，必填 | 整个 Agent 进程 | 运行时位置参数，只能写一个。`codex` 驱动 `codex app-server`；`claude` 通过 Claude Agent SDK 驱动本机 `claude`。未写、写错或写了两个时，Agent 在创建任何节点状态前退出。 |
+| `--yolo` | 不启用 | 整个 Agent 进程中的所有 Codex 会话 | 关闭 Codex 审批与沙箱，使用 `approvalPolicy: never` 和 `dangerFullAccess`；Claude 运行时使用 `bypassPermissions`。Web 会把节点标为“全权限”。 |
+| `--codex-proxy-only` | 不启用 | Agent 自身的控制中心网络 | Agent 注册后的 WSS 控制通道和附件下载强制直连；Codex App Server 或 Claude Code 子进程仍继承代理环境变量。未配置代理时传不传都相同。 |
 
 常用组合：
 
 ```bash
-npm --prefix /path/to/controller-center-agent start -- --yolo --codex-proxy-only
+npm --prefix /path/to/controller-center-agent start -- codex --yolo --codex-proxy-only
 ```
 
-`--yolo` 所说的“全权限”只针对 Codex 的审批和沙箱层，仍然受 Agent 进程所属操作系统用户、文件权限及 systemd 限制。
+`--yolo` 所说的“全权限”只针对 Codex / Claude Code 的审批和沙箱层，仍然受 Agent 进程所属操作系统用户、文件权限及 systemd 限制。
 
 ## 2. 首次注册
 
@@ -144,6 +147,8 @@ npm run agent:enroll -- \
 
 注册成功后，中心地址和节点独立凭证会保存到 `AGENT_DATA_DIR/connection.json`，文件权限为 `0600`。日常启动不再需要域名或注册 Token。
 
+控制中心拒绝节点凭据时（尚未注册、在 Web 中被“仅撤销”或节点已被删除），Agent 会打印原因、结束正在运行的 Codex / Claude Code 进程并以退出码 `78` 停止，不再重连。重新接入需要在 Web 生成新的注册 Token，执行 `agent.sh login` 后再启动。控制中心默认不接受共享 Token，未注册的 Agent 必须先注册。
+
 注册连接失败时，CLI 会显示本次使用直连还是系统代理、请求地址、完整底层错误链和针对 DNS、拒绝连接、超时、TLS 证书或连接重置的排查建议。诊断信息不会展示注册 Token 或代理认证信息。
 
 ## 3. 环境变量
@@ -156,15 +161,16 @@ npm run agent:enroll -- \
 | `AGENT_TOKEN` | 注册凭证优先；否则 `dev-agent-token` | 仅兼容尚未注册的旧共享 Token 节点。本机已有独立凭证后，该变量不会覆盖注册凭证。 |
 | `AGENT_NAME` | 当前主机名 | Agent 报告的节点原始名称；Web 中的显示名称可单独修改。 |
 | `AGENT_ID` | `AGENT_DATA_DIR/identity.json` 中的稳定 ID | 高级覆盖项，主要用于测试或迁移。已注册后不要随意修改，否则会与节点绑定凭证不一致。 |
-| `AGENT_DATA_DIR` | `~/.controller-center-agent` | 保存节点 ID、注册连接、可靠队列、附件缓存和按 Codex 版本保存 24 小时的模型目录缓存。生产环境建议使用绝对路径。 |
+| `AGENT_DATA_DIR` | `~/.controller-center-agent` | 保存节点 ID、注册连接、可靠队列、附件缓存、按运行时 CLI 版本保存 24 小时的模型目录缓存，以及 Claude 运行时的会话登记 `claude-threads.json`。生产环境建议使用绝对路径。 |
 
-### 3.2 Codex 与任务
+### 3.2 运行时与任务
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `CODEX_BIN` | `codex` | 本机 Codex CLI 可执行文件路径。 |
+| `CLAUDE_BIN` | `claude` | 本机 Claude Code CLI 路径；不含 `/` 时按 `PATH` 查找，找不到时 Claude 任务直接失败并提示。 |
 | `MAX_CONCURRENT_RUNS` | `5` | 单个节点的最大并发活动任务总数，必须为正整数；超过后排队。 |
-| `AGENT_NETWORK_ACCESS` | `false` | 非 `--yolo` 模式下，Codex `workspaceWrite` sandbox 是否允许网络。 |
+| `AGENT_NETWORK_ACCESS` | `false` | 非 `--yolo` 模式下，Codex `workspaceWrite` sandbox 是否允许网络；Claude 运行时不使用该项，联网工具按审批流程处理。 |
 | `AGENT_WORKSPACES` | 空数组 | 附加工作空间 JSON 数组，格式为 `[{"id":"project-a","name":"Project A","path":"/srv/project-a"}]`。不能覆盖启动目录决定的默认工作空间。 |
 
 Agent 的默认工作空间由进程启动目录决定。通过 npm workspace 脚本启动时，npm 提供的原始调用目录会被保留；systemd 部署则由 `WorkingDirectory` 决定。
@@ -188,7 +194,7 @@ Agent 的默认工作空间由进程启动目录决定。通过 npm workspace �
 
 代理模式矩阵：
 
-| 场景 | 注册请求 | WSS 控制通道 | 附件下载 | Codex App Server |
+| 场景 | 注册请求 | WSS 控制通道 | 附件下载 | Codex / Claude Code 子进程 |
 | --- | --- | --- | --- | --- |
 | 未配置代理变量 | 直连 | 直连 | 直连 | 直连 |
 | 配置代理，未传 `--codex-proxy-only` | 按代理/`NO_PROXY` | 按代理/`NO_PROXY` | 按代理/`NO_PROXY` | 继承代理变量 |
@@ -198,20 +204,35 @@ Agent 不会记录、上报或写入数据库中的代理 URL 和认证信息。
 
 ## 4. systemd 示例
 
-仓库示例默认采用全权限并仅让 Codex 使用代理：
+仓库示例默认采用全权限并仅让 Codex / Claude Code 子进程使用代理；运行时写在 `ExecStart` 中，模板使用 `<codex|claude>` 占位符，替换为 `codex` 或 `claude` 后才能启动：
 
 ```ini
 [Service]
 WorkingDirectory=/path/to/default-workspace
 EnvironmentFile=/etc/controller-center/agent.env
-ExecStart=/usr/bin/node /opt/controller-center-agent/dist/index.js --yolo --codex-proxy-only
+ExecStart=/usr/bin/node /opt/controller-center-agent/dist/index.js claude --yolo --codex-proxy-only
 ```
 
-- 需要 Codex 审批与沙箱：删除 `--yolo`。
+- 需要审批（Codex 另有沙箱）：删除 `--yolo`。
 - 需要控制中心流量也走系统代理：删除 `--codex-proxy-only`。
 - 修改参数后执行 `systemctl daemon-reload` 并重启 Agent 服务。
+- 模板设置了 `RestartPreventExitStatus=78`：凭据被拒绝时 Agent 以 78 退出，systemd 不会反复拉起；重新注册后手动启动服务。
 
 完整文件见 `deploy/systemd/controller-center-agent.service`，环境变量模板见 `deploy/agent.env.example`。
+
+## 5. Claude Code 运行时
+
+运行时选择 `claude` 时，Agent 通过官方 Claude Agent SDK（`@anthropic-ai/claude-agent-sdk`，版本锁定）驱动节点本机已安装的 `claude` CLI。安装包不附带 SDK 自带的 Claude Code 二进制，节点需自行安装 Claude Code，并以 Agent 的运行用户完成登录（凭据在该用户的 `~/.claude`，不会发送到控制中心）。协议仍为 v5：Agent 把 Claude Code 的事件转换为现有的会话、进度、审批和用量消息，并在握手中上报 `runtime: "claude"` 和所属机器 `machineId`；Control Plane 保存后在节点 API 返回，Web 显示节点运行时及 CLI 版本，并把相关文案显示为 Claude。
+
+- **会话**：每个 Controller Center 会话对应一个 Claude Code 会话，二者 ID 相同，记录保存在 `~/.claude/projects/` 下，可在本机 `claude --resume` 中看到。Agent 在 `AGENT_DATA_DIR/runtimes/claude/claude-threads.json` 记录会话所属工作空间与最近用量。删除会话会同时删除对应的 Claude Code 会话文件。
+- **进程模型**：每轮任务启动一个 Claude Code 进程并恢复该会话，轮次结束后关闭（进程 3 秒内未自行退出则强制结束）。因此 Claude 在该轮中启动的后台命令或后台子任务会随轮次结束停止，不会在轮次之间继续运行。同一会话的下一轮和删除操作会等上一轮进程退出后再执行，避免两个进程同时写入同一会话文件。
+- **设置与系统提示**：使用 Claude Code 自带系统提示，并像 CLI 一样加载用户、项目和本地设置（`CLAUDE.md`、权限规则、Hooks、MCP 服务器）。设置中已允许的工具不会再向 Web 请求审批。
+- **审批**：默认（`--safe`）使用 `acceptEdits`：工作区内的文件修改自动允许；需要确认的命令、工作区外的修改、联网和其他工具显示为 Web 确认卡片，“本会话允许”只在当前 Agent 进程内对同一会话生效。Claude 的提问工具 `AskUserQuestion` 显示为输入表单。`--yolo` 使用 `bypassPermissions`；以 root 运行时 Claude Code 默认拒绝该模式，Agent 会仅为 Claude 子进程设置 `IS_SANDBOX=1`（运维已显式设置该变量时保留原值），启动日志会提示。
+- **追加指令与中止**：追加指令进入 Claude Code 的消息队列，在工具调用之间并入当前轮次。中止会结束当前进程；中止前已排队、尚未处理的追加指令随之丢弃。
+- **模型与选项**：模型列表来自本机 Claude Code（如 `default`、`opus`、`sonnet`、`haiku` 等别名与具体版本），思考强度按模型支持的级别提供。Fast 仅在 Claude Code 标记支持的模型上可用，按 Claude Code 的 Fast 模式计费。
+- **压缩与用量**：手动压缩发送 Claude Code 的 `/compact`；用量来自 Claude Code 报告的累计模型用量，上下文占用取最近一次模型调用。
+- **同机运行 Codex 和 Claude**：同一个 `AGENT_DATA_DIR` 可同时运行 `start codex` 与 `start claude`，共用一次注册的机器身份和凭证，不需要再次 login。节点列表中两者各是一个节点：Codex 节点沿用原有节点 ID（已有节点不变），Claude 节点 ID 由机器 ID 固定推算，会话互不相通。Claude 的本地状态（消息队列、模型缓存、附件、会话登记）保存在 `AGENT_DATA_DIR/runtimes/claude/`，与 Codex 互不干扰。接入按机器管理：在 Web 中“仅撤销”或“删除”任一节点都作用于整台机器的所有运行时。Web 添加的工作空间按机器共享，两个节点都能使用；默认工作空间仍是各自的启动目录。两个节点在同一路径同时运行任务时，Web 会提示并发修改风险。`agent.sh status` 会分别列出正在运行的 Codex 与 Claude 进程。
+- **使用条款**：节点使用的是各自机器上用户本人登录的 Claude Code。按照 Anthropic 的说明，不应把一个 Claude 订阅账号的登录提供给其他人使用，也不应代他人中转 Claude 订阅额度；面向他人提供服务时应使用各自的 API Key 或订阅凭据。
 ## 节点终端与文件工具
 
 Agent v0.3.14 增加真实 PTY 与节点文件能力，旧 Agent 的聊天功能继续兼容协议 v5。Web 的“新开终端”和“节点文件”分别打开独立标签页。Shell 与文件操作使用 Agent 进程的系统用户，文件路径可以越出 Codex 工作空间；Codex 的 `--safe` / `--yolo` 不改变这些工具的权限。

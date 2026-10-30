@@ -11,26 +11,48 @@ function temporaryDirectory(t) {
   return directory;
 }
 
-test('retains every current target and removes old installation and source archives', t => {
+test('retains the current and previous versions and removes older installation and source archives', t => {
   const directory = temporaryDirectory(t);
   const retained = [
     'controller-center-agent-v0.3.17-linux-x64-glibc.tar.gz',
     'controller-center-agent-v0.3.17-darwin-arm64.tar.gz',
     'controller-center-agent-source-v0.3.17.tar.gz',
+    'controller-center-agent-v0.3.16-linux-x64-glibc.tar.gz',
+    'controller-center-agent-v0.3.16-darwin-arm64.tar.gz',
+    'controller-center-agent-source-v0.3.16.tar.gz',
   ];
   const old = [
     'controller-center-agent-v0.3.15-darwin-arm64.tar.gz',
-    'controller-center-agent-v0.3.16-linux-x64-glibc.tar.gz',
-    'controller-center-agent-source-v0.3.16.tar.gz',
+    'controller-center-agent-source-v0.3.15.tar.gz',
     'controller-center-agent-v0.3.4.tar.gz',
-    'controller-center-agent-v0.3.17-beta-linux-x64-glibc.tar.gz',
+    'controller-center-agent-v0.3.16-beta-linux-x64-glibc.tar.gz',
   ];
   for (const name of [...retained, ...old]) writeFileSync(path.join(directory, name), name);
   const result = cleanupAgentPackages(directory, '0.3.17');
+  assert.equal(result.previousVersion, '0.3.16');
   assert.deepEqual(result.removed.sort(), old.sort());
   assert.equal(result.removedBytes, old.reduce((size, name) => size + Buffer.byteLength(name), 0));
   assert.deepEqual(readdirSync(directory).sort(), retained.sort());
   for (const name of retained) assert.equal(readFileSync(path.join(directory, name), 'utf8'), name);
+});
+
+test('rolls back to the closest older installable version by semantic version order', t => {
+  const directory = temporaryDirectory(t);
+  const retained = [
+    'controller-center-agent-v1.0.0-linux-x64-glibc.tar.gz',
+    'controller-center-agent-v1.0.0-rc.10-linux-x64-glibc.tar.gz',
+  ];
+  const old = [
+    'controller-center-agent-v1.0.0-rc.9-linux-x64-glibc.tar.gz',
+    'controller-center-agent-v0.9.0-linux-x64-glibc.tar.gz',
+    // A source archive alone cannot be installed, so it is not a rollback target.
+    'controller-center-agent-source-v1.0.0-rc.11.tar.gz',
+  ];
+  for (const name of [...retained, ...old]) writeFileSync(path.join(directory, name), name);
+  const result = cleanupAgentPackages(directory, '1.0.0');
+  assert.equal(result.previousVersion, '1.0.0-rc.10');
+  assert.deepEqual(result.removed.sort(), old.sort());
+  assert.deepEqual(readdirSync(directory).sort(), retained.sort());
 });
 
 test('keeps existing packages when the replacement is missing or empty', t => {
@@ -56,7 +78,7 @@ test('limits cleanup to regular package archives in the selected output director
   mkdirSync(path.join(directory, 'nested'));
   writeFileSync(path.join(directory, 'nested', old), 'nested-package');
   symlinkSync(path.join(otherDirectory, old), path.join(directory, old));
-  assert.deepEqual(cleanupAgentPackages(directory, '0.3.17').removed, []);
+  assert.deepEqual(cleanupAgentPackages(directory, '0.3.17'), { previousVersion: null, removed: [], removedBytes: 0 });
   assert.equal(readFileSync(path.join(otherDirectory, old), 'utf8'), 'outside-package');
   assert.equal(readFileSync(path.join(directory, 'nested', old), 'utf8'), 'nested-package');
   assert.equal(readFileSync(path.join(directory, 'other-product-v0.3.16.tar.gz'), 'utf8'), 'other');

@@ -5,11 +5,13 @@ const webVersion = JSON.parse(readFileSync(new URL("../package.json", import.met
 const now = "2026-09-10T00:00:00.000Z";
 const node = {
   id: "qa-node",
+  machineId: "qa-node",
   name: "移动工作站",
   reportedName: "qa-node",
   platform: "linux",
   arch: "x64",
   agentVersion: "0.1.0",
+  runtime: "codex",
   codexVersion: "codex-cli 0.153.0",
   permissionMode: "danger-full-access",
   maxConcurrentRuns: 3,
@@ -2507,4 +2509,192 @@ test("设置页在列表展示注册 Token、状态和到期倒计时", async ({
   await expect(page.getByText("已注册", { exact: true })).toBeVisible({ timeout: 12_000 });
   await expect(page.getByText(registrationToken)).toHaveCount(0, { timeout: 8_000 });
   await expect(page.locator('.enrollment-history')).toHaveCount(0);
+});
+
+test("删除和撤销作用于整台机器，删除需要输入节点名称并清理全部会话", async ({ page }) => {
+  await mockControlCenter(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { value: { writeText: async (text: string) => {
+      (window as unknown as { nodeClipboard: string }).nodeClipboard = text;
+    } } });
+  });
+  let deleted = false;
+  const deleteBodies: unknown[] = [];
+  const claudeEntry = {
+    ...node, id: "qa-node-claude", runtime: "claude", codexVersion: "2.1.310 (Claude Code)", activeRuns: 0, accessMode: "enrolled",
+  };
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: deleted ? [] : [claudeEntry, { ...node, accessMode: "enrolled" }] } });
+  });
+  await page.route(`**/api/nodes/${node.id}`, async (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    deleteBodies.push(route.request().postDataJSON());
+    if (deleteBodies.length === 1) {
+      await route.fulfill({ status: 409, json: { error: "这台机器上有 1 个任务正在运行，请先中止后再删除" } });
+      return;
+    }
+    deleted = true;
+    await route.fulfill({ status: 204 });
+  });
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
+  await page.getByRole("button", { name: "节点接入", exact: true }).click();
+  const nodeList = page.locator(".enrollment-nodes");
+  // One machine row lists both runtimes, Codex first.
+  await expect(nodeList.locator("article")).toHaveCount(1);
+  await expect(nodeList.locator(".enrollment-node-runtime")).toHaveText([/^Codex codex-cli/, /^Claude 2\.1\.310/]);
+  await nodeList.screenshot({ path: `/tmp/controller-center-node-actions-${page.viewportSize()!.width}.png` });
+  await nodeList.getByRole("button", { name: "仅撤销", exact: true }).click();
+  await expect(nodeList).toContainText("这台机器上的 Codex、Claude 节点都会立即断开，节点与会话记录保留");
+  await nodeList.getByRole("button", { name: "取消", exact: true }).click();
+  await nodeList.getByRole("button", { name: "删除", exact: true }).click();
+
+  const dialog = page.getByRole("alertdialog", { name: `删除节点“${node.name}”？` });
+  await expect(dialog).toContainText("撤销这台机器的接入凭证，Codex、Claude 节点都会立即断开");
+  await expect(dialog).toContainText("全部会话（2 个）");
+  const confirm = dialog.getByRole("button", { name: "撤销并删除" });
+  const input = dialog.getByRole("textbox", { name: "输入节点名称以确认删除" });
+  await expect(input).toBeFocused();
+  await expect(confirm).toBeDisabled();
+  await input.fill("其他节点");
+  await expect(confirm).toBeDisabled();
+  const copyName = dialog.getByRole("button", { name: "复制节点名称" });
+  await copyName.click();
+  await expect(copyName).toHaveText("已复制");
+  expect(await page.evaluate(() => (window as unknown as { nodeClipboard: string }).nodeClipboard)).toBe(node.name);
+  await input.fill(` ${node.name} `);
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect(dialog.getByText("这台机器上有 1 个任务正在运行，请先中止后再删除")).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+  await page.screenshot({ path: `/tmp/controller-center-delete-node-${page.viewportSize()!.width}.png` });
+
+  // Escape closes only the confirmation, not the settings panel.
+  await input.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "设置" })).toBeVisible();
+
+  await nodeList.getByRole("button", { name: "删除", exact: true }).click();
+  await input.fill(node.name);
+  await input.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect(nodeList).toHaveCount(0);
+  expect(deleteBodies).toEqual([{ confirmName: node.name }, { confirmName: node.name }]);
+});
+
+test("左侧节点栏标出已撤销接入的节点", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "节点栏标记在桌面验证一次");
+  await mockControlCenter(page);
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [{ ...node, status: "offline", accessMode: "revoked" }] } });
+  });
+  await page.goto("/");
+  const badge = page.locator(".node-list .node-revoked-badge");
+  await expect(badge).toHaveText("已撤销");
+  await expect(badge).toHaveAttribute("title", /设置 → 节点接入中删除/);
+  // A revoked node can no longer run anything, so its stale permission badge is hidden.
+  await expect(page.locator(".node-list .node-permission-badge")).toHaveCount(0);
+  await page.locator(".node-list").screenshot({ path: "/tmp/controller-center-revoked-node.png" });
+});
+
+test("节点用官方标志区分 Codex 与 Claude 运行时", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "节点栏标志在桌面验证展开与收起两种状态");
+  await mockControlCenter(page);
+  const claudeNode = {
+    ...node, id: "claude-node", name: "Claude 工作站", reportedName: "claude-node", runtime: "claude",
+    codexVersion: "2.1.310 (Claude Code)", permissionMode: "workspace-write", activeRuns: 0, workspaces: [],
+  };
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [node, claudeNode] } });
+  });
+  await page.goto("/");
+  const cards = page.locator(".node-list .node-card");
+  await expect(cards.nth(0).locator(".node-main .runtime-icon-codex")).toBeVisible();
+  await expect(cards.nth(0).locator(".node-main small")).toContainText("Codex");
+  await expect(cards.nth(1).locator(".node-main .runtime-icon-claude")).toBeVisible();
+  await expect(cards.nth(1).locator(".node-main small")).toContainText("Claude");
+  await page.locator(".node-list").screenshot({ path: "/tmp/controller-center-runtime-icons.png" });
+  await page.getByRole("button", { name: "折叠节点栏" }).click();
+  await expect(cards.nth(1).locator(".node-identity-runtime .runtime-icon-claude")).toBeVisible();
+  await expect(cards.nth(1).locator(".node-identity")).toHaveAttribute("title", /Claude/);
+  await page.locator(".node-list").screenshot({ path: "/tmp/controller-center-runtime-icons-collapsed.png" });
+});
+
+test("Codex 与 Claude 分别设置对话默认值，工作空间按机器管理", async ({ page }) => {
+  await mockControlCenter(page);
+  const efforts = ["low", "medium", "high", "xhigh", "max"].map((reasoningEffort) => ({ reasoningEffort }));
+  const claudeEntry = {
+    ...node, id: "qa-node-claude", runtime: "claude", codexVersion: "2.1.311 (Claude Code)", activeRuns: 0,
+    models: [
+      { id: "default", displayName: "Default (recommended)", isDefault: true, supportedReasoningEfforts: efforts },
+      { id: "opus", displayName: "Opus 5.5", isDefault: false, supportedReasoningEfforts: efforts },
+    ],
+  };
+  const shared = { ...node.workspaces[0], id: "shared", name: "Shared repo", path: "/workspace/shared", source: "web", isDefault: false, conversationCount: 2 };
+  const claudeStartup = { ...node.workspaces[0], id: "claude-start", nodeId: claudeEntry.id, name: "Claude start", path: "/workspace/claude", conversationCount: 0 };
+  const settingsUpdates: unknown[] = [];
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [node, claudeEntry] } });
+  });
+  await page.route(`**/api/nodes/${node.id}/workspaces*`, async (route) => {
+    await route.fulfill({ json: { data: [node.workspaces[0], shared] } });
+  });
+  await page.route(`**/api/nodes/${claudeEntry.id}/workspaces*`, async (route) => {
+    await route.fulfill({ json: { data: [claudeStartup, { ...shared, nodeId: claudeEntry.id }] } });
+  });
+  await page.route("**/api/settings", async (route) => {
+    if (route.request().method() === "PATCH") {
+      settingsUpdates.push(route.request().postDataJSON());
+      await route.fulfill({ json: { settings: route.request().postDataJSON() } });
+      return;
+    }
+    await route.fulfill({ json: { settings: { defaultModel: "gpt-6-astra", defaultEffort: "high", claudeDefaultModel: "opus", claudeDefaultEffort: "xhigh" } } });
+  });
+  await page.goto("/");
+  const openSettings = () => page.locator('button[aria-label="设置"]:visible, button[title="设置"]:visible').first().click();
+  await openSettings();
+
+  // Each runtime picks from the models its own nodes report.
+  const codex = page.getByRole("region", { name: "Codex 对话默认值" });
+  const claude = page.getByRole("region", { name: "Claude 对话默认值" });
+  await expect(codex.getByRole("combobox", { name: "Codex 默认模型" })).toHaveValue("gpt-6-astra");
+  await expect(claude.getByRole("combobox", { name: "Claude 默认模型" })).toHaveValue("opus");
+  await expect(claude.getByRole("combobox", { name: "Claude 默认模型" }).locator("option:checked")).toHaveText("Opus 5.5");
+  await expect(claude.getByRole("combobox", { name: "Claude 默认模型" }).locator("option")).not.toContainText(["GPT-6-Astra"]);
+  await expect(claude.getByRole("combobox", { name: "Claude 默认思考强度" })).toHaveValue("xhigh");
+  await page.locator(".settings-form").screenshot({ path: `/tmp/controller-center-runtime-defaults-${page.viewportSize()!.width}.png` });
+  await claude.getByRole("combobox", { name: "Claude 默认思考强度" }).selectOption("max");
+  await page.getByRole("button", { name: "保存设置" }).click();
+  expect(settingsUpdates).toEqual([{ defaultModel: "gpt-6-astra", defaultEffort: "high", claudeDefaultModel: "opus", claudeDefaultEffort: "max" }]);
+
+  // One machine, one list: the shared Web workspace once, each startup directory with its runtime.
+  await openSettings();
+  await page.locator(".settings-layout nav").getByRole("button", { name: "工作空间" }).click();
+  const machineSelect = page.getByRole("combobox", { name: "管理节点" });
+  await expect(machineSelect.locator("option")).toHaveText([`${node.name} · 在线`]);
+  const cards = page.locator(".workspace-card");
+  await expect(cards).toHaveCount(3);
+  await expect(cards.filter({ hasText: "Shared repo" })).toContainText("2 个会话");
+  await expect(cards.filter({ hasText: "Shared repo" }).locator(".workspace-runtimes")).toHaveCount(0);
+  await expect(cards.filter({ hasText: "Claude start" }).locator(".workspace-runtimes")).toHaveText("Claude");
+  await expect(cards.filter({ hasText: "Controller Center" }).locator(".workspace-runtimes")).toHaveText("Codex");
+  await page.locator(".workspace-settings").screenshot({ path: `/tmp/controller-center-machine-workspaces-${page.viewportSize()!.width}.png` });
+});
+
+test("Claude 节点的新会话使用 Claude 默认模型和思考强度", async ({ page }) => {
+  await mockControlCenter(page, { unopenedNode: true });
+  const efforts = ["low", "medium", "high", "xhigh", "max"].map((reasoningEffort) => ({ reasoningEffort }));
+  await page.route("**/api/nodes", async (route) => {
+    await route.fulfill({ json: { data: [{ ...node, runtime: "claude", models: [
+      { id: "default", displayName: "Default (recommended)", isDefault: true, supportedReasoningEfforts: efforts },
+      { id: "opus", displayName: "Opus 5.5", isDefault: false, supportedReasoningEfforts: efforts },
+    ] }] } });
+  });
+  await page.route("**/api/settings", async (route) => {
+    await route.fulfill({ json: { settings: { defaultModel: "gpt-6-astra", defaultEffort: "high", claudeDefaultModel: "opus", claudeDefaultEffort: "xhigh" } } });
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "开始一个新会话" })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "选择模型" })).toHaveValue("opus");
+  await expect(page.getByRole("combobox", { name: "选择思考强度" })).toHaveValue("xhigh");
 });

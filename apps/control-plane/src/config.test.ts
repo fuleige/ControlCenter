@@ -8,6 +8,17 @@ afterEach(() => {
   process.env = { ...originalEnvironment };
 });
 
+describe("Control Plane Agent access configuration", () => {
+  it("disables legacy shared-token access unless a token is configured", () => {
+    delete process.env.AGENT_SHARED_TOKEN;
+    expect(loadConfig().agentToken).toBeNull();
+    process.env.AGENT_SHARED_TOKEN = "  ";
+    expect(loadConfig().agentToken).toBeNull();
+    process.env.AGENT_SHARED_TOKEN = "migration-token";
+    expect(loadConfig().agentToken).toBe("migration-token");
+  });
+});
+
 describe("Control Plane data configuration", () => {
   it("anchors the default data directory to the invocation directory", () => {
     process.env.INIT_CWD = "/srv/controller-center";

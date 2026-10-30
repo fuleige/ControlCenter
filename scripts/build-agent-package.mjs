@@ -104,6 +104,9 @@ try {
     type: "module",
     main: "./dist/index.js",
     types: "./dist/index.d.ts",
+    // Mirror the workspace subpath exports (e.g. ./node-identity), resolved to built files.
+    exports: Object.fromEntries(Object.entries(protocolPackage.exports).map(([subpath, target]) =>
+      [subpath, { types: target.import.replace(/\.js$/, ".d.ts"), import: target.import }])),
   }, null, 2)}\n`);
   writeFileSync(path.join(releaseDirectory, "node-files/package.json"), `${JSON.stringify({
     name: "@controller-center/node-files", version: "0.1.0", private: true, type: "module",
@@ -119,6 +122,15 @@ try {
   }, null, 2)}\n`);
 
   run("npm", ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], releaseDirectory);
+  // The Claude runtime drives the node's own installed `claude` CLI, so drop the
+  // SDK's bundled per-platform Claude Code binary (~290 MB).
+  const anthropicModules = path.join(releaseDirectory, "node_modules/@anthropic-ai");
+  if (existsSync(anthropicModules)) for (const entry of readdirSync(anthropicModules)) {
+    if (entry.startsWith("claude-agent-sdk-")) rmSync(path.join(anthropicModules, entry), { recursive: true, force: true });
+  }
+  run("node", ["--input-type=module", "-e", `const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    if (typeof sdk.query !== 'function') throw new Error('Claude Agent SDK did not load');
+    console.log('Packaged Claude Agent SDK loads without its bundled CLI binary');`], releaseDirectory);
   // Installation stays script-free. Copy the native module already built on this
   // exact target, then prove the standalone installation can spawn a real PTY.
   cpSync(requirePath("node_modules/node-pty"), path.join(releaseDirectory, "node_modules/node-pty"), { recursive: true });
@@ -148,7 +160,7 @@ try {
   const size = statSync(finalArtifact).size;
   const sha256 = createHash("sha256").update(readFileSync(finalArtifact)).digest("hex");
   const cleanup = cleanupAgentPackages(artifactDirectory, version);
-  process.stdout.write(`Agent package: ${finalArtifact}\nSize: ${size} bytes\nSHA-256: ${sha256}\nRemoved previous Agent packages: ${cleanup.removed.length}\n`);
+  process.stdout.write(`Agent package: ${finalArtifact}\nSize: ${size} bytes\nSHA-256: ${sha256}\nKept rollback version: ${cleanup.previousVersion ? `v${cleanup.previousVersion}` : 'none'}\nRemoved older Agent packages: ${cleanup.removed.length}\n`);
 } finally {
   if (existsSync(temporaryArtifact)) rmSync(temporaryArtifact, { force: true });
   rmSync(temporaryDirectory, { recursive: true, force: true });

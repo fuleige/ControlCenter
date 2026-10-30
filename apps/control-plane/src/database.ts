@@ -3,6 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AgentErrorPayload,
+  AgentRuntime,
   ConversationCompaction,
   ConversationCompactionPayload,
   ConversationTokenUsage,
@@ -25,11 +26,15 @@ type Row = Record<string, unknown>;
 
 export interface NodeRecord {
   id: string;
+  /** Machine whose credential this runtime entry uses; access is granted per machine. */
+  machineId: string;
   name: string;
   reportedName: string;
   platform: string;
   arch: string;
   agentVersion: string;
+  runtime: AgentRuntime;
+  /** Version string reported by the runtime's CLI. */
   codexVersion: string;
   permissionMode: "workspace-write" | "danger-full-access";
   maxConcurrentRuns: number;
@@ -156,10 +161,23 @@ export interface NotificationRecord {
   manualUnreadAt: string | null;
 }
 
+/** New-conversation defaults; the unprefixed pair predates Claude and applies to Codex. */
 export interface GlobalSettingsRecord {
   defaultModel: string | null;
   defaultEffort: string | null;
+  claudeDefaultModel: string | null;
+  claudeDefaultEffort: string | null;
 }
+
+const globalSettingKeys = ["defaultModel", "defaultEffort", "claudeDefaultModel", "claudeDefaultEffort"] as const;
+
+/** Used until Claude defaults are first saved: Opus (Claude Code's alias for Opus 5.5) at extra-high effort. */
+const initialGlobalSettings: GlobalSettingsRecord = {
+  defaultModel: null,
+  defaultEffort: null,
+  claudeDefaultModel: "opus",
+  claudeDefaultEffort: "xhigh",
+};
 
 export interface AdminSessionRecord {
   id: string;
@@ -280,6 +298,27 @@ function nullableText(row: Row, key: string): string | null {
   const value = row[key];
   return value === null || value === undefined ? null : String(value);
 }
+
+/**
+ * A node's display name. An entry nobody renamed takes its machine's Codex entry
+ * name, so a Claude entry started on that machine reads as the same machine.
+ */
+function nodeNameSql(alias: string): string {
+  return `COALESCE(NULLIF(${alias}.display_name, ''), `
+    + `(SELECT NULLIF(m.display_name, '') FROM nodes m WHERE m.id = ${alias}.machine_id AND m.id <> ${alias}.id), ${alias}.name)`;
+}
+
+/** SQL matching the entries on the machine of the node id expression `nodeIdSql`. */
+function machineEntriesSql(nodeIdSql: string): string {
+  return `SELECT m.id FROM nodes m WHERE COALESCE(m.machine_id, m.id) = (SELECT COALESCE(o.machine_id, o.id) FROM nodes o WHERE o.id = ${nodeIdSql})`;
+}
+
+/**
+ * Conversations using workspace row `w`. A Web workspace is shared by the
+ * runtimes of its machine, so its count covers all of their conversations.
+ */
+const workspaceConversationCountSql = `(SELECT COUNT(*) FROM conversations c WHERE c.workspace_id = w.id
+  AND (c.node_id = w.node_id OR (w.source = 'web' AND c.node_id IN (${machineEntriesSql("w.node_id")})))) AS conversation_count`;
 
 function parseJson(value: unknown): unknown {
   return JSON.parse(String(value));
@@ -612,6 +651,10 @@ export class ControlDatabase {
     this.ensureColumn("nodes", "model_catalog_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("nodes", "capabilities_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("nodes", "permission_mode", "TEXT NOT NULL DEFAULT 'workspace-write'");
+    // Rows written before runtimes were selectable all came from Codex Agents.
+    this.ensureColumn("nodes", "runtime", "TEXT NOT NULL DEFAULT 'codex'");
+    // NULL for nodes from Agents that predate shared machines: their id is the machine.
+    this.ensureColumn("nodes", "machine_id", "TEXT");
     this.ensureColumn("workspaces", "source", "TEXT NOT NULL DEFAULT 'config'");
     this.ensureColumn("workspaces", "is_default", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("workspaces", "status", "TEXT NOT NULL DEFAULT 'valid'");
@@ -756,14 +799,16 @@ export class ControlDatabase {
     try {
       this.sqlite.prepare(`
         INSERT INTO nodes (
-          id, name, platform, arch, agent_version, codex_version,
+          id, machine_id, name, platform, arch, agent_version, runtime, codex_version,
           permission_mode, max_concurrent_runs, active_runs, status, boot_id, last_seen_at, connected_at, model_catalog_json, capabilities_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'online', ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
+          machine_id = excluded.machine_id,
           name = excluded.name,
           platform = excluded.platform,
           arch = excluded.arch,
           agent_version = excluded.agent_version,
+          runtime = excluded.runtime,
           codex_version = excluded.codex_version,
           permission_mode = excluded.permission_mode,
           max_concurrent_runs = excluded.max_concurrent_runs,
@@ -776,10 +821,12 @@ export class ControlDatabase {
           updated_at = excluded.updated_at
       `).run(
         node.id,
+        node.machineId ?? node.id,
         node.name,
         node.platform,
         node.arch,
         node.agentVersion,
+        node.runtime === "claude" ? "claude" : "codex",
         node.codexVersion,
         node.permissionMode === "danger-full-access" ? "danger-full-access" : "workspace-write",
         node.maxConcurrentRuns,
@@ -869,6 +916,7 @@ export class ControlDatabase {
           }
         }
       }
+      this.copyMachineWebWorkspaces(node.id, now);
       this.sqlite.exec("COMMIT");
     } catch (error) {
       this.sqlite.exec("ROLLBACK");
@@ -938,25 +986,27 @@ export class ControlDatabase {
 
   listNodes(): NodeRecord[] {
     const rows = this.sqlite.prepare(`
-      SELECT n.*,
-        EXISTS(SELECT 1 FROM node_credentials nc WHERE nc.node_id = n.id) AS has_credentials,
-        EXISTS(SELECT 1 FROM node_credentials nc WHERE nc.node_id = n.id AND nc.revoked_at IS NULL) AS has_active_credentials
+      SELECT n.*, ${nodeNameSql("n")} AS display_label,
+        EXISTS(SELECT 1 FROM node_credentials nc WHERE nc.node_id = COALESCE(n.machine_id, n.id)) AS has_credentials,
+        EXISTS(SELECT 1 FROM node_credentials nc WHERE nc.node_id = COALESCE(n.machine_id, n.id) AND nc.revoked_at IS NULL) AS has_active_credentials
       FROM nodes n ORDER BY n.status DESC, n.name
     `).all() as Row[];
     const workspaceStatement = this.sqlite.prepare(`
-      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      SELECT w.*, ${workspaceConversationCountSql}
       FROM workspaces w
       WHERE w.node_id = ?
       ORDER BY w.is_default DESC, w.archived_at IS NOT NULL, w.name
     `);
     return rows.map((row) => ({
       id: text(row, "id"),
-      name: nullableText(row, "display_name") ?? text(row, "name"),
+      machineId: nullableText(row, "machine_id") ?? text(row, "id"),
+      name: text(row, "display_label"),
       reportedName: text(row, "name"),
       platform: text(row, "platform"),
       arch: text(row, "arch"),
       agentVersion: text(row, "agent_version"),
       codexVersion: text(row, "codex_version"),
+      runtime: text(row, "runtime") === "claude" ? "claude" : "codex",
       permissionMode: text(row, "permission_mode") === "danger-full-access" ? "danger-full-access" : "workspace-write",
       maxConcurrentRuns: Number(row.max_concurrent_runs),
       activeRuns: Number(row.active_runs),
@@ -981,7 +1031,7 @@ export class ControlDatabase {
 
   getWorkspace(nodeId: string, workspaceId: string): WorkspaceRecord | null {
     const row = this.sqlite.prepare(`
-      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      SELECT w.*, ${workspaceConversationCountSql}
       FROM workspaces w WHERE w.node_id = ? AND w.id = ?
     `).get(nodeId, workspaceId) as Row | undefined;
     if (!row) return null;
@@ -991,7 +1041,7 @@ export class ControlDatabase {
 
   listWorkspaces(nodeId: string, includeArchived = false): WorkspaceRecord[] {
     const rows = this.sqlite.prepare(`
-      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      SELECT w.*, ${workspaceConversationCountSql}
       FROM workspaces w
       WHERE w.node_id = ? ${includeArchived ? "" : "AND w.archived_at IS NULL"}
       ORDER BY w.is_default DESC, w.archived_at IS NOT NULL, w.name
@@ -1016,7 +1066,7 @@ export class ControlDatabase {
 
   findWorkspaceByPath(nodeId: string, workspacePath: string, exceptId?: string): WorkspaceRecord | null {
     const row = this.sqlite.prepare(`
-      SELECT w.*, (SELECT COUNT(*) FROM conversations c WHERE c.node_id = w.node_id AND c.workspace_id = w.id) AS conversation_count
+      SELECT w.*, ${workspaceConversationCountSql}
       FROM workspaces w
       WHERE w.node_id = ? AND w.path = ? ${exceptId ? "AND w.id <> ?" : ""}
       LIMIT 1
@@ -1024,13 +1074,54 @@ export class ControlDatabase {
     return row ? this.workspaceFromRow(row) : null;
   }
 
-  createWebWorkspace(input: { id: string; nodeId: string; name: string; path: string; now: string }): WorkspaceRecord {
+  /**
+   * Entries holding a copy of a workspace. A Web workspace is a directory of the
+   * machine, so each runtime entry on it has a copy under the same id.
+   */
+  workspaceCopyNodeIds(nodeId: string, id: string): string[] {
+    return (this.sqlite.prepare(`
+      SELECT w.node_id FROM workspaces w
+      WHERE w.id = ? AND (w.node_id = ? OR (
+        w.source = 'web' AND w.node_id IN (${machineEntriesSql("?")})
+        AND (SELECT own.source FROM workspaces own WHERE own.node_id = ? AND own.id = w.id) = 'web'
+      ))
+      ORDER BY w.node_id
+    `).all(id, nodeId, nodeId, nodeId) as Row[]).map((row) => text(row, "node_id"));
+  }
+
+  /** Gives a runtime entry the Web workspaces the other runtimes of its machine list. */
+  private copyMachineWebWorkspaces(nodeId: string, now: string): void {
     this.sqlite.prepare(`
       INSERT INTO workspaces (
         node_id, id, name, path, source, is_default, status,
         validation_error, last_validated_at, archived_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'web', 0, 'valid', NULL, ?, NULL, ?, ?)
-    `).run(input.nodeId, input.id, input.name, input.path, input.now, input.now, input.now);
+      )
+      SELECT ?, w.id, w.name, w.path, 'web', 0, w.status, w.validation_error, w.last_validated_at, w.archived_at, w.created_at, ?
+      FROM workspaces w
+      WHERE w.source = 'web' AND w.node_id <> ? AND w.node_id IN (${machineEntriesSql("?")})
+        -- An entry already listing the directory (e.g. as its startup directory) keeps its own row.
+        AND NOT EXISTS (SELECT 1 FROM workspaces own WHERE own.node_id = ? AND (own.id = w.id OR own.path = w.path))
+      GROUP BY w.id
+    `).run(nodeId, now, nodeId, nodeId, nodeId);
+  }
+
+  createWebWorkspace(input: { id: string; nodeId: string; name: string; path: string; now: string }): WorkspaceRecord {
+    this.sqlite.exec("BEGIN");
+    try {
+      this.sqlite.prepare(`
+        INSERT INTO workspaces (
+          node_id, id, name, path, source, is_default, status,
+          validation_error, last_validated_at, archived_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'web', 0, 'valid', NULL, ?, NULL, ?, ?)
+      `).run(input.nodeId, input.id, input.name, input.path, input.now, input.now, input.now);
+      for (const entryId of this.machineNodeIds(this.machineIdOf(input.nodeId)!)) {
+        if (entryId !== input.nodeId) this.copyMachineWebWorkspaces(entryId, input.now);
+      }
+      this.sqlite.exec("COMMIT");
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
     return this.getWorkspace(input.nodeId, input.id)!;
   }
 
@@ -1045,10 +1136,11 @@ export class ControlDatabase {
       : input.archived === false || input.path
         ? "valid"
         : current.status === "offline" ? "valid" : current.status;
+    const copies = this.workspaceCopyNodeIds(input.nodeId, input.id);
     this.sqlite.prepare(`
       UPDATE workspaces SET name = ?, path = ?, status = ?, validation_error = ?,
         last_validated_at = ?, archived_at = ?, updated_at = ?
-      WHERE node_id = ? AND id = ?
+      WHERE id = ? AND node_id IN (${copies.map(() => "?").join(", ")})
     `).run(
       name,
       workspacePath,
@@ -1057,26 +1149,29 @@ export class ControlDatabase {
       input.path ? input.now : current.lastValidatedAt,
       archivedAt,
       input.now,
-      input.nodeId,
       input.id,
+      ...copies,
     );
     return this.getWorkspace(input.nodeId, input.id);
   }
 
   updateWorkspaceValidation(nodeId: string, id: string, valid: boolean, error: string | null, now: string): WorkspaceRecord | null {
+    const copies = this.workspaceCopyNodeIds(nodeId, id);
     this.sqlite.prepare(`
       UPDATE workspaces SET status = ?, validation_error = ?, last_validated_at = ?, updated_at = ?
-      WHERE node_id = ? AND id = ? AND archived_at IS NULL
-    `).run(valid ? "valid" : "invalid", valid ? null : error, now, now, nodeId, id);
+      WHERE id = ? AND node_id IN (${copies.map(() => "?").join(", ")}) AND archived_at IS NULL
+    `).run(valid ? "valid" : "invalid", valid ? null : error, now, now, id, ...copies);
     return this.getWorkspace(nodeId, id);
   }
 
   deleteUnusedWorkspace(nodeId: string, id: string): boolean {
+    const copies = this.workspaceCopyNodeIds(nodeId, id);
+    const placeholders = copies.map(() => "?").join(", ");
     return this.sqlite.prepare(`
       DELETE FROM workspaces
-      WHERE node_id = ? AND id = ? AND is_default = 0
-        AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.node_id = workspaces.node_id AND c.workspace_id = workspaces.id)
-    `).run(nodeId, id).changes > 0;
+      WHERE id = ? AND node_id IN (${placeholders}) AND is_default = 0
+        AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.workspace_id = workspaces.id AND c.node_id IN (${placeholders}))
+    `).run(id, ...copies, ...copies).changes > 0;
   }
 
   createConversation(record: Omit<ConversationRecord, "unread" | "unreadAt">): void {
@@ -1246,7 +1341,7 @@ export class ControlDatabase {
       } else {
         predicates.push(`(
           instr(lower(c.title), lower(?)) > 0
-          OR instr(lower(COALESCE(NULLIF(n.display_name, ''), n.name)), lower(?)) > 0
+          OR instr(lower(${nodeNameSql("n")}), lower(?)) > 0
         )`);
         baseParameters.push(query, query);
       }
@@ -1612,7 +1707,9 @@ export class ControlDatabase {
       FROM runs r
       JOIN conversations c ON c.id = r.conversation_id
       JOIN workspaces w ON w.node_id = c.node_id AND w.id = c.workspace_id
-      WHERE c.node_id = ?
+      JOIN nodes n ON n.id = c.node_id
+      -- Codex and Claude entries of one machine share its directories.
+      WHERE COALESCE(n.machine_id, n.id) = (SELECT COALESCE(machine_id, id) FROM nodes WHERE id = ?)
         AND w.path = ?
         AND r.status IN ('queued', 'dispatching', 'running', 'waiting_approval', 'recovering')
       LIMIT 1
@@ -2093,7 +2190,7 @@ export class ControlDatabase {
   listTaskCenter(limit = 200, readCutoff = new Date(Date.now() - 30 * 86_400_000).toISOString()): TaskCenterRecord[] {
     const rows = this.sqlite.prepare(`
       SELECT c.id AS conversation_id, c.title AS conversation_title,
-        n.id AS node_id, COALESCE(n.display_name, n.name) AS node_name,
+        n.id AS node_id, ${nodeNameSql("n")} AS node_name,
         x.id AS notification_id, x.manual_unread_at,
         CASE WHEN x.id IS NOT NULL AND x.read_at IS NULL THEN 1 ELSE 0 END AS unread,
         r.id AS run_id, COALESCE(r.status, c.status) AS status,
@@ -2136,10 +2233,10 @@ export class ControlDatabase {
       "SELECT key, value_json FROM settings WHERE scope = 'global' AND scope_id = 'default'",
     ).all() as Row[];
     const values = new Map(rows.map((row) => [text(row, "key"), parseJson(row.value_json)]));
-    return {
-      defaultModel: typeof values.get("defaultModel") === "string" ? values.get("defaultModel") as string : null,
-      defaultEffort: typeof values.get("defaultEffort") === "string" ? values.get("defaultEffort") as string : null,
-    };
+    return Object.fromEntries(globalSettingKeys.map((key) => {
+      const value = values.get(key);
+      return [key, values.has(key) ? typeof value === "string" ? value : null : initialGlobalSettings[key]];
+    })) as unknown as GlobalSettingsRecord;
   }
 
   updateGlobalSettings(settings: GlobalSettingsRecord, now: string): GlobalSettingsRecord {
@@ -2150,8 +2247,7 @@ export class ControlDatabase {
     `);
     this.sqlite.exec("BEGIN");
     try {
-      statement.run("defaultModel", JSON.stringify(settings.defaultModel), now);
-      statement.run("defaultEffort", JSON.stringify(settings.defaultEffort), now);
+      for (const key of globalSettingKeys) statement.run(key, JSON.stringify(settings[key]), now);
       this.sqlite.exec("COMMIT");
     } catch (error) {
       this.sqlite.exec("ROLLBACK");
@@ -2400,6 +2496,63 @@ export class ControlDatabase {
       UPDATE node_credentials SET revoked_at = ?
       WHERE node_id = ? AND revoked_at IS NULL
     `).run(revokedAt, nodeId).changes);
+  }
+
+  /** The machine a node-list entry belongs to, or null when the entry does not exist. */
+  machineIdOf(nodeId: string): string | null {
+    const row = this.sqlite.prepare("SELECT COALESCE(machine_id, id) AS machine_id FROM nodes WHERE id = ?").get(nodeId) as Row | undefined;
+    return row ? text(row, "machine_id") : null;
+  }
+
+  machineNodeIds(machineId: string): string[] {
+    return (this.sqlite.prepare("SELECT id FROM nodes WHERE COALESCE(machine_id, id) = ? ORDER BY id").all(machineId) as Row[])
+      .map((row) => text(row, "id"));
+  }
+
+  /** Unfinished runs on the machine's connected entries, which a disconnect would orphan. */
+  countActiveMachineRuns(machineId: string): number {
+    const row = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM runs r
+      JOIN conversations c ON c.id = r.conversation_id
+      JOIN nodes n ON n.id = c.node_id
+      WHERE COALESCE(n.machine_id, n.id) = ? AND n.status = 'online'
+        AND r.status IN ('queued', 'dispatching', 'running', 'waiting_approval', 'recovering')
+    `).get(machineId) as Row;
+    return Number(row.count);
+  }
+
+  /**
+   * Removes every runtime entry of a machine with their conversations and
+   * history, plus the machine's credentials so none of its Agents can
+   * reconnect. Runs, messages, approvals, notifications and workspaces cascade
+   * from the rows deleted here. Returns the removed entry ids and the storage
+   * keys of their conversation attachments for the caller to unlink.
+   */
+  deleteMachine(machineId: string): { nodeIds: string[]; attachmentStorageKeys: string[] } {
+    this.sqlite.exec("BEGIN");
+    try {
+      const nodeIds = this.machineNodeIds(machineId);
+      const entries = `(${nodeIds.map(() => "?").join(", ")})`;
+      let attachmentStorageKeys: string[] = [];
+      if (nodeIds.length > 0) {
+        const nodeAttachments = `FROM attachments WHERE conversation_id IN (SELECT id FROM conversations WHERE node_id IN ${entries})`;
+        attachmentStorageKeys = (this.sqlite.prepare(`SELECT storage_key ${nodeAttachments}`).all(...nodeIds) as Row[])
+          .map((row) => text(row, "storage_key"));
+        this.sqlite.prepare(`DELETE ${nodeAttachments}`).run(...nodeIds);
+        for (const table of ["events", "approvals", "commands", "conversations", "deliveries"]) {
+          this.sqlite.prepare(`DELETE FROM ${table} WHERE node_id IN ${entries}`).run(...nodeIds);
+        }
+        this.sqlite.prepare(`DELETE FROM nodes WHERE id IN ${entries}`).run(...nodeIds);
+      }
+      for (const table of ["node_credentials", "enrollment_tokens"]) {
+        this.sqlite.prepare(`DELETE FROM ${table} WHERE node_id = ?`).run(machineId);
+      }
+      this.sqlite.exec("COMMIT");
+      return { nodeIds, attachmentStorageKeys };
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   createUiEvent(type: string, resourceId: string | null, occurredAt: string, conversationId: string | null = null): UiEventRecord {

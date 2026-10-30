@@ -1,6 +1,6 @@
 # Controller Center
 
-一个用于集中管理多台本地 Codex 节点的控制中心。节点上的 Agent 主动连接控制中心，并通过 `stdio` 驱动本地 `codex app-server`；Codex 登录凭据始终留在节点本地。工作区文件默认不上传；文件预览和传输只处理管理员明确选择的文件，节点文件上传、下载可使用 WebRTC 直连或控制中心中转。
+一个用于集中管理多台本地 Codex / Claude Code 节点的控制中心。节点上的 Agent 主动连接控制中心，按启动时必选的运行时，通过 `stdio` 驱动本地 `codex app-server`，或通过 Claude Agent SDK 驱动本机已安装的 `claude` CLI；Codex 与 Claude Code 的登录凭据始终留在节点本地。工作区文件默认不上传；文件预览和传输只处理管理员明确选择的文件，节点文件上传、下载可使用 WebRTC 直连或控制中心中转。
 
 产品、可靠性和公网认证方案见 [产品设计](docs/product-design.md)、[可靠性设计](docs/reliability-design.md) 与 [公网认证及节点接入设计](docs/security-enrollment-design.md)。节点工具方案和验证记录见 [节点终端与文件管理设计](docs/node-tools-design.md)。Agent 可用参数、环境变量、优先级和组合示例见 [Agent 客户端命令与配置](docs/agent-cli.md)。代码按这些边界实施。
 
@@ -9,15 +9,16 @@
 代码位于同一 npm workspace，但三个应用可以分别构建和部署：
 
 - `apps/control-plane`：节点注册、调度、状态持久化、审批和 SSE API。
-- `apps/agent`：部署在受控节点，管理本地 Codex App Server。
+- `apps/agent`：部署在受控节点，管理本地 Codex App Server 或 Claude Code CLI（每个 Agent 进程只选一种）。
 - `apps/web`：独立 React Web 控制台，支持桌面和移动端浏览器。
 - `packages/protocol`：控制中心与 Agent 共享的版本化协议，不包含业务运行代码。
 
 ```text
 Mobile/Desktop Web -- REST + SSE --> Control Plane <-- outbound WSS -- Node Agent -- stdio --> Codex App Server
+                                                                         └─ stdio (Claude Agent SDK) --> Claude Code CLI
 ```
 
-控制中心与 Agent 使用自有 `control-protocol/v5`。Codex JSON-RPC 的版本差异只在 Agent 内处理。
+控制中心与 Agent 使用自有 `control-protocol/v5`。Codex JSON-RPC 的版本差异、以及 Claude Code 与 Codex 的语义差异都只在 Agent 内处理；Agent 在 `agent.hello` 中上报 `runtime`（`codex` / `claude`）和 `machineId`，协议仍为 v5，未上报这些字段的旧 Agent 均按 Codex 处理、节点 ID 即机器 ID，现有 Codex 节点无需改动即可继续连接。同一数据目录可同时运行两种运行时，共用一次注册的机器凭证，在节点列表中各为一个节点；Codex 节点沿用机器 ID，Claude 节点 ID 由机器 ID 固定推算，Control Plane 据此校验凭证。Control Plane 保存该字段并在节点 API 返回，Web 在节点列表、会话栏、聊天标题、快速切换、消息中心筛选和节点接入页显示运行时。
 
 Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane 变化时，现有 Agent 无需升级、重新打包或重启；只有协议兼容性或 Agent 运行代码变化时才发布新的 Agent。升级协议时必须先部署并重启 Control Plane，再更新 Agent；`4400 Protocol mismatch` 表示双方协议版本不兼容，不需要重新注册节点。
 
@@ -25,9 +26,10 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 
 - Web 使用随机管理员 Token 登录，服务端建立 HttpOnly 会话；管理员原始 Token 不进入前端构建、Local Storage 或 URL。
 - Web 可生成 10 分钟有效的节点注册 Token；有效期内可在列表查看、复制和确认注册状态，到期自动删除；Agent 首次注册后使用与固定节点 ID 绑定的独立长期凭证。
-- “设置 → 节点接入”按系统和架构展示已准备的 Agent 安装包，选择后可下载，并查看 Agent 版本、文件大小与 SHA-256；当前下载目录提供 v0.3.22 Linux x64/glibc 与 macOS ARM64 包，用户已于 2026-10-26 反馈两个平台实测未发现异常；安装包不能跨系统使用。普通下载接口沿用管理员登录态，也支持复制一小时有效的安装包专用下载链接；验证范围见[本轮实机反馈](docs/node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。
-- Agent 注册、心跳、断线检测和自动重连；迁移期间仍兼容旧共享 Token。
-- Agent 可在启动时显式传入 `--yolo`，以关闭 Codex 审批和沙箱；节点会把当前权限模式上报给中心，Web 在节点名称旁持续显示“全权限”。
+- “设置 → 节点接入”按系统和架构展示已准备的 Agent 安装包，选择后可下载，并查看 Agent 版本、文件大小与 SHA-256；当前下载目录提供 v0.3.24 Linux x64/glibc 与 macOS ARM64 包，并保留 v0.3.23 用于回退；用户已于 2026-10-30 反馈 Linux 包实测通过，macOS 包尚待实机验证；安装包不能跨系统使用。普通下载接口沿用管理员登录态，也支持复制一小时有效的安装包专用下载链接；验证范围见[本轮实机反馈](docs/node-tools-design.md#1019-linux-与-macos-实机反馈及提交前检查)。
+- Agent 注册、心跳、断线检测和自动重连；凭据被拒绝（未注册、已撤销或节点已删除）时停止重连并以退出码 78 退出。旧共享 Token 仅在显式设置 `AGENT_SHARED_TOKEN` 时兼容。
+- Agent 启动参数必须写明运行时 `codex` 或 `claude`（例如 `./agent.sh start claude`），没有默认值；未写、写错或同时写两个时拒绝启动，且不创建节点状态。Claude 运行时的行为与限制见 [Agent 客户端命令与配置](docs/agent-cli.md#5-claude-code-运行时)。
+- Agent 可在启动时显式传入 `--yolo`，以关闭 Codex 审批和沙箱（Claude 运行时对应 `bypassPermissions`）；节点会把当前权限模式上报给中心，Web 在节点名称旁持续显示“全权限”。
 - Agent 统一读取 Linux/macOS CLI 常用的代理环境变量；可通过 `--codex-proxy-only` 让控制中心注册、控制通道和附件下载强制直连，同时只让 Codex 子进程继承系统代理。
 - Agent 启动目录自动成为不可修改的默认工作空间；还可通过启动配置或 Web 设置为节点登记多个本地路径。
 - Web 添加工作空间时由对应 Agent 验证目录存在、可读写并返回规范路径；每次创建会话或新任务前再次验证。
@@ -48,7 +50,7 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 - 全局快速切换支持按节点名称或会话名称搜索所有节点和跨节点历史会话；空关键词不加载历史会话，有关键词时最多返回 10 条会话结果。桌面端可使用 `Ctrl/Cmd + K`，移动端底部工具栏按“节点、消息、搜索、设置”排列，节点入口直接显示在线数/总数。
 - 会话列表使用服务端名称搜索与游标分页，每页 50 条，浏览器最多缓存 300 条；更早会话继续通过名称搜索访问，不会下载或检索消息正文、代码和附件内容。
 - 消息中心汇总和排序后最多展示 200 个会话，未读计数统计完整数据，摘要最多 120 个字符；已读提醒保留 30 天、自动未读保留 90 天，手动未读保留至已读。标记更早会话可恢复提醒入口，任务时间与会话历史保留。
-- 全局默认模型和思考强度设置，节点不支持偏好模型时回退本机默认；设置页展示构建版本号。
+- 默认模型和思考强度按 Codex、Claude 分别设置（Claude 初始为 Opus 5.5 + xhigh），节点不支持偏好模型时回退本机默认；设置页展示构建版本号。
 - 文件上传、拖拽和粘贴图片；分片续传、SHA-256 校验和 Agent 本地缓存。
 - Agent 本地 SQLite inbox/outbox、命令去重、消息补发和重连状态协调。
 - 浏览器 SSE 使用持久游标重放并按资源精准刷新；正常连接时每 60 秒权威同步，断线时每 10 秒兜底轮询，页面恢复可见时立即同步。
@@ -64,7 +66,7 @@ Controller Center 与 Agent 各自维护版本号。仅 Web 或 Control Plane �
 ## 环境要求
 
 - Node.js 24.x 为构建基线；Agent 安装包运行时支持 Node.js 24 及以上，较新主版本提示兼容状态并实际检测原生模块。
-- Agent 节点已安装并登录 `codex` CLI。
+- Agent 节点已按所选运行时安装并登录 `codex` CLI 或 Claude Code（`claude`）；登录用户须与 Agent 运行用户一致。
 - 控制中心到 Agent 不需要入站网络；Agent 只需能访问中心的 WSS 地址。
 
 当前已使用 `codex-cli 0.154.0` 完成联调验证。Agent 同时兼容旧版 `on-request` / `workspace-write` 枚举和新版官方文档中的命名。
@@ -84,7 +86,7 @@ npm run build
 npm run package:agent
 ```
 
-新包通过构建检查并成功生成后，会自动清理同一输出目录中的其他版本安装包和源码归档，只保留当前 Agent 版本的各系统/架构包；构建失败时保留原包。也可执行 `npm run clean:agent-packages` 清理已有历史包。设置 `AGENT_PACKAGE_OUTPUT_DIR` 时只处理指定目录。
+新包通过构建检查并成功生成后，会自动清理同一输出目录中更早版本的安装包和源码归档，只保留当前 Agent 版本和上一个版本（便于回退）的各系统/架构包；构建失败时保留原包。也可执行 `npm run clean:agent-packages` 清理已有历史包。设置 `AGENT_PACKAGE_OUTPUT_DIR` 时只处理指定目录。
 
 终端一，启动控制中心：
 
@@ -104,10 +106,10 @@ npm run admin -- admin-token show
 CONTROL_CENTER_URL=ws://127.0.0.1:8787/agent/connect \
 AGENT_TOKEN=local-agent-token \
 AGENT_NAME=local-dev \
-npm run dev:agent -- --yolo --codex-proxy-only
+npm run dev:agent -- codex --yolo --codex-proxy-only
 ```
 
-`--yolo` 是显式的全权限开关：它会关闭 Codex 的审批与沙箱隔离；不传时仍使用默认的 `workspaceWrite` 安全模式。`--codex-proxy-only` 是进程级网络策略；不传时 Agent 与 Codex 都遵循系统代理环境变量，传入后 Agent 自身强制直连而 Codex 仍继承代理。Agent 启动命令所在目录就是默认工作空间（通过 npm 启动时使用 npm 保留的原始调用目录，而不是 workspace 包目录）。`AGENT_WORKSPACES` 仅用于追加由部署配置维护的工作空间；若其中包含启动目录，该项会被识别为默认项。
+运行时参数 `codex` 必填，改为 `claude` 即驱动本机 Claude Code。`--yolo` 是显式的全权限开关：它会关闭 Codex 的审批与沙箱隔离；不传时仍使用默认的 `workspaceWrite` 安全模式。`--codex-proxy-only` 是进程级网络策略；不传时 Agent 与 Codex 都遵循系统代理环境变量，传入后 Agent 自身强制直连而 Codex 仍继承代理。Agent 启动命令所在目录就是默认工作空间（通过 npm 启动时使用 npm 保留的原始调用目录，而不是 workspace 包目录）。`AGENT_WORKSPACES` 仅用于追加由部署配置维护的工作空间；若其中包含启动目录，该项会被识别为默认项。
 
 终端三，启动 Web：
 
@@ -153,7 +155,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
 
 - `PUBLIC_CONTROL_API_URL`：默认留空并使用 Web 容器的同源反向代理；只有 API 单独使用其他域名时才填写。
 - `WEB_ORIGIN`：Web 的完整 Origin，用于 CORS。
-- `AGENT_SHARED_TOKEN`：只用于尚未迁移的旧 Agent；新节点不共享长期令牌。
+- `AGENT_SHARED_TOKEN`：默认不设置，旧共享 Token 接入关闭；只在迁移尚未注册的旧 Agent 时临时设置。新节点不共享长期令牌。
 
 默认部署只映射 Web 端口，Nginx 同时转发 API、SSE、节点注册、Agent WebSocket 和附件下载，因此访问者不需要单独映射控制中心端口。公网部署必须在外层 Nginx 启用 TLS，并把 `WEB_ORIGIN` 设为实际的 `https://` Origin。
 
@@ -175,7 +177,7 @@ docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec control-
 Agent 需要直接访问本机 Codex、Git 和工作区，因此推荐作为宿主机服务运行，而不是放入容器。登录 Web 后进入“设置 → 节点接入”，可选择并下载匹配系统/CPU 架构/libc 的客户端安装包；该包已经包含编译结果、生产依赖和 PTY 原生模块，无需在节点上执行 `npm install` 或 TypeScript 编译。
 
 ```bash
-cc_agent_archive=controller-center-agent-v0.3.22-linux-x64-glibc.tar.gz
+cc_agent_archive=controller-center-agent-v0.3.24-linux-x64-glibc.tar.gz
 cc_agent_directory=${cc_agent_archive%.tar.gz}
 tar -xzf "$cc_agent_archive"
 sudo mv "$cc_agent_directory" /opt/controller-center-agent
@@ -187,20 +189,20 @@ sudo mv "$cc_agent_directory" /opt/controller-center-agent
 - `deploy/systemd/controller-center-agent.service`
 - `deploy/agent.env.example`
 
-Agent 的运行用户必须对配置的工作区具有适当权限，并且该用户需要完成本地 Codex 登录。`AGENT_DATA_DIR` 不设置时默认使用 `~/.controller-center-agent`，它保存稳定节点身份而不决定默认工作空间；默认工作空间仍由启动目录决定。
+Agent 的运行用户必须对配置的工作区具有适当权限，并且该用户需要完成所选运行时（Codex 或 Claude Code）的本地登录。`AGENT_DATA_DIR` 不设置时默认使用 `~/.controller-center-agent`，它保存稳定节点身份而不决定默认工作空间；默认工作空间仍由启动目录决定。
 systemd 的 `WorkingDirectory` 决定该节点的默认工作空间；独立包中的示例默认为 `/opt/controller-center-agent`，正式部署时应改成希望交给 Codex 使用的工作目录。
-仓库中的 systemd 示例已在 Agent 启动命令末尾添加 `--yolo --codex-proxy-only`；若节点需要审批和沙箱保护，删除 `--yolo`，若控制中心流量也应使用代理则删除 `--codex-proxy-only`。
+仓库中的 systemd 示例已在 Agent 启动命令末尾添加 `--yolo --codex-proxy-only`，其中的 `<codex|claude>` 占位符须换成该节点的运行时（保留占位符时拒绝启动）；若节点需要审批和沙箱保护，删除 `--yolo`，若控制中心流量也应使用代理则删除 `--codex-proxy-only`。
 客户端运行与注册支持的完整参数列表见 [Agent 客户端命令与配置](docs/agent-cli.md)。
 
 独立客户端和发布压缩包提供快捷脚本，默认连接本项目的公开控制中心，并以全权限、控制链路直连模式启动：
 
 ```bash
 ./agent.sh login
-./agent.sh start
+./agent.sh start codex   # 或 ./agent.sh start claude，简写 ./agent.sh claude
 ./agent.sh status
 ```
 
-可用 `./agent.sh start --safe` 恢复审批与沙箱，或用 `./agent.sh start --all-proxy` 让控制中心连接也按系统代理规则访问。
+从 Agent v0.3.23 起 `start` 必须选择运行时，没有默认值；Codex 节点升级时把原来的 `./agent.sh start` 改为 `./agent.sh start codex`（systemd 在 `ExecStart` 中写 `codex`）即保持原有行为。可用 `./agent.sh start codex --safe` 恢复审批与沙箱，或用 `./agent.sh start codex --all-proxy` 让控制中心连接也按系统代理规则访问。
 
 新节点首次接入：先在 Web 的“设置 → 节点接入”生成注册 Token，再在节点执行以下命令。命令只要求控制中心域名，Token 会通过不回显的交互输入读取；公网地址必须为 HTTPS。
 
@@ -219,7 +221,7 @@ npm run agent:enroll -- --server https://control.example.com --codex-proxy-only
 | --- | --- | --- |
 | `CONTROL_PORT` | `8787` | API 与 Agent WSS 端口 |
 | `CONTROL_DATA_DIR` | `<启动命令所在目录>/data` | SQLite 数据与附件目录；建议生产环境显式配置绝对路径 |
-| `AGENT_SHARED_TOKEN` | `dev-agent-token` | 旧 Agent 迁移用共享令牌；迁移期仍须设为高强度随机值 |
+| `AGENT_SHARED_TOKEN` | 空（关闭） | 旧 Agent 迁移用共享令牌；未设置时不接受任何共享 Token 接入，迁移期需设为高强度随机值 |
 | `ADMIN_TOKEN` | 空 | 仅在管理员 Token 文件尚不存在时作为首次引导值；通常留空自动生成 |
 | `ADMIN_TOKEN_FILE` | `<CONTROL_DATA_DIR>/secrets/admin-token` | 本机可查询的管理员原始 Token 文件，权限 `0600` |
 | `ENROLLMENT_DISPLAY_KEY_FILE` | `<CONTROL_DATA_DIR>/secrets/enrollment-display-key` | 注册 Token 临时展示内容的本机加密密钥，权限 `0600` |
@@ -245,17 +247,19 @@ Agent：
 | `MAX_CONCURRENT_RUNS` | `5` | 单个节点的最大活动任务总数；超过后排队 |
 | `AGENT_NETWORK_ACCESS` | `false` | Codex workspace sandbox 默认网络权限 |
 | `CODEX_BIN` | `codex` | Codex CLI 路径 |
+| `CLAUDE_BIN` | `claude`（按 `PATH` 查找） | Claude Code CLI 路径，仅 Claude 运行时使用 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 系统 HTTP(S) 代理；支持大写和小写变量 |
 | `ALL_PROXY` | 空 | 未配置协议专用代理时的后备代理；当前支持 HTTP(S) 代理地址 |
 | `NO_PROXY` | 空 | 默认模式下不使用代理的地址；支持大写和小写变量 |
 
-Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 `--server`、`--token` 和 `--codex-proxy-only`。详细说明、安全注意事项及环境变量优先级见 [Agent 客户端命令与配置](docs/agent-cli.md)。
+Agent 日常运行须写明运行时 `codex` / `claude`，并支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 `--server`、`--token` 和 `--codex-proxy-only`。详细说明、安全注意事项及环境变量优先级见 [Agent 客户端命令与配置](docs/agent-cli.md)。
 
 ## API 概览
 
 - `GET /api/nodes`
 - `PATCH /api/nodes/:id`
 - `POST /api/nodes/:id/access/revoke`（撤销节点独立凭证并断开连接）
+- `DELETE /api/nodes/:id`（删除离线节点及其全部会话、审批、命令记录和凭证；在线节点需先撤销接入或停止 Agent）
 - `GET/POST /api/nodes/:id/workspaces`
 - `PATCH/DELETE /api/nodes/:nodeId/workspaces/:workspaceId`
 - `POST /api/nodes/:nodeId/workspaces/:workspaceId/validate`
@@ -295,7 +299,7 @@ Agent 日常运行支持 `--yolo` 和 `--codex-proxy-only`；首次注册支持 
 
 选择在线节点后，可通过“新开终端”和“节点文件”打开独立标签页。终端为真实 PTY，可正常使用 Vim/tmux 等已安装程序；每次新开，关闭或断线后结束，不提供历史恢复。文件管理提供目录浏览、批量上传/下载，单文件最大 1 GiB，整批同名覆盖一次确认。
 
-2026-10-08 已实现 WebRTC 直连上传/下载、开页检测和独立的传输方式选择，并更新生产 Web 与 Control Plane；节点 Agent 独立升级。Agent v0.3.17 起声明 `node_files_direct_v1`，旧 Agent 继续中转。可用时默认直连，已选直连任务失败后须用户确认才创建中转新任务并从头传输。直连下载在网页流式保存；初始选择中转仍交给 Chrome 原生下载。STUN 默认候选为 `stun:stun.cloudflare.com:3478`、`stun:global.stun.twilio.com:3478`、`stun:stun.l.google.com:19302`；可通过 `NODE_FILES_STUN_URLS` 覆盖，显式留空关闭 STUN。文件页显示可展开的诊断详情，失败时展开，并向浏览器控制台输出地址错误和连接阶段；单个 STUN 错误不直接判定整个直连不可用。当前客户端为 v0.3.22，新增会话 Fast 档位和估算输出速度，修正密集分块与暂停恢复的速度采样，保留发送排队修复及 Node 24 及以上运行支持；用户已于 2026-10-26 反馈当前 Linux 与 macOS 包实测未发现异常；测试直连仍以两端实际设备和网络结果为准。完整生命周期、验证边界与生产发布记录见 [节点工具设计](docs/node-tools-design.md)。
+2026-10-08 已实现 WebRTC 直连上传/下载、开页检测和独立的传输方式选择，并更新生产 Web 与 Control Plane；节点 Agent 独立升级。Agent v0.3.17 起声明 `node_files_direct_v1`，旧 Agent 继续中转。可用时默认直连，已选直连任务失败后须用户确认才创建中转新任务并从头传输。直连下载在网页流式保存；初始选择中转仍交给 Chrome 原生下载。STUN 默认候选为 `stun:stun.cloudflare.com:3478`、`stun:global.stun.twilio.com:3478`、`stun:stun.l.google.com:19302`；可通过 `NODE_FILES_STUN_URLS` 覆盖，显式留空关闭 STUN。文件页显示可展开的诊断详情，失败时展开，并向浏览器控制台输出地址错误和连接阶段；单个 STUN 错误不直接判定整个直连不可用。v0.3.22 客户端新增会话 Fast 档位和估算输出速度，修正密集分块与暂停恢复的速度采样，保留发送排队修复及 Node 24 及以上运行支持；用户已于 2026-10-26 反馈该版本 Linux 与 macOS 包实测未发现异常；测试直连仍以两端实际设备和网络结果为准。完整生命周期、验证边界与生产发布记录见 [节点工具设计](docs/node-tools-design.md)。
 
 已实现的终端与中转文件工具需要对应 Web、Control Plane 以及 Agent v0.3.14 或更新版本；缺少工具 capability 的旧 Agent 继续支持原有聊天，工具入口显示升级提示。后续仅缺少直连能力的 Agent 保留中转入口。
 

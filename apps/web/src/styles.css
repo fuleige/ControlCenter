@@ -296,6 +296,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .node-main strong { min-width: 0; color: var(--text); font-size: 13px; font-weight: 680; }
 .node-main small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
 .node-permission-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #f0b8ad; border-radius: 5px; background: #fff1ee; color: #b42318; font-size: 8px; font-style: normal; font-weight: 750; line-height: 1.2; }
+.runtime-icon { margin-right: 4px; display: inline-block; flex: none; vertical-align: -2px; }
+.runtime-icon-claude { color: #d97757; }
+.runtime-icon-codex { color: #1d2939; }
+.node-identity-runtime { display: none; }
+.node-revoked-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #d0d5dd; border-radius: 5px; background: #f2f4f7; color: #475467; font-size: 8px; font-style: normal; font-weight: 750; line-height: 1.2; }
 .node-load {
   padding: 4px 7px;
   border: 1px solid var(--border);
@@ -1625,6 +1630,7 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 .settings-default-fields { padding: 0 12px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
 .settings-default-fields label { min-width: 0; padding: 12px 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, .95fr); align-items: center; gap: 12px; }
 .settings-default-fields label + label { border-top: 1px solid #edf1f6; }
+.settings-default-fields h4 { margin: 0; padding: 12px 0 2px; display: flex; align-items: center; gap: 7px; color: #26364d; font-size: 12px; font-weight: 650; }
 .settings-default-fields label > span { color: #344054; font-size: 12px; font-weight: 550; }
 .settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .workspace-settings, .enrollment-settings { position: relative; }
@@ -1647,6 +1653,8 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 .workspace-card-copy strong { min-width: 0; overflow: hidden; color: #26364d; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-card-copy b, .workspace-card-copy span { flex-shrink: 0; padding: 2px 5px; border-radius: 5px; background: #eef2f7; color: #667085; font-size: 10px; font-weight: 550; }
 .workspace-card-copy b { background: var(--accent-soft); color: var(--accent); }
+.workspace-card-copy .workspace-runtimes { padding: 0; display: inline-flex; gap: 4px; background: none; }
+.workspace-card-copy .workspace-runtimes > span { display: inline-flex; align-items: center; gap: 3px; }
 .workspace-card-copy code { display: block; margin-top: 4px; overflow: hidden; color: #667085; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-card-copy > small { display: block; margin-top: 5px; overflow-wrap: anywhere; color: var(--danger); font-size: 11px; }
 .workspace-card-meta { display: grid; justify-items: end; gap: 4px; }
@@ -1701,6 +1709,14 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
 .enrollment-nodes article strong { overflow: hidden; color: #344054; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .enrollment-nodes article small, .enrollment-node-confirm span { color: var(--muted); font-size: 11px; }
 .enrollment-node-confirm { display: flex !important; grid-template-columns: none !important; align-items: center; gap: 6px !important; }
+.enrollment-node-actions { flex-shrink: 0; display: flex; align-items: center; gap: 6px; }
+.delete-node-confirm .compact-confirm-icon { background: var(--danger-soft); color: var(--danger); }
+.delete-node-name { margin-top: 13px; display: grid; gap: 7px; color: #344054; font-size: 11px; }
+.delete-node-name > span { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.delete-node-name code { padding: 2px 6px; border-radius: 6px; background: #f2f4f7; color: #253347; font-size: 12px; user-select: all; word-break: break-all; }
+.delete-node-name button { min-height: 24px; padding: 0 8px; font-size: 11px; }
+.delete-node-name input { width: 100%; min-height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; font: inherit; font-size: 12px; }
+.delete-node-confirm .form-error { margin-top: 8px; color: var(--danger); }
 .enrollment-history { margin-top: 18px; }
 .enrollment-history > header { padding-bottom: 8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; border-bottom: 1px solid var(--border); }
 .enrollment-history > header strong { color: #344054; font-size: 13px; font-weight: 600; }
@@ -1880,6 +1896,8 @@ input::placeholder, textarea::placeholder { color: var(--muted-light); }
   .layout.nodes-collapsed .node-card.selected .node-identity { border-color: #8bb2f9; background: #eaf2ff; color: var(--accent); }
   .layout.nodes-collapsed .node-identity.full-access { border-color: #eaa89c; box-shadow: inset 0 -3px 0 #e25544; }
   .layout.nodes-collapsed .node-card.selected .node-identity.full-access { border-color: #dc7464; }
+  .layout.nodes-collapsed .node-identity-runtime { position: absolute; top: -5px; left: -5px; width: 16px; height: 16px; display: grid; place-items: center; border: 1px solid #dce3ed; border-radius: 99px; background: #fff; }
+  .layout.nodes-collapsed .node-identity-runtime .runtime-icon { margin: 0; vertical-align: 0; }
   .layout.nodes-collapsed .presence { position: absolute; right: 9px; bottom: 7px; width: 8px; height: 8px; border: 2px solid #fff; box-shadow: none; }
   .layout.nodes-collapsed .node-footer { padding: 7px; }
   .layout.nodes-collapsed .node-footer > button { min-height: 42px; padding: 0; justify-content: center; }

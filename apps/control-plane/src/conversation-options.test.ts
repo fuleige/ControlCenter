@@ -16,7 +16,8 @@ describe("conversation Fast compatibility", () => {
 
   it("requires both node capability and the selected model's catalog support", () => {
     expect(fastModeError(true, false, models, "default")).toContain("升级");
-    expect(fastModeError(true, true, models, "plain")).toContain("不支持");
+    expect(fastModeError(true, true, models, "plain")).toBe("当前模型或 Codex 账户不支持 Fast 模式");
+    expect(fastModeError(true, true, models, "plain", "claude")).toBe("当前模型或 Claude 账户不支持 Fast 模式");
     expect(fastModeError(true, true, models, "missing")).toContain("不支持");
     expect(fastModeError(true, true, models, null)).toBeNull();
     expect(fastModeError(true, true, models, "default")).toBeNull();

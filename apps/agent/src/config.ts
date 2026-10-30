@@ -2,16 +2,24 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFile
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { WorkspaceDescriptor } from "@controller-center/protocol";
+import type { AgentRuntime, WorkspaceDescriptor } from "@controller-center/protocol";
+import { runtimeNodeId } from "@controller-center/protocol/node-identity";
 import { codexProxyOnlyFromArgv } from "./outbound-network.js";
 
 export interface AgentConfig {
   controlUrl: string;
   token: string;
+  /** This runtime's entry in the node list. */
   nodeId: string;
+  /** Shared by every runtime started from this data directory; owns the credential. */
+  machineId: string;
   nodeName: string;
   dataDirectory: string;
+  /** Runtime-private state: the outbox, model cache and attachments must not be shared. */
+  stateDirectory: string;
+  runtime: AgentRuntime;
   codexBinary: string;
+  claudeBinary: string;
   maxConcurrentRuns: number;
   networkAccess: boolean;
   yolo: boolean;
@@ -136,10 +144,29 @@ export function loadSavedConnection(dataDirectory: string): SavedAgentConnection
   return { controlUrl: parsed.controlUrl, credential: parsed.credential };
 }
 
+/**
+ * The runtime is a required positional argument with no default: an Agent must
+ * never silently drive a different CLI than the operator chose.
+ */
+export function runtimeFromArgs(argv: string[]): AgentRuntime {
+  const positional = argv.filter((argument) => !argument.startsWith("-"));
+  if (positional.length === 0) throw new Error("未选择节点运行时；请在启动参数中写明 codex 或 claude，例如 ./agent.sh start claude");
+  if (positional.length > 1) throw new Error(`只能选择一个节点运行时，收到：${positional.join(" ")}`);
+  const runtime = positional[0]!;
+  if (runtime !== "codex" && runtime !== "claude") throw new Error(`无效的节点运行时 "${runtime}"，只能是 codex 或 claude`);
+  return runtime;
+}
+
 export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig {
+  // Validate the runtime choice before creating any node state.
+  const runtime = runtimeFromArgs(argv);
   const dataDirectory = agentDataDirectory();
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
   chmodSync(dataDirectory, 0o700);
+  // Codex keeps the data directory root, so existing nodes need no migration.
+  const stateDirectory = runtime === "codex" ? dataDirectory : path.join(dataDirectory, "runtimes", runtime);
+  mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
+  const machineId = loadOrCreateNodeId(dataDirectory);
   const savedConnection = loadSavedConnection(dataDirectory);
   // Once enrollment has produced a node-bound credential it must win over a
   // legacy AGENT_TOKEN left in an existing systemd environment file.
@@ -147,10 +174,14 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
   return {
     controlUrl: normalizeControlUrl(process.env.CONTROL_CENTER_URL ?? savedConnection?.controlUrl ?? "ws://127.0.0.1:8787/agent/connect"),
     token,
-    nodeId: loadOrCreateNodeId(dataDirectory),
+    nodeId: runtimeNodeId(machineId, runtime),
+    machineId,
     nodeName: process.env.AGENT_NAME?.trim() || os.hostname(),
     dataDirectory,
+    stateDirectory,
+    runtime,
     codexBinary: process.env.CODEX_BIN ?? "codex",
+    claudeBinary: process.env.CLAUDE_BIN ?? "claude",
     maxConcurrentRuns: integerEnv("MAX_CONCURRENT_RUNS", 5),
     networkAccess: process.env.AGENT_NETWORK_ACCESS === "true",
     yolo: argv.includes("--yolo"),

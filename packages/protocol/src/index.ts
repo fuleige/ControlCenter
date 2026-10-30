@@ -79,12 +79,24 @@ export interface ModelDescriptor {
   fastServiceTier?: "fast" | "priority";
 }
 
+/** Local CLI an Agent drives; chosen explicitly when the Agent starts. */
+export type AgentRuntime = "codex" | "claude";
+
 export interface NodeDescriptor {
+  /** Node-list identity of this runtime on the machine; see runtimeNodeId. */
   id: string;
+  /**
+   * Identity shared by every runtime started from one Agent data directory; it
+   * owns the enrolled credential. Agents before v0.3.24 omit it: id is the machine.
+   */
+  machineId?: string;
   name: string;
   platform: string;
   arch: string;
   agentVersion: string;
+  /** Agents before v0.3.23 omit it; they always run Codex. */
+  runtime?: AgentRuntime;
+  /** Version string reported by the runtime's CLI. */
   codexVersion: string;
   permissionMode?: "workspace-write" | "danger-full-access";
   maxConcurrentRuns: number;

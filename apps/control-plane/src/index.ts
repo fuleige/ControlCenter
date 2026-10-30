@@ -14,17 +14,19 @@ import {
   type AgentDurableMessage,
   type ControlCommand,
   type ControlCommandMessage,
+  type AgentRuntime,
   type AttachmentDescriptor,
   type JsonValue,
   type ReasoningEffort,
 } from "@controller-center/protocol";
+import { runtimeNodeId } from "@controller-center/protocol/node-identity";
 import { loadConfig } from "./config.js";
 import { fastModeError } from "./conversation-options.js";
 import { findAgentPackage, listAgentPackages } from "./agent-package.js";
 import { AGENT_PACKAGE_SHARED_PATH, agentPackageLogUrl, registerAgentPackageDownloadLinks } from './agent-package-download.js';
 import { NodeTools, NodeToolError } from "./node-tools.js";
 import { AgentConnections } from "./connections.js";
-import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type MessageListCursor, type WorkspaceRecord } from "./database.js";
+import { ControlDatabase, type CommandRecord, type ConversationListCursor, type EnrollmentTokenRecord, type GlobalSettingsRecord, type MessageListCursor, type WorkspaceRecord } from "./database.js";
 import { UiEventBus } from "./event-bus.js";
 import {
   ADMIN_SESSION_IDLE_MS,
@@ -384,6 +386,21 @@ function syncNodeWorkspaces(nodeId: string): boolean {
   return connections.syncWorkspaces(nodeId, database.listManagedWorkspacesForAgent(nodeId));
 }
 
+/** Web workspaces are shared by the runtimes of a machine, so a change reaches each of its Agents. */
+function syncMachineWorkspaces(nodeId: string): void {
+  const machineId = database.machineIdOf(nodeId);
+  for (const entryId of machineId ? database.machineNodeIds(machineId) : [nodeId]) syncNodeWorkspaces(entryId);
+}
+
+/** A workspace other than `exceptId` already using the path on an entry that would hold a copy. */
+function workspacePathConflict(nodeIds: string[], workspacePath: string, exceptId?: string) {
+  for (const nodeId of nodeIds) {
+    const duplicate = database.findWorkspaceByPath(nodeId, workspacePath, exceptId);
+    if (duplicate) return duplicate;
+  }
+  return null;
+}
+
 async function validatePathOnNode(nodeId: string, workspacePath: string): Promise<
   { canonicalPath: string; suggestedName: string } | { statusCode: 400 | 404 | 409; error: string }
 > {
@@ -524,18 +541,26 @@ function prepareAttachments(ids: unknown, messageClientId: string): { ids: strin
   };
 }
 
+/** The new-conversation defaults configured for a runtime. */
+function runtimeDefaults(runtime: AgentRuntime | undefined): { model: string | null; effort: ReasoningEffort | null } {
+  const settings = database.getGlobalSettings();
+  return runtime === "claude"
+    ? { model: settings.claudeDefaultModel, effort: settings.claudeDefaultEffort as ReasoningEffort | null }
+    : { model: settings.defaultModel, effort: settings.defaultEffort as ReasoningEffort | null };
+}
+
 function selectedModel(nodeId: string, requested?: string): string | null {
   const explicit = requested?.trim();
   if (explicit) return explicit;
-  const preferred = database.getGlobalSettings().defaultModel;
-  if (!preferred) return null;
   const node = database.listNodes().find((candidate) => candidate.id === nodeId);
+  const preferred = runtimeDefaults(node?.runtime).model;
+  if (!preferred) return null;
   return node?.models.some((model) => model.id === preferred) ? preferred : null;
 }
 
 function selectedEffort(nodeId: string, modelId: string | null, requested?: ReasoningEffort | null): ReasoningEffort | null {
-  const candidate = requested ?? database.getGlobalSettings().defaultEffort as ReasoningEffort | null;
   const node = database.listNodes().find((entry) => entry.id === nodeId);
+  const candidate = requested ?? runtimeDefaults(node?.runtime).effort;
   const model = node?.models.find((entry) => entry.id === modelId) ?? node?.models.find((entry) => entry.isDefault);
   if (!candidate) return model?.defaultReasoningEffort ?? null;
   if (!model || model.supportedReasoningEfforts.length === 0 || model.supportedReasoningEfforts.some((entry) => entry.reasoningEffort === candidate)) return candidate;
@@ -544,7 +569,7 @@ function selectedEffort(nodeId: string, modelId: string | null, requested?: Reas
 
 function selectedFastModeError(nodeId: string, modelId: string | null, fastMode: unknown): string | null {
   const node = database.listNodes().find((candidate) => candidate.id === nodeId);
-  return fastModeError(fastMode, connections.hasCapability(nodeId, FAST_MODE_CAPABILITY), node?.models ?? [], modelId);
+  return fastModeError(fastMode, connections.hasCapability(nodeId, FAST_MODE_CAPABILITY), node?.models ?? [], modelId, node?.runtime);
 }
 
 function processDurableMessage(nodeId: string, message: AgentDurableMessage): void {
@@ -800,7 +825,7 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
   const credentialNodeId = credential && !credential.revokedAt && secretMatches(suppliedToken, credential.tokenHash)
     ? credential.nodeId
     : null;
-  const legacyAuthenticated = safeTokenEqual(suppliedToken, config.agentToken);
+  const legacyAuthenticated = config.agentToken !== null && safeTokenEqual(suppliedToken, config.agentToken);
   if (!legacyAuthenticated && !credentialNodeId) {
     socket.close(4401, "Invalid agent token");
     return;
@@ -814,11 +839,19 @@ app.get("/agent/connect", { websocket: true }, (socket: WebSocket, request) => {
       const message = parseAgentMessage(data.toString());
       if (!initialized) {
         if (message.type !== "agent.hello") throw new Error("agent.hello must be the first message");
-        if (legacyAuthenticated && database.nodeHasCredentials(message.node.id)) {
+        // Every runtime on a machine shares the machine's credential; each one's
+        // node-list id is derived from the machine so a credential cannot claim others.
+        const machineId = message.node.machineId ?? message.node.id;
+        const runtime = message.node.runtime ?? "codex";
+        if ((runtime !== "codex" && runtime !== "claude") || message.node.id !== runtimeNodeId(machineId, runtime)) {
+          socket.close(4403, "Node id does not match its machine and runtime");
+          return;
+        }
+        if (legacyAuthenticated && database.nodeHasCredentials(machineId)) {
           socket.close(4403, "This node must use its enrolled credential");
           return;
         }
-        if (credentialNodeId && message.node.id !== credentialNodeId) {
+        if (credentialNodeId && machineId !== credentialNodeId) {
           socket.close(4403, "Credential does not belong to this node");
           return;
         }
@@ -913,15 +946,44 @@ app.patch<{ Params: { id: string }; Body: { name?: string | null } }>("/api/node
 });
 
 app.post<{ Params: { id: string } }>("/api/nodes/:id/access/revoke", async (request, reply) => {
-  if (!database.listNodes().some((node) => node.id === request.params.id)) {
-    return reply.code(404).send({ error: "节点不存在" });
-  }
-  const revoked = database.revokeNodeCredentials(request.params.id, now());
+  const machineId = database.machineIdOf(request.params.id);
+  if (!machineId) return reply.code(404).send({ error: "节点不存在" });
+  // Access is granted per machine, so every runtime on it loses access together.
+  const revoked = database.revokeNodeCredentials(machineId, now());
   if (revoked === 0) return reply.code(409).send({ error: "该节点没有可撤销的独立凭证" });
-  connections.close(request.params.id);
-  database.markNodeOffline(request.params.id, now());
-  publish("node.access-revoked", request.params.id);
+  for (const nodeId of database.machineNodeIds(machineId)) {
+    connections.close(nodeId, 4401, "Access revoked");
+    database.markNodeOffline(nodeId, now());
+    publish("node.access-revoked", nodeId);
+  }
   return { revoked };
+});
+
+app.delete<{ Params: { id: string }; Body: { confirmName?: string } }>("/api/nodes/:id", async (request, reply) => {
+  const node = database.listNodes().find((candidate) => candidate.id === request.params.id);
+  if (!node) return reply.code(404).send({ error: "节点不存在或已被删除" });
+  if (request.body?.confirmName?.trim() !== node.name) {
+    return reply.code(400).send({ error: "输入的节点名称不一致，未删除" });
+  }
+  // Deletion covers the whole machine; disconnecting would leave these turns
+  // running unattended on it.
+  const activeRuns = database.countActiveMachineRuns(node.machineId);
+  if (activeRuns > 0) {
+    return reply.code(409).send({ error: `这台机器上有 ${activeRuns} 个任务正在运行，请先中止后再删除` });
+  }
+  const { nodeIds, attachmentStorageKeys } = database.deleteMachine(node.machineId);
+  request.log.info({ machineId: node.machineId, nodeIds, nodeName: node.name, attachments: attachmentStorageKeys.length },
+    "Machine deleted with all of its node entries and conversations");
+  for (const nodeId of nodeIds) {
+    // Its credentials are gone, so no Agent on the machine can reconnect.
+    connections.close(nodeId, 4401, "Node deleted");
+  }
+  for (const storageKey of attachmentStorageKeys) {
+    const filePath = path.join(config.attachmentDirectory, storageKey);
+    if (existsSync(filePath)) unlinkSync(filePath);
+  }
+  for (const nodeId of nodeIds) publish("node.deleted", nodeId);
+  return reply.code(204).send();
 });
 
 app.get<{ Params: { id: string }; Querystring: { includeArchived?: string } }>("/api/nodes/:id/workspaces", async (request, reply) => {
@@ -949,7 +1011,7 @@ app.post<{ Params: { id: string }; Body: { name?: string; path?: string } }>("/a
     path: validation.canonicalPath,
     now: createdAt,
   });
-  syncNodeWorkspaces(request.params.id);
+  syncMachineWorkspaces(request.params.id);
   publish("workspace.created", workspace.id);
   return reply.code(201).send({ workspace });
 });
@@ -982,7 +1044,8 @@ app.patch<{
     }
     const validation = await validatePathOnNode(request.params.nodeId, request.body.path!.trim());
     if ("error" in validation) return reply.code(validation.statusCode).send({ error: validation.error });
-    const duplicate = database.findWorkspaceByPath(request.params.nodeId, validation.canonicalPath, current.id);
+    const duplicate = workspacePathConflict(
+      database.workspaceCopyNodeIds(request.params.nodeId, current.id), validation.canonicalPath, current.id);
     if (duplicate) return reply.code(409).send({ error: `该路径已经登记为“${duplicate.name}”` });
     canonicalPath = validation.canonicalPath;
   }
@@ -999,7 +1062,7 @@ app.patch<{
     ...(hasArchived ? { archived: request.body.archived } : {}),
     now: now(),
   });
-  syncNodeWorkspaces(request.params.nodeId);
+  syncMachineWorkspaces(request.params.nodeId);
   publish("workspace.updated", request.params.workspaceId);
   return { workspace };
 });
@@ -1036,7 +1099,7 @@ app.delete<{ Params: { nodeId: string; workspaceId: string } }>("/api/nodes/:nod
   if (!database.deleteUnusedWorkspace(request.params.nodeId, request.params.workspaceId)) {
     return reply.code(409).send({ error: "工作空间当前不能删除" });
   }
-  syncNodeWorkspaces(request.params.nodeId);
+  syncMachineWorkspaces(request.params.nodeId);
   publish("workspace.deleted", request.params.workspaceId);
   return reply.code(204).send();
 });
@@ -1838,20 +1901,26 @@ app.post<{ Params: { id: string }; Body: { response?: JsonValue } }>("/api/appro
 
 app.get("/api/settings", async () => ({ settings: database.getGlobalSettings() }));
 
-app.patch<{ Body: { defaultModel?: string | null; defaultEffort?: ReasoningEffort | null } }>("/api/settings", async (request, reply) => {
+app.patch<{ Body: Partial<Record<keyof GlobalSettingsRecord, string | null>> }>("/api/settings", async (request, reply) => {
   const current = database.getGlobalSettings();
-  const defaultModel = request.body?.defaultModel === undefined
-    ? current.defaultModel
-    : typeof request.body.defaultModel === "string" && request.body.defaultModel.trim()
-      ? request.body.defaultModel.trim()
+  const model = (key: "defaultModel" | "claudeDefaultModel") => request.body?.[key] === undefined
+    ? current[key]
+    : typeof request.body[key] === "string" && request.body[key].trim()
+      ? request.body[key].trim()
       : null;
-  const defaultEffort = request.body?.defaultEffort === undefined
-    ? current.defaultEffort
-    : request.body.defaultEffort;
-  if (defaultEffort && !reasoningEfforts.has(defaultEffort as ReasoningEffort)) {
+  const effort = (key: "defaultEffort" | "claudeDefaultEffort") => request.body?.[key] === undefined
+    ? current[key]
+    : request.body[key] ?? null;
+  const next: GlobalSettingsRecord = {
+    defaultModel: model("defaultModel"),
+    defaultEffort: effort("defaultEffort"),
+    claudeDefaultModel: model("claudeDefaultModel"),
+    claudeDefaultEffort: effort("claudeDefaultEffort"),
+  };
+  if ([next.defaultEffort, next.claudeDefaultEffort].some((value) => value && !reasoningEfforts.has(value as ReasoningEffort))) {
     return reply.code(400).send({ error: "所选思考强度不受支持" });
   }
-  const settings = database.updateGlobalSettings({ defaultModel, defaultEffort: defaultEffort ?? null }, now());
+  const settings = database.updateGlobalSettings(next, now());
   publish("settings.updated", "global");
   return { settings };
 });
@@ -2141,8 +2210,8 @@ async function shutdown(signal: string): Promise<void> {
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-if (config.agentToken === "dev-agent-token") {
-  app.log.warn("Using the development agent token. Set AGENT_SHARED_TOKEN before deployment.");
+if (config.agentToken) {
+  app.log.warn("Legacy shared-token Agent access is enabled by AGENT_SHARED_TOKEN. Unset it once every node uses an enrolled credential.");
 }
 
 await app.listen({ host: config.host, port: config.port });

@@ -218,6 +218,14 @@ export async function revokeNodeAccess(nodeId: string): Promise<void> {
   await api(`/api/nodes/${encodeURIComponent(nodeId)}/access/revoke`, { method: "POST" });
 }
 
+/** Revokes the node and deletes all of its records; the server re-checks the typed name. */
+export async function deleteNode(nodeId: string, confirmName: string): Promise<void> {
+  await api<void>(`/api/nodes/${encodeURIComponent(nodeId)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirmName }),
+  });
+}
+
 export async function listNodeWorkspaces(nodeId: string, includeArchived = true): Promise<Workspace[]> {
   return (await api<{ data: Workspace[] }>(`/api/nodes/${encodeURIComponent(nodeId)}/workspaces?includeArchived=${includeArchived}`)).data;
 }
